@@ -32,6 +32,7 @@ from .detect import (L_ANK, L_EAR, L_EL, L_EYE, L_FOOT, L_HEEL, L_HIP, L_INDEX, 
                      R_THUMB, R_WR)
 from .mathutil import (gaussian_smooth, interp_gaps, mat_to_quat, normalize, quat_continuity,
                        quat_to_mat, rot_between, rot_from_axes, slerp)
+from .naturalize import Naturalizer, filter_rotations, hold_root
 from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
@@ -247,7 +248,8 @@ class RigSolver:
             # forearm carries the pronation/supination: palm normal (rest -Y)
             rpalm = self.rest_palm[side]
             k = side + "LowerArm"
-            G[k] = rot_from_axes(self.rest_dir[k], rpalm, fa, self._twist_axis(k, fa, palm_n, 0.85, rpalm))
+            G[k] = rot_from_axes(self.rest_dir[k], rpalm, fa,
+                                 self._twist_axis(k, fa, palm_n, 0.85 if hp is not None else 0.0, rpalm))
             k = side + "Hand"
             G[k] = rot_from_axes(self.rest_dir[k], rpalm, hand_dir, palm_n)
             if hp is not None:
@@ -298,9 +300,10 @@ class RigSolver:
             G[k] = rot_from_axes(self.rest_dir[k], Z, th, self._twist_axis(k, th, b_obs, 1.0, Z))
             k = side + "LowerLeg"
             G[k] = rot_from_axes(self.rest_dir[k], Z, sh_, self._twist_axis(k, sh_, foot_f, 1.0, Z))
-            # foot: heel->toe gives pitch/yaw, the ankle above that line gives roll
+            # foot: heel->toe gives pitch/yaw; roll follows the shin (the ankle
+            # landmarks are too close together to measure foot roll reliably)
             k = side + "Foot"
-            G[k] = rot_from_axes(Z, Y, foot_f, an - heel)
+            G[k] = rot_from_axes(Z, X, foot_f, G[side + "LowerLeg"] @ X)
         self.prev = {k: v for k, v in G.items() if k.endswith(("UpperArm", "LowerArm", "UpperLeg", "LowerLeg"))}
         return G
 
@@ -357,6 +360,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     world = capture["world"].astype(np.float64)
     cropc = capture["cropc"].astype(np.float64)
     h2d, hw, hs, hc = (capture[k].astype(np.float64) for k in ("h2d", "hw", "hs", "hc"))
+    # a landmark outside the picture is a guess: treat it as not visible
+    margin = 0.01 * max(W, H)
+    inside = (lm2d[..., 0] > -margin) & (lm2d[..., 0] < W + margin) & (lm2d[..., 1] > -margin) & (lm2d[..., 1] < H + margin)
+    vis = np.where(inside, vis, 0.0)
     valid = capture["tracked"] & (vis.mean(1) > 0.35) & (np.abs(world).sum((1, 2)) > 0)
     hvalid = (hs >= 0.5) & valid[:, None]
 
@@ -438,8 +445,16 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     hipc = (P[:, L_HIP] + P[:, R_HIP]) / 2
     Pw = np.einsum("nij,nkj->nki", R_w, P - hipc[:, None])
     Phw = np.einsum("nij,nskj->nski", R_w, Ph - P[:, [L_WR, R_WR]][:, :, None])  # relative to wrist
-    sig = 0.25 * max(0.0, smoothing) * fs
     progress(0.35, "Computing bone rotations")
+
+    # ---- 3b. palm / back-of-hand ambiguity: choose per frame between the hand as
+    # detected and its depth-mirrored version, so the forearm stays within its
+    # rotation range and does not flip between frames
+    for side, wi, ei in ((0, L_WR, L_EL), (1, R_WR, R_EL)):
+        sh_i = L_SH if side == 0 else R_SH
+        view = normalize(np.einsum("nij,nj->ni", R_w, np.nan_to_num(P[:, wi])))
+        Phw[:, side] = resolve_hand_mirroring(Phw[:, side], hvalid[:, side], view,
+                                              Pw[:, sh_i], Pw[:, ei], Pw[:, wi], 1.0 if side == 1 else -1.0)
 
     # ---- 4. rotations
     solver = RigSolver(skel)
@@ -448,7 +463,6 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     Q[..., 3] = 1
     qvalid = np.zeros(N, bool)
     finger_valid = np.zeros((N, 2), bool)
-    fingers = [[b for b in skel.bones if b.startswith(sd) and any(fg in b for fg in FINGERS)] for sd in ("left", "right")]
     bidx = {b: i for i, b in enumerate(skel.bones)}
     names = {"hipL": L_HIP, "hipR": R_HIP, "shL": L_SH, "shR": R_SH, "elL": L_EL, "elR": R_EL,
              "wrL": L_WR, "wrR": R_WR, "knL": L_KNEE, "knR": R_KNEE, "anL": L_ANK, "anR": R_ANK,
@@ -487,16 +501,13 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             corr = quat_to_mat(np.array([np.sin(-off / 2), 0, 0, np.cos(off / 2)]))
             Q[qvalid, hi] = mat_to_quat(R @ corr)
 
-    # ---- 5. temporal: continuity, fill gaps, light smoothing in rotation space
-    progress(0.55, "Filling gaps and smoothing")
-    for i, b in enumerate(skel.bones):
-        is_finger = any(b in fl for fl in fingers)
-        if is_finger:
-            side = 0 if b.startswith("left") else 1
-            m = finger_valid[:, side]
-        else:
-            m = qvalid
-        Q[:, i] = fill_and_smooth_quats(Q[:, i], m, sig * (1.0 if not is_finger else 0.8), max_gap=int(2.0 * fps))
+    # ---- 5. temporal: per-bone confidence -> hold unseen bones, reject spikes, smooth
+    progress(0.55, "Filtering (hold unseen bones, remove spikes, smooth)")
+    conf = bone_confidence(skel, vis, hs, valid, hvalid)
+    nat = Naturalizer(skel)
+    Q = nat.unflip_fingers(Q)
+    strength = np.array([2.0 if (b.endswith("Hand") or any(f in b for f in FINGERS)) else 1.0 for b in skel.bones])
+    Q = filter_rotations(Q, conf, fps, smoothing, strength=strength)
 
     # ---- 6. root motion on the avatar
     progress(0.7, "Solving root motion and foot contacts")
@@ -510,7 +521,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     root_actor = np.einsum("nij,nj->ni", R_w, np.nan_to_num(T))
     root_actor = interp_gaps(root_actor, valid)
     root, contacts = root_motion(skel, Q, root_actor * scale, valid, shot_of, fps, Pw, scale)
-    if foot_lock:
+    root = hold_root(root, valid, fps)
+    progress(0.8, "Joint limits and limb IK")
+    Q = nat.apply(Q, root, fps, conf)
+    if foot_lock:  # last: pins planted feet (two-bone IK that keeps the knee's bend plane)
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
 
     # ---- 7. cloned camera relative to the avatar
@@ -539,6 +553,84 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         "h2d": h2d.astype(np.float32), "hs": hs.astype(np.float32), "scale": scale,
     }
     return anim
+
+
+def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):
+    """H: (N,21,3) hand points relative to the wrist (world). Returns H with some
+    frames mirrored in depth, chosen by a 2-state Viterbi over the clip."""
+    N = len(H)
+    idx = np.where(ok & np.isfinite(H.reshape(N, -1)).all(1))[0]
+    if len(idx) < 2:
+        return H
+    Hm = H.copy()
+    v = view[idx][:, None, :]
+    Hm[idx] = H[idx] - 2 * np.sum(H[idx] * v, -1, keepdims=True) * v
+
+    def palm(h):
+        return normalize(sgn * np.cross(h[:, 5] - h[:, 0], h[:, 17] - h[:, 0]))
+    ua, fa = E[idx] - S[idx], Wr[idx] - E[idx]
+    hng = np.cross(ua, fa)
+    bend = np.arctan2(np.linalg.norm(hng, axis=1), np.sum(ua * fa, 1))
+    n0 = normalize(np.cross(normalize(hng), fa))  # palm direction at neutral (thumb up)
+    unary = np.zeros((len(idx), 2))
+    pn = [palm(H[idx]), palm(Hm[idx])]
+    fan = normalize(fa)
+    for k in (0, 1):
+        n = pn[k] - fan * np.sum(pn[k] * fan, 1, keepdims=True)
+        c = np.sum(normalize(n) * n0, 1)
+        w = np.clip((bend - np.radians(15)) / np.radians(25), 0, 1)
+        unary[:, k] = w * np.clip(-0.17 - c, 0, None) * 4.0
+    unary[:, 1] += 0.35  # the detector is usually right
+    # transition: change of the palm direction between consecutive seen frames
+    cost = unary[0].copy()
+    back = np.zeros((len(idx), 2), int)
+    for j in range(1, len(idx)):
+        new = np.zeros(2)
+        gapw = 1.0 / max(1, idx[j] - idx[j - 1]) ** 0.5
+        for k in (0, 1):
+            tr = [np.arccos(np.clip(np.dot(pn[k][j], pn[m][j - 1]), -1, 1)) / np.pi * 3.0 * gapw for m in (0, 1)]
+            c2 = cost + np.array(tr)
+            back[j, k] = int(np.argmin(c2))
+            new[k] = c2[back[j, k]] + unary[j, k]
+        cost = new
+    st = np.zeros(len(idx), int)
+    st[-1] = int(np.argmin(cost))
+    for j in range(len(idx) - 1, 0, -1):
+        st[j - 1] = back[j, st[j]]
+    out = H.copy()
+    sel = idx[st == 1]
+    out[sel] = Hm[sel]
+    return out
+
+
+BONE_LANDMARKS = {
+    "hips": [L_HIP, R_HIP, L_SH, R_SH], "spine": [L_HIP, R_HIP, L_SH, R_SH], "chest": [L_HIP, R_HIP, L_SH, R_SH],
+    "upperChest": [L_HIP, R_HIP, L_SH, R_SH], "neck": [NOSE, L_EAR, R_EAR, L_SH, R_SH], "head": [NOSE, L_EAR, R_EAR],
+}
+for _s, _S in (("left", "L"), ("right", "R")):
+    _l = (lambda a, b: a if _S == "L" else b)
+    BONE_LANDMARKS.update({
+        f"{_s}UpperArm": [_l(L_SH, R_SH), _l(L_EL, R_EL)], f"{_s}LowerArm": [_l(L_EL, R_EL), _l(L_WR, R_WR)],
+        f"{_s}UpperLeg": [_l(L_HIP, R_HIP), _l(L_KNEE, R_KNEE)], f"{_s}LowerLeg": [_l(L_KNEE, R_KNEE), _l(L_ANK, R_ANK)],
+        f"{_s}Foot": [_l(L_ANK, R_ANK), _l(L_HEEL, R_HEEL), _l(L_FOOT, R_FOOT)],
+        f"{_s}Toes": [_l(L_ANK, R_ANK), _l(L_HEEL, R_HEEL), _l(L_FOOT, R_FOOT)],
+    })
+
+
+def bone_confidence(skel, vis, hs, valid, hvalid):
+    """(N,B) confidence that each bone's rotation was actually observed."""
+    N = len(vis)
+    conf = np.zeros((N, len(skel.bones)))
+    for i, b in enumerate(skel.bones):
+        side = 0 if b.startswith("left") else 1
+        if b.endswith("Hand") or any(f in b for f in FINGERS):
+            c = np.where(hvalid[:, side], hs[:, side], 0.0)
+        elif b in BONE_LANDMARKS:
+            c = vis[:, BONE_LANDMARKS[b]].min(1)
+        else:
+            c = np.ones(N)  # shoulders / eyes / jaw: never driven, stay at rest
+        conf[:, i] = np.where(valid, c, 0.0)
+    return conf
 
 
 def runs(mask, shot_of):
@@ -775,3 +867,50 @@ def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06, leash=0.035):
                 Q[k, il] = mat_to_quat(Gu.T @ Gl)
                 Q[k, ifo] = mat_to_quat(Gl.T @ Gf)
     return Q
+
+
+OUTPUT_FPS = (12, 24, 30, 60)
+
+
+def resample_anim(anim, fps_out):
+    """Resample a solved animation to exactly `fps_out` frames per second.
+
+    Output frame k is at time k / fps_out. Rotations are interpolated on the
+    sphere, positions linearly; nothing is blended across a camera cut.
+    `src_frame` gives the nearest source video frame for each output frame."""
+    fps_in = float(anim["fps"])
+    n_in = int(anim["frames"])
+    if abs(fps_out - fps_in) < 1e-9:
+        out = dict(anim)
+        out["src_frame"] = np.arange(n_in, dtype=np.int32)
+        out["src_fps"] = fps_in
+        return out
+    dur = n_in / fps_in
+    n_out = max(1, int(np.floor(dur * fps_out + 1e-6)))
+    t = np.arange(n_out) / fps_out * fps_in  # fractional source index
+    i0 = np.clip(np.floor(t).astype(int), 0, n_in - 1)
+    i1 = np.clip(i0 + 1, 0, n_in - 1)
+    a = (t - i0)[:, None]
+    shot = np.asarray(anim["shot_of"])
+    cut = shot[i0] != shot[i1]
+    a = np.where(cut[:, None], np.round(a), a)
+    near = np.where(a[:, 0] < 0.5, i0, i1)
+    out = {k: v for k, v in anim.items() if not isinstance(v, np.ndarray)}
+    q0 = np.asarray(anim["quats"], np.float64)[i0]
+    q1 = np.asarray(anim["quats"], np.float64)[i1]
+    q1 = np.where(np.sum(q0 * q1, -1, keepdims=True) < 0, -q1, q1)
+    out["quats"] = normalize(q0 * (1 - a[:, :, None]) + q1 * a[:, :, None]).astype(np.float32)
+    for k in ("root", "cam_pos"):
+        v = np.asarray(anim[k], np.float64)
+        out[k] = (v[i0] * (1 - a) + v[i1] * a).astype(np.float32)
+    c0, c1 = np.asarray(anim["cam_quat"], np.float64)[i0], np.asarray(anim["cam_quat"], np.float64)[i1]
+    c1 = np.where(np.sum(c0 * c1, -1, keepdims=True) < 0, -c1, c1)
+    out["cam_quat"] = normalize(c0 * (1 - a) + c1 * a).astype(np.float32)
+    for k, v in anim.items():
+        if isinstance(v, np.ndarray) and k not in out and len(v) == n_in:
+            out[k] = v[near]
+    out["fps"] = float(fps_out)
+    out["frames"] = int(n_out)
+    out["src_fps"] = fps_in
+    out["src_frame"] = near.astype(np.int32)
+    return out

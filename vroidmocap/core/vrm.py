@@ -62,6 +62,7 @@ class VrmSkeleton:
     raw_world_pos: dict               # bone -> rest world position in the *file* frame
     to_file: np.ndarray               # 3x3: normalized frame -> file frame
     tips: dict = field(default_factory=dict)  # bone -> position of a child "end" node, if any
+    path: str = ""
 
     def has(self, b):
         return b in self.rest_pos
@@ -188,4 +189,4 @@ def load_vrm_skeleton(path) -> VrmSkeleton:
         if kids and not any(parent[x] == b for x in ordered if x != b):
             tips[b] = to_norm @ world[kids[0]][:3, 3]
     return VrmSkeleton(version, title, ordered, parent, rest_pos, node_name, raw_rot,
-                       raw_pos, to_file, tips)
+                       raw_pos, to_file, tips, path=str(path))

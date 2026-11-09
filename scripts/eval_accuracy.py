@@ -103,6 +103,15 @@ def main(workdir, cid, vrm):
         acc = np.linalg.norm(p[2:] - 2 * p[1:-1] + p[:-2], axis=1)[valid[1:-1]]
         jit.append(np.median(acc) * 1000)
     print(f"jitter (median joint acceleration): {np.mean(jit):.2f} mm/frame^2")
+    # rotational jitter / flips: per-bone angular velocity and acceleration of local rotations
+    from vroidmocap.core.naturalize import q_log
+    from vroidmocap.core.mathutil import quat_conj, quat_mul
+    qd = quat_mul(quat_conj(Q[:-1]), Q[1:])
+    w = q_log(qd)
+    acc = np.degrees(np.linalg.norm(w[1:] - w[:-1], axis=-1))[valid[1:-1]]
+    vel = np.degrees(np.linalg.norm(w, axis=-1))
+    print(f"rotation jitter: median {np.median(acc):.2f} deg/frame^2, p99 {np.percentile(acc, 99):.1f}; "
+          f"worst single-frame jump {vel.max():.1f} deg (p99.9 {np.percentile(vel, 99.9):.1f})")
     # foot sliding: horizontal speed of a foot while it is marked as planted
     contacts = d["contacts"].astype(bool)
     slide = []

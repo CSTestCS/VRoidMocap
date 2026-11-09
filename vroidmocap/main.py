@@ -86,6 +86,8 @@ def cli(argv):
     c.add_argument("--in-place", action="store_true")
     c.add_argument("--smoothing", type=float, default=1.0)
     c.add_argument("--no-foot-lock", action="store_true", help="do not pin planted feet (raw leg angles)")
+    c.add_argument("--fps", type=int, default=30, choices=(12, 24, 30, 60), help="output frame rate")
+    c.add_argument("--no-model", action="store_true", help="export the skeleton/animation only (no avatar mesh)")
     g = sub.add_parser("gui")
     g.add_argument("--browser", action="store_true")
     g.add_argument("--port", type=int, default=0)
@@ -122,7 +124,8 @@ def cli(argv):
         if STATE.job.error:
             print("Error:", STATE.job.error)
             return 1
-        STATE.export(args.character - 1, args.out, in_place=args.in_place)
+        STATE.export(args.character - 1, args.out, in_place=args.in_place, fps=args.fps,
+                     include_model=not args.no_model)
         print("Wrote", args.out)
     return 0
 

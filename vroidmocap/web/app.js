@@ -236,8 +236,10 @@ async function openAnimation(cid) {
   try {
     showStep("viewer");
     await ensureViewer();
-    const meta = await api(`/api/anim/${cid}/meta`);
-    const buf = await (await fetch(`/api/anim/${cid}/bin`)).arrayBuffer();
+    const keepT = S.character === cid && S.anim ? S.frame / S.anim.fps : null;
+    const fps = Number($("fpsSel").value);
+    const meta = await api(`/api/anim/${cid}/meta?fps=${fps}`);
+    const buf = await (await fetch(`/api/anim/${cid}/bin?fps=${fps}`)).arrayBuffer();
     S.viewer.setAnimation(meta, buf);
     S.anim = S.viewer.anim;
     S.character = cid;
@@ -246,7 +248,7 @@ async function openAnimation(cid) {
     $("viewerChar").textContent = c ? c.name : "";
     $("scrub").max = meta.frames - 1;
     drawTrack();
-    seek(firstValid());
+    seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
 function firstValid() { const v = S.anim.valid; for (let i = 0; i < v.length; i++) if (v[i] > 0.5) return i; return 0; }
@@ -258,7 +260,7 @@ function loadFrameImage(f) {
   if (imgBusy) return;
   imgBusy = true;
   const targets = [$("frameImg"), S.ovImg].filter(Boolean);
-  const url = `/api/frame/${f}.jpg?w=${S.layout === "overlay" ? 1280 : 960}`;
+  const url = `/api/frame/${S.anim.src[f]}.jpg?w=${S.layout === "overlay" ? 1280 : 960}`;
   const img = new Image();
   img.onload = () => {
     for (const t of targets) t.src = img.src;
@@ -286,9 +288,9 @@ function seek(f) {
   S.viewer.setFrame(f);
   $("scrub").value = f;
   const fps = S.anim.fps;
-  $("timecode").textContent = `${fmtTime(f / fps)}.${String(Math.floor(((f / fps) % 1) * 100)).padStart(2, "0")} · frame ${f} / ${S.anim.frames - 1}`;
+  $("timecode").textContent = `${fmtTime(f / fps)}.${String(Math.floor(((f / fps) % 1) * 100)).padStart(2, "0")} · frame ${f} / ${S.anim.frames - 1} @ ${S.anim.fps} fps`;
   const shot = S.anim.shot[f];
-  const row = S.analysis?.camera?.[f];
+  const row = S.analysis?.camera?.[S.anim.src[f]];
   $("frameInfo").textContent = (S.anim.valid[f] > 0.5 ? "Tracked" : "Character not visible (pose interpolated)") +
     ` · shot ${shot + 1}` + (row ? ` · camera yaw ${row[0].toFixed(1)}° pitch ${row[1].toFixed(1)}° roll ${row[2].toFixed(1)}° · FOV ${S.anim.vfov[f].toFixed(1)}°` : "") +
     ` · hands ${S.anim.hs[f * 2] >= 0.5 ? "L✓" : "L–"} ${S.anim.hs[f * 2 + 1] >= 0.5 ? "R✓" : "R–"}`;
@@ -367,10 +369,14 @@ $("showGrid").onchange = (e) => (S.viewer.showFloor = e.target.checked);
 new ResizeObserver(() => sizeLm()).observe($("paneVideo"));
 $("frameImg").addEventListener("load", () => sizeLm());
 
-$("exportBtn").onclick = () => $("exportDlg").showModal();
+$("exportBtn").onclick = () => {
+  $("exFps").textContent = `${S.anim.frames} frames at exactly ${S.anim.fps} fps (change it with “Frame rate” in the toolbar).`;
+  $("exportDlg").showModal();
+};
+$("fpsSel").onchange = () => { if (S.character != null) openAnimation(S.character); };
 $("exportDlg").addEventListener("close", async () => {
   if ($("exportDlg").returnValue !== "ok") return;
-  const opts = { character: S.character, in_place: $("exInPlace").checked, lock_height: $("exLockHeight").checked, camera: $("exCamera").checked };
+  const opts = { character: S.character, in_place: $("exInPlace").checked, lock_height: $("exLockHeight").checked, camera: $("exCamera").checked, fps: S.anim.fps, model: $("exModel").checked };
   const c = S.analysis.characters.find((x) => x.id === S.character);
   const base = (S.state.video || "video").split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
   const name = `${base}_${(c?.name || "character").replace(/[^\w-]+/g, "_")}.fbx`;
@@ -383,7 +389,7 @@ $("exportDlg").addEventListener("close", async () => {
       setJob(null);
       toast(`Saved ${path}`);
     } else {
-      const q = new URLSearchParams({ character: S.character, in_place: opts.in_place ? 1 : 0, lock_height: opts.lock_height ? 1 : 0, camera: opts.camera ? 1 : 0 });
+      const q = new URLSearchParams({ character: S.character, in_place: opts.in_place ? 1 : 0, lock_height: opts.lock_height ? 1 : 0, camera: opts.camera ? 1 : 0, fps: opts.fps, model: opts.model ? 1 : 0 });
       const a = document.createElement("a");
       a.href = `/api/export.fbx?${q}`;
       a.download = name;

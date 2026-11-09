@@ -202,14 +202,26 @@ class AppState:
         self.anims[char_id] = anim
         return anim
 
-    def anim_binary(self, char_id):
-        a = self.anim(char_id)
-        parts = [("quats", a["quats"]), ("root", a["root"]), ("cam_pos", a["cam_pos"]),
+    def anim_at(self, char_id, fps):
+        """The animation resampled to exactly `fps` (12, 24, 30 or 60)."""
+        from .core.retarget import OUTPUT_FPS, resample_anim
+        fps = int(fps)
+        if fps not in OUTPUT_FPS:
+            raise ValueError(f"Frame rate must be one of {OUTPUT_FPS}")
+        key = (char_id, fps)
+        cache = self.__dict__.setdefault("_resampled", {})
+        if key not in cache or cache[key][0] is not self.anim(char_id):
+            cache[key] = (self.anim(char_id), resample_anim(self.anim(char_id), fps))
+        return cache[key][1]
+
+    def anim_binary(self, char_id, fps=30):
+        a = self.anim_at(char_id, fps)
+        parts = [("src_frame", a["src_frame"].astype(np.float32)), ("quats", a["quats"]), ("root", a["root"]), ("cam_pos", a["cam_pos"]),
                  ("cam_quat", a["cam_quat"]), ("cam_vfov", a["cam_vfov"]),
                  ("valid", a["valid"].astype(np.float32)), ("contacts", a["contacts"].astype(np.float32)),
                  ("lm2d", a["lm2d"]), ("vis", a["vis"]), ("h2d", a["h2d"]), ("hs", a["hs"]),
                  ("shot_of", a["shot_of"].astype(np.float32))]
-        meta = {k: a[k] for k in ("fps", "frames", "width", "height", "character", "bones", "scale")}
+        meta = {k: a[k] for k in ("fps", "frames", "width", "height", "character", "bones", "scale", "src_fps")}
         meta["layout"] = {}
         off = 0
         blobs = []
@@ -220,10 +232,13 @@ class AppState:
             off += arr.nbytes
         return meta, b"".join(blobs)
 
-    def export(self, char_id, path, in_place=False, lock_height=False, include_camera=True):
+    def export(self, char_id, path, in_place=False, lock_height=False, include_camera=True, fps=30,
+               include_model=True, write_textures=True):
         from .core.fbx_writer import export_animation_fbx
-        return export_animation_fbx(path, self.skel, self.anim(char_id), in_place=in_place,
-                                    lock_height=lock_height, include_camera=include_camera)
+        tex_dir = os.path.splitext(path)[0] + ".fbm" if (include_model and write_textures) else None
+        return export_animation_fbx(path, self.skel, self.anim_at(char_id, fps), in_place=in_place,
+                                    lock_height=lock_height, include_camera=include_camera,
+                                    vrm_path=self.vrm, include_model=include_model, texture_dir=tex_dir)
 
 
 STATE = AppState()
@@ -304,7 +319,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.startswith("/api/anim/"):
                 parts = p.split("/")
                 cid = int(parts[3])
-                meta, blob = STATE.anim_binary(cid)
+                meta, blob = STATE.anim_binary(cid, int(q.get("fps", 30)))
                 if parts[4] == "meta":
                     return self._send(200, meta)
                 return self._send(200, blob, "application/octet-stream")
@@ -313,7 +328,8 @@ class Handler(BaseHTTPRequestHandler):
                 fd, tmp = tempfile.mkstemp(suffix=".fbx")
                 os.close(fd)
                 STATE.export(cid, tmp, q.get("in_place") == "1", q.get("lock_height") == "1",
-                             q.get("camera", "1") == "1")
+                             q.get("camera", "1") == "1", int(q.get("fps", 30)), q.get("model", "1") == "1",
+                             write_textures=False)  # single-file download: textures are embedded
                 base = os.path.splitext(os.path.basename(STATE.video or "video"))[0]
                 self._file(tmp, "application/octet-stream", f"{base}_character{cid + 1}.fbx")
                 os.remove(tmp)
@@ -364,7 +380,8 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/export":
                 path = body["path"]
                 STATE.export(int(body["character"]), path, bool(body.get("in_place")),
-                             bool(body.get("lock_height")), bool(body.get("camera", True)))
+                             bool(body.get("lock_height")), bool(body.get("camera", True)),
+                             int(body.get("fps", 30)), bool(body.get("model", True)))
                 return self._send(200, {"ok": True, "path": path})
             if p == "/api/rename":
                 cid = int(body["character"])

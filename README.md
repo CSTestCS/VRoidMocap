@@ -23,9 +23,10 @@ A Windows app that turns a video into a motion-capture animation for your own
    and planted feet are pinned with leg IK so they do not slide.
 3. **Viewer**. Watch side by side with the video, as *avatar over video*
    (the clip rendered through the solved camera, to check alignment), or with a
-   free orbit camera. Scrub, step frame by frame, **lock movement** (keeps the
-   character in the middle of the room, optionally height too) and **export
-   `.fbx`**. Go back and pick another character at any time without
+   free orbit camera. Scrub, step frame by frame, pick the output frame rate
+   (12/24/30/60 fps), **lock movement** (keeps the character in the middle of
+   the room, optionally height too) and **export `.fbx`**, with or without
+   the avatar model. Go back and pick another character at any time without
    re-analysing.
 
 ## Download / run
@@ -45,55 +46,72 @@ Command line: use `VRoidMocapCLI.exe` (same app, console build):
 
 ```
 VRoidMocapCLI.exe analyze video.mp4
-VRoidMocapCLI.exe capture video.mp4 avatar.vrm 1 out.fbx [--in-place] [--smoothing 1] [--no-foot-lock]
+VRoidMocapCLI.exe capture video.mp4 avatar.vrm 1 out.fbx [--fps 30] [--no-model] [--in-place] [--smoothing 1] [--no-foot-lock]
 VRoidMocapCLI.exe selftest
 ```
 
 ## The exported FBX
 
-* Skeleton = your avatar's own humanoid bones, with the **same bone names and
-  rest orientations** as the `.vrm`, so the clip binds by name to the model in
-  Blender (VRM add-on), Unity (Humanoid rig), Unreal and Maya.
-* One key per video frame at the video's frame rate, centimetres, Y-up.
-* Optional animated camera **VideoCamera** that reproduces the original
-  camera (position, rotation and focal length), so you can render your avatar
-  from the exact shots of the video.
-* *In place* / *lock height* options match the viewer's *lock movement* toggle.
+* **Frame rate:** exactly 12, 24, 30 or 60 fps (toolbar *Frame rate*). The
+  animation is resampled to that rate, and the viewer plays at the same rate.
+* **Skeleton:** your avatar's complete VRoid node hierarchy (every bone,
+  including hair and skirt bones, with the original names and rest transforms).
+  Only rotations are animated, plus the hips translation for root motion.
+* **Model (optional, on by default):** the avatar's meshes with skin weights,
+  materials and textures. Textures are embedded in the FBX; when saving to a
+  folder they are also written to `<name>.fbm/`. Untick *Include the avatar
+  model* for an animation-only FBX that binds by bone name to the same model
+  in Blender, Unity (Humanoid), Unreal or Maya.
+* Optional animated **VideoCamera** that reproduces the original camera
+  (position, rotation, focal length).
+* *In place* / *lock height* match the viewer's *lock movement* toggle.
 
-The exporter is verified by importing into Blender: joint positions and the
-camera match the app's own solve to 0.0 cm / 0.0°.
+Verified by importing into Blender: bone positions match the app's solve to
+0.0 cm, the camera matches exactly, and skinned vertices follow their bones
+exactly.
+
+## How the motion is cleaned up
+
+* **Unseen bones freeze.** Every bone has a per-frame confidence: are its
+  joints visible and inside the picture, and was the hand found? While a bone
+  (or the whole character) is not seen, it holds its last seen pose, then blends
+  into the next seen pose over 0.2 s. Root motion freezes the same way.
+* **No flips.** Single-frame spikes are rejected. The palm vs back-of-hand
+  ambiguity of the hand detector is resolved over the whole clip (Viterbi).
+  Finger joints that appear bent backwards (a depth ambiguity) are mirrored
+  forward.
+* **Natural joints (IK + limits).** Elbows and knees are solved as hinges with
+  two-bone IK that keeps the wrist and ankle where they are. Forearm twist
+  (pronation/supination) is filtered and kept in its anatomical range without
+  flipping. Wrists, finger joints (hinges, knuckle splay), thumbs, spine, neck
+  and feet are kept inside joint limits. The skeleton itself is never changed;
+  only rotations are corrected.
+* **Smoothing** is motion-adaptive and zero-phase: strong where a bone is
+  nearly still (where jitter shows), light during fast moves. Hands and fingers
+  get extra smoothing.
 
 ## Accuracy
 
 `scripts/eval_accuracy.py` projects the posed avatar through the solved camera
-and compares every limb with the video. On a 25 s clip of the sample video
-(1080p60 dance with a moving camera), at default settings:
+and compares every limb with the video. Full 3-minute sample (1080p60 dance,
+moving camera), default settings:
 
-| | median 2D angle error vs video |
+| | |
 |---|---|
-| upper arms, thighs, shoulders, hips | 0.3–1.0° |
-| shins (with foot locking) | 1–2° |
-| fingers (where the hand is visible) | ~2.7° |
+| body limbs, median 2D angle error vs video | 1.2° |
+| fingers vs the hand detector | ~11° (the detector itself is noisy on small hands) |
+| rotation jitter (median / 99th pct) | 0.2 / 4.7 °/frame² |
 | hips position | 1% of body height |
 | planted foot sliding | 0 cm/s median |
 
-With smoothing at 0 the body is at 0.1–0.2° and fingers 0.7°, but with more
-frame-to-frame jitter. The *Smoothing* slider and *Lock planted feet* checkbox
-in step 2 let you choose. *Re-solve* on a character card re-runs only the solve
-(seconds), not the capture.
-
 Honest limits of single-camera capture:
 * **Depth**, meaning how far a limb points toward or away from the camera, is
-  inferred, not measured. It is smoothed over time and constrained by bone
-  lengths, but it is the least certain part.
-* **Hidden fingers** (fists, hands behind the body, hands holding a prop) are
-  filled from neighbouring frames. Hand coverage is shown under the timeline.
-* **Proportions:** the avatar receives the *rotations*, not the positions, so
-  an avatar with different limb lengths will not overlap the video pixel for
-  pixel.
-* Camera translation along the view axis (dolly) can't be separated from the
-  character moving. Root motion therefore comes from foot contacts, which
-  works for tracking and handheld shots.
+  inferred, not measured.
+* **Hidden or tiny hands:** fingers are only as good as what can be seen; when
+  unseen they hold their last pose.
+* **Very fast spins** can briefly confuse front and back.
+* **Proportions:** the avatar receives rotations, not positions, so an avatar
+  with different limb lengths will not overlap the video pixel for pixel.
 
 ## Building the exe yourself
 

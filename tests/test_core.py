@@ -122,7 +122,7 @@ def random_pose(skel, rng, amount=0.6):
         setq(f"{s}Hand", aa([0, 0, -sx], U(-50, 60)) @ aa([0, 1, 0], U(-20, 20)))
         setq(f"{s}UpperLeg", axis_angle_to_mat(normalize(rng.normal(size=3)), U(0.1, 1.0)))
         setq(f"{s}LowerLeg", aa([1, 0, 0], U(20, 120)))  # knee hinge: shin swings back
-        setq(f"{s}Foot", aa([1, 0, 0], U(-30, 30)) @ aa([0, 0, 1], U(-15, 15)))
+        setq(f"{s}Foot", aa([1, 0, 0], U(-30, 30)))  # ankle flexion (foot roll is not observable)
         for fg in FINGERS:
             for k, seg in enumerate(FINGER_SEGS[fg]):
                 b = f"{s}{fg}{seg}"
@@ -272,6 +272,27 @@ def read_fbx_tree(path):
     return nodes
 
 
+def write_skeleton_glb(skel, path):
+    """Tiny GLB containing just the skeleton's nodes (for exporter tests)."""
+    import json as _json
+    nodes = []
+    for b in skel.bones:
+        p = skel.parent[b]
+        t = skel.rest_pos[b] - (skel.rest_pos[p] if p else 0)
+        nodes.append({"name": b, "translation": [float(x) for x in t], "children": []})
+    for i, b in enumerate(skel.bones):
+        p = skel.parent[b]
+        if p:
+            nodes[skel.bones.index(p)]["children"].append(i)
+    for nd in nodes:
+        if not nd["children"]:
+            del nd["children"]
+    js = _json.dumps({"asset": {"version": "2.0"}, "nodes": nodes, "scenes": [{"nodes": [0]}], "scene": 0}).encode()
+    js += b" " * ((4 - len(js) % 4) % 4)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js)) + struct.pack("<I4s", len(js), b"JSON") + js)
+
+
 class FbxExport(unittest.TestCase):
     def test_write_and_parse(self):
         from vroidmocap.core.fbx_writer import export_animation_fbx
@@ -284,17 +305,83 @@ class FbxExport(unittest.TestCase):
                 "cam_quat": np.tile([0, 0, 0, 1.0], (N, 1)), "cam_vfov": np.full(N, 40.0), "width": 1920, "height": 1080}
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.fbx")
-            export_animation_fbx(p, skel, anim)
+            write_skeleton_glb(skel, os.path.join(d, "t.glb"))
+            export_animation_fbx(p, skel, anim, vrm_path=os.path.join(d, "t.glb"))
             tree = read_fbx_tree(p)
         names = [n[0] for n in tree]
         for k in ("FBXHeaderExtension", "GlobalSettings", "Definitions", "Objects", "Connections", "Takes"):
             self.assertIn(k, names)
         objects = next(n for n in tree if n[0] == "Objects")
         models = [n for n in objects[2] if n[0] == "Model"]
-        self.assertEqual(len(models), len(skel.bones) + 2)  # bones + armature root + camera
+        self.assertEqual(len(models), len(skel.bones) + 1)  # bones + camera
         curves = [n for n in objects[2] if n[0] == "AnimationCurve"]
         self.assertTrue(all(len(next(k for k in c[2] if k[0] == "KeyTime")[1][0]) == N for c in curves))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Naturalize(unittest.TestCase):
+    def test_anatomical_poses_are_kept(self):
+        from vroidmocap.core.naturalize import Naturalizer
+        skel = synthetic_skeleton()
+        rng = np.random.default_rng(4)
+        # continuous motion: blend between anatomical key poses (as in real footage)
+        from vroidmocap.core.naturalize import slerp_many
+        keys = [random_pose(skel, rng)[0] for _ in range(4)]
+        Q = np.concatenate([np.stack([slerp_many(k0[b], k1[b], np.linspace(0, 1, 20, endpoint=False))
+                                      for b in range(len(skel.bones))], 1) for k0, k1 in zip(keys[:-1], keys[1:])])
+        root = np.tile([0, 1.0, 0], (len(Q), 1))
+        Q2 = Naturalizer(skel).apply(Q, root, fps=30.0)
+        # (a blend of two anatomical poses is itself anatomical, so little should change)
+        pos, _ = avatar_fk(skel, Q, root)
+        pos2, _ = avatar_fk(skel, Q2, root)
+        # hands, feet and every finger joint stay where they were (IK keeps end points)
+        ends = [skel.bones.index(b) for b in skel.bones if b.endswith(("Hand", "Foot", "Distal", "Intermediate"))]
+        err = np.linalg.norm(pos2[:, ends] - pos[:, ends], axis=-1)
+        self.assertLess(np.median(err), 0.01, f"median {np.median(err)}")
+
+    def test_clamp_never_flip_flops(self):
+        from vroidmocap.core.naturalize import clamp_continuous
+        # a noisy signal hovering in the middle of the forbidden zone must not
+        # alternate between the two bounds
+        t = np.radians(-140 + 8 * np.random.default_rng(1).normal(size=300))
+        out = clamp_continuous(t, np.radians(-100), np.radians(180))
+        switches = np.sum(np.abs(np.diff(out)) > 1e-9)
+        self.assertLessEqual(switches, 6)  # was 80 with a plain nearest-bound clamp
+
+    def test_unseen_bones_freeze(self):
+        from vroidmocap.core.naturalize import filter_rotations, q_angle
+        N = 120
+        ang = np.radians(np.linspace(0, 60, N))
+        Q = np.zeros((N, 1, 4))
+        Q[:, 0, 2] = np.sin(ang / 2)
+        Q[:, 0, 3] = np.cos(ang / 2)
+        conf = np.ones((N, 1))
+        conf[40:90] = 0.0  # bone not visible
+        # garbage while unseen must not leak in
+        Q[40:90, 0] = normalize(np.random.default_rng(0).normal(size=(50, 4)))
+        out = filter_rotations(Q, conf, fps=30.0, smoothing=1.0)
+        # held near the last seen pose for most of the gap, no wild motion
+        held = np.degrees(q_angle(out[45:80, 0], Q[39, 0]))
+        self.assertLess(held.max(), 6.0)
+        step = np.degrees(q_angle(out[1:, 0], out[:-1, 0]))
+        # re-appearing: blended in over 0.2 s, never a jump
+        self.assertLess(step.max(), 12.0)
+
+    def test_backward_finger_is_reflected(self):
+        from vroidmocap.core.naturalize import Naturalizer, q_axis_angle
+        skel = synthetic_skeleton()
+        nat = Naturalizer(skel)
+        b = "leftIndexIntermediate"
+        i = skel.bones.index(b)
+        a = nat.axis[b]
+        h = normalize(np.cross(a, [0, -1.0, 0]))
+        Q = np.zeros((1, len(skel.bones), 4))
+        Q[..., 3] = 1
+        Q[0, i] = q_axis_angle(h, np.radians(-50))  # bent backwards 50 deg
+        Q2 = nat.unflip_fingers(Q)
+        d = quat_to_mat(Q2[0, i]) @ a
+        u = normalize(np.cross(h, a))
+        self.assertAlmostEqual(np.degrees(np.arctan2(d @ u, d @ a)), 50.0, places=3)

@@ -82,7 +82,7 @@ export class Viewer {
       meta, frames: meta.frames, fps: meta.fps, bones: meta.bones, B: meta.bones.length,
       quats: f32("quats"), root: f32("root"), camPos: f32("cam_pos"), camQuat: f32("cam_quat"),
       vfov: f32("cam_vfov"), valid: f32("valid"), contacts: f32("contacts"),
-      lm2d: f32("lm2d"), vis: f32("vis"), h2d: f32("h2d"), hs: f32("hs"), shot: f32("shot_of"),
+      lm2d: f32("lm2d"), vis: f32("vis"), h2d: f32("h2d"), hs: f32("hs"), shot: f32("shot_of"), src: f32("src_frame"),
     };
     this.videoCam.aspect = meta.width / meta.height;
     this.nodes = null;
