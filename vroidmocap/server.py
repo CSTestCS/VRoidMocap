@@ -147,9 +147,11 @@ class AppState:
         from .core.analysis import Analyzer
 
         def run(progress, cancel):
-            if force:
-                for name in os.listdir(self.workdir):
-                    pth = os.path.join(self.workdir, name)
+            for name in os.listdir(self.workdir):
+                pth = os.path.join(self.workdir, name)
+                # a new analysis invalidates captures / animations made from the old one
+                stale = name.startswith(("capture_c", "anim_c")) or (force and name != "thumbs")
+                if stale or (force and name == "thumbs"):
                     shutil.rmtree(pth) if os.path.isdir(pth) else os.remove(pth)
             res = Analyzer(self.video, self.workdir, progress, cancel).run()
             self.analysis = res
