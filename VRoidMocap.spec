@@ -20,6 +20,18 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
+# console build: same app, for command-line use and diagnostics
+cli = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    name="VRoidMocapCLI",
+    icon="packaging/icon.ico",
+    console=True,
+    upx=False,
+    runtime_tmpdir=None,
+)
 exe = EXE(
     pyz,
     a.scripts,

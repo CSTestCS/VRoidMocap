@@ -139,11 +139,16 @@ def setup_logging():
 
 def selftest():
     """Load every model and run it once (used by the build to verify the exe)."""
+    import faulthandler
+    faulthandler.dump_traceback_later(150, exit=True)  # print where it is stuck, if it ever stalls
+    print("selftest: python", sys.version.split()[0], "frozen", getattr(sys, "frozen", False), flush=True)
     import numpy as np
     from .core.detect import Embedder, HandDetector, PoseDetector
     img = np.zeros((256, 256, 3), np.uint8)
+    print("selftest: numpy", np.__version__, flush=True)
     for name, make in (("pose_full", lambda: PoseDetector(False)), ("pose_heavy", lambda: PoseDetector(True)),
                        ("hand", HandDetector), ("embed", Embedder)):
+        print("selftest: loading", name, flush=True)
         m = make()
         (m.embed if name == "embed" else m.detect)(img)
         m.close()

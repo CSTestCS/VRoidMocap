@@ -41,10 +41,11 @@ jobs:
         timeout-minutes: 10
         run: |
           $log = "$env:LOCALAPPDATA\VRoidMocap\vroidmocap.log"
-          $t = Start-Process -FilePath dist\VRoidMocap.exe -ArgumentList "selftest" -PassThru
-          if (-not $t.WaitForExit(240000)) { Stop-Process -Id $t.Id -Force; if (Test-Path $log) { Get-Content $log }; throw "selftest timed out" }
-          if (Test-Path $log) { Get-Content $log }
-          if (-not (Select-String -Path $log -Pattern "SELFTEST PASSED" -Quiet)) { throw "selftest failed" }
+          $t = Start-Process -FilePath dist\VRoidMocapCLI.exe -ArgumentList "selftest" -PassThru -NoNewWindow -RedirectStandardOutput st_out.txt -RedirectStandardError st_err.txt
+          $done = $t.WaitForExit(240000)
+          Get-Content st_out.txt; Get-Content st_err.txt
+          if (-not $done) { Stop-Process -Id $t.Id -Force; throw "selftest timed out" }
+          if (-not (Select-String -Path st_out.txt -Pattern "SELFTEST PASSED" -Quiet)) { throw "selftest failed" }
           $p = Start-Process -FilePath dist\VRoidMocap.exe -ArgumentList "--browser","--port","8799" -PassThru
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
@@ -57,11 +58,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: VRoidMocap-windows
-          path: dist/VRoidMocap.exe
+          path: |
+            dist/VRoidMocap.exe
+            dist/VRoidMocapCLI.exe
           if-no-files-found: error
 
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/VRoidMocap.exe
+          files: |
+            dist/VRoidMocap.exe
+            dist/VRoidMocapCLI.exe
