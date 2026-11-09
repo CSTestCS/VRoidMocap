@@ -237,18 +237,21 @@ export function drawLandmarks(ctx, A, f, sx, sy) {
   if (!A || A.valid[f] < 0.5) return;
   const P = (i) => [A.lm2d[(f * 33 + i) * 2] * sx, A.lm2d[(f * 33 + i) * 2 + 1] * sy];
   const V = (i) => A.vis[f * 33 + i];
-  ctx.lineWidth = 2;
-  for (const [a, b] of POSE_EDGES) {
-    if (V(a) < 0.3 || V(b) < 0.3) continue;
-    const left = (a % 2 === 1 && a > 10) || (b % 2 === 1 && b > 10);
-    ctx.strokeStyle = left ? "rgba(79,209,197,.9)" : "rgba(246,173,85,.9)";
-    const [x1, y1] = P(a), [x2, y2] = P(b);
-    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.lineCap = "round";
+  for (const pass of [0, 1]) {
+    for (const [a, b] of POSE_EDGES) {
+      if (V(a) < 0.3 || V(b) < 0.3) continue;
+      const left = (a % 2 === 1 && a > 10) || (b % 2 === 1 && b > 10);
+      ctx.lineWidth = pass ? 2 : 4;
+      ctx.strokeStyle = pass ? (left ? "#ff4fd8" : "#ffe14f") : "rgba(0,0,0,.7)";
+      const [x1, y1] = P(a), [x2, y2] = P(b);
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
   }
   for (let side = 0; side < 2; side++) {
     if (A.hs[f * 2 + side] < 0.5) continue;
     const H = (i) => [A.h2d[((f * 2 + side) * 21 + i) * 2] * sx, A.h2d[((f * 2 + side) * 21 + i) * 2 + 1] * sy];
-    ctx.strokeStyle = side === 0 ? "rgba(129,230,217,.95)" : "rgba(251,211,141,.95)";
+    ctx.strokeStyle = side === 0 ? "#ff9cf0" : "#fff3a0";
     ctx.lineWidth = 1.2;
     for (const [a, b] of HAND_EDGES) {
       const [x1, y1] = H(a), [x2, y2] = H(b);
