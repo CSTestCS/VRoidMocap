@@ -72,23 +72,33 @@ exactly.
 
 ## How the motion is cleaned up
 
-* **Unseen bones freeze.** Every bone has a per-frame confidence: are its
-  joints visible and inside the picture, and was the hand found? While a bone
-  (or the whole character) is not seen, it holds its last seen pose, then blends
-  into the next seen pose over 0.2 s. Root motion freezes the same way.
-* **No flips.** Single-frame spikes are rejected. The palm vs back-of-hand
-  ambiguity of the hand detector is resolved over the whole clip (Viterbi).
-  Finger joints that appear bent backwards (a depth ambiguity) are mirrored
-  forward.
-* **Natural joints (IK + limits).** Elbows and knees are solved as hinges with
-  two-bone IK that keeps the wrist and ankle where they are. Forearm twist
-  (pronation/supination) is filtered and kept in its anatomical range without
-  flipping. Wrists, finger joints (hinges, knuckle splay), thumbs, spine, neck
-  and feet are kept inside joint limits. The skeleton itself is never changed;
-  only rotations are corrected.
+* **Camera cuts are found on every frame.** A cut is a sudden one- or
+  two-frame spike in picture change; fast pans are not mistaken for cuts.
+  Short camera "snaps" become their own short shots, and wherever camera
+  tracking is lost the camera alignment restarts instead of drifting.
+* **A still camera stays still.** Wherever the background does not move, the
+  cloned camera is locked (fixed position and rotation). The character moves
+  within that fixed view: across the image it follows the video exactly, while
+  depth is corrected only while the feet are free, so planted feet never slide.
+* **Spins.** During spins the pose model can swap the character's left and
+  right or flip front and back. Every frame is read four ways (as detected,
+  sides swapped, depth mirrored, both) and the sequence whose body turns
+  smoothly is chosen.
+* **Unseen bones freeze.** A bone (or the whole character) that is not seen
+  holds its last seen pose, then blends into the next seen pose over 0.2 s.
+* **No flips.** Single-frame spikes are rejected. Palm vs back-of-hand and
+  the two possible depths of every elbow, wrist, knee and ankle are resolved
+  over time. Finger joints that appear bent backwards are mirrored forward.
+* **Natural joints (IK + limits).**
+  * Elbows: hinge IK that keeps the wrist where it is. The elbow sits where it
+    was seen, and the upper arm never turns past its natural range.
+  * Thighs never twist. They only swing to point at the knee; any twist the
+    leg needs happens at the knee (±45°).
+  * Forearm twist stays within its natural range. Wrists, fingers, thumbs,
+    spine, neck and feet stay within joint limits.
+  * The skeleton is never changed; only rotations are corrected.
 * **Smoothing** is motion-adaptive and zero-phase: strong where a bone is
-  nearly still (where jitter shows), light during fast moves. Hands and fingers
-  get extra smoothing.
+  nearly still, light during fast moves.
 
 ## Accuracy
 

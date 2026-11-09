@@ -144,6 +144,61 @@ def part_histograms(rgb, lm2d, vis):
     return np.concatenate(out)
 
 
+# ----------------------------------------------------------------------------- cuts
+def detect_cuts(video_path, progress=None, cancel=None):
+    """Exact frame of every camera cut, checked on EVERY frame.
+
+    A cut is a sudden spike in frame-to-frame difference compared with the
+    neighbouring frames (so fast pans / whip pans, which differ a lot on every
+    frame, are not cuts) or a large colour-histogram change. One-frame inserts
+    (a single frame of another camera) produce two cuts and become their own
+    tiny shot."""
+    rd = VideoReader(video_path)
+    N, fps = rd.frame_count, rd.fps
+    hist_c = np.ones(N)
+    mad = np.zeros(N)
+    prev_g = prev_h = None
+    for f, bgr in rd.iter_frames(1):
+        if cancel and cancel():
+            rd.close()
+            raise Cancelled()
+        sm = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+        g = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        hsv = cv2.cvtColor(sm, cv2.COLOR_BGR2HSV)
+        h = cv2.calcHist([hsv], [0, 1, 2], None, [12, 4, 4], [0, 180, 0, 256, 0, 256]).flatten()
+        h = h / max(h.sum(), 1)
+        if prev_g is not None:
+            hist_c[f] = float(np.minimum(h, prev_h).sum())
+            mad[f] = float(np.mean(np.abs(g - prev_g)))
+        prev_g, prev_h = g, h
+        if progress and f % 600 == 0:
+            progress(0.08 * f / max(N, 1), f"Finding camera cuts: frame {f + 1}/{N}")
+    rd.close()
+    k = max(2, int(round(0.25 * fps)))
+    spike = np.zeros(N, bool)
+    for f in range(1, N):
+        lo, hi = max(1, f - k), min(N, f + k + 1)
+        neigh = np.concatenate([mad[lo:f], mad[f + 1:hi]])
+        base = float(np.median(neigh)) if len(neigh) else 0.0
+        spike[f] = (mad[f] > 10 and mad[f] > 4.0 * base + 4.0) or hist_c[f] < 0.5
+    cuts = []
+    f = 1
+    while f < N:
+        if not spike[f]:
+            f += 1
+            continue
+        s0 = f
+        while f < N and spike[f]:
+            f += 1
+        n = f - s0
+        if n <= 2:                      # a cut (possibly with one transition frame)
+            cuts.append(s0)
+        elif n <= 0.25 * fps:           # a camera snap: its own short transition shot
+            cuts.extend([s0, f] if f < N else [s0])
+        # longer: an ordinary (fast) camera move, not a cut
+    return sorted(set(cuts))
+
+
 # ----------------------------------------------------------------------------- main pass
 class Analyzer:
     def __init__(self, video_path, workdir, progress=None, cancel=None, stride=None,
@@ -214,7 +269,7 @@ class Analyzer:
         self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
         embedder = Embedder()
 
-        scan_path = os.path.join(self.workdir, "scan.pkl")
+        scan_path = os.path.join(self.workdir, "scan_v2.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:
@@ -225,9 +280,11 @@ class Analyzer:
                 embedder.close()
                 rd.close()
                 return self._finish(t_start, N, fps, W, H, stride, sc)
+        cut_frames = detect_cuts(self.video_path, self.progress, self.cancel)
+        cut_set = set(cut_frames)
         cam_scale = 640.0 / W
         cw, ch = 640, int(round(H * cam_scale))
-        prev_gray = prev_hist = prev_mask = None
+        prev_gray = prev_mask = None
         tracks, finished = [], []
         shot_starts = [0]
         frame_ids, H_rel, H_ok = [], [], []
@@ -235,22 +292,16 @@ class Analyzer:
         lost_limit = max(2, int(round(0.6 * fps / stride)))
         thumbs = {}
         k = 0
+        prev_fi = -1
         for fi, bgr in rd.iter_frames(stride):
             if self.cancel():
                 raise Cancelled()
+            cuts_here = [c for c in range(prev_fi + 1, fi + 1) if c in cut_set] if prev_fi >= 0 else []
+            prev_fi = fi
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             small = cv2.resize(bgr, (cw, ch), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            hsv = cv2.cvtColor(cv2.resize(small, (96, 54)), cv2.COLOR_BGR2HSV)
-            hist = cv2.calcHist([hsv], [0, 1, 2], None, [12, 4, 4], [0, 180, 0, 256, 0, 256])
-            hist = hist.flatten() / max(hist.sum(), 1)
-            cut = False
-            mad = 0.0
-            if prev_hist is not None:
-                corr = float(np.minimum(hist, prev_hist).sum())  # histogram intersection
-                mad = float(np.mean(cv2.absdiff(gray, prev_gray)))
-                if corr < 0.45 or (corr < 0.62 and mad > 40):
-                    cut = True
+            cut = bool(cuts_here)
 
             # ---- camera motion (background only): keep matched point pairs for later
             pair, ok = None, False
@@ -269,7 +320,7 @@ class Analyzer:
                             if valid.sum() > 0.3 * valid.size:
                                 resid = float(np.mean(cv2.absdiff(warped, gray)[valid]))
                         if ratio < 0.3 or resid > 14.0:
-                            cut = True
+                            pass  # fast pan / blur: no usable camera motion for this step (not a cut)
                         else:
                             a, b = pts[good].reshape(-1, 2), nxt[good].reshape(-1, 2)
                             if len(a) > 300:
@@ -277,10 +328,10 @@ class Analyzer:
                                 a, b = a[sel], b[sel]
                             pair = np.concatenate([a, b], 1).astype(np.float32) / cam_scale
                             ok = True
-                elif mad > 30:
-                    cut = True
-            if cut and (not shot_starts or shot_starts[-1] != fi):
-                shot_starts.append(fi)
+            if cut:
+                for c in cuts_here:
+                    if c not in shot_starts:
+                        shot_starts.append(c)
                 finished.extend(tracks)
                 tracks = []
                 last_scan = -10 ** 9
@@ -348,13 +399,13 @@ class Analyzer:
             frame_ids.append(fi)
             H_rel.append(pair)
             H_ok.append(ok)
-            prev_gray, prev_hist = gray, hist
+            prev_gray = gray
             k += 1
             if k % 5 == 0:
                 el = time.time() - t_start
                 frac = fi / max(N - 1, 1)
                 eta = el / max(frac, 1e-6) * (1 - frac)
-                self.progress(frac * 0.9, f"Scanning frame {fi + 1}/{N} - {len(tracks)} people in view - ~{eta / 60:.1f} min left")
+                self.progress(0.08 + frac * 0.82, f"Scanning frame {fi + 1}/{N} - {len(tracks)} people in view - ~{eta / 60:.1f} min left")
         finished.extend(tracks)
         rd.close()
         self.scan_pose.close()
@@ -362,6 +413,7 @@ class Analyzer:
         embedder.close()
 
         sc = {"stride": stride, "frames": N, "frame_ids": frame_ids, "H_rel": H_rel, "H_ok": H_ok,
+              "cuts": cut_frames,
               "shot_starts": shot_starts, "tracks": finished, "thumbs": thumbs}
         import pickle
         with open(scan_path + ".tmp", "wb") as fh:
@@ -371,16 +423,22 @@ class Analyzer:
 
     def _finish(self, t_start, N, fps, W, H, stride, sc):
         self.progress(0.91, "Solving cameras and identities")
-        # fast whip-pans / flashes can fire the cut detector on many consecutive
-        # frames: shots shorter than 0.3 s are merged into the previous shot
-        starts = list(sc["shot_starts"])
-        merged = [starts[0]]
-        for i in range(1, len(starts)):
-            end = starts[i + 1] if i + 1 < len(starts) else N
-            prev_len = starts[i] - merged[-1]
-            if end - starts[i] < 0.3 * fps or prev_len < 0.3 * fps:
-                continue
-            merged.append(starts[i])
+        merged = set(sc["shot_starts"]) | {0}
+        # where camera tracking failed inside a shot (heavy blur, fast snap), the
+        # camera orientation is re-established afterwards: start a new shot there
+        fids = list(sc["frame_ids"])
+        ok = sc["H_ok"]
+        n_split = 0
+        for i in range(2, len(fids)):
+            starts_after_cut = any(fids[i - 1] < c <= fids[i] for c in sc["shot_starts"])
+            if not ok[i] and ok[i - 1] and not starts_after_cut:
+                j = i
+                while j < len(fids) and not ok[j]:
+                    j += 1
+                if j < len(fids):
+                    merged.add(fids[j])
+                    n_split += 1
+        merged = sorted(merged)
         frame_shot = np.searchsorted(np.array(merged), np.arange(N), side="right") - 1
         for t in sc["tracks"]:
             t.shot = int(frame_shot[t.frames[0]])
@@ -499,7 +557,17 @@ class Analyzer:
             tl_dump[p + "vis"] = np.array(t.vis, np.float16)
             tl_dump[p + "world"] = np.array(t.world, np.float32)
             tl_dump[p + "cropc"] = np.array(t.crop_c, np.float32)
+        # how much the background moves (px per frame at full resolution): ~0 = locked-off camera
+        bg = np.full(nA, np.nan)
+        for i in range(nA):
+            if H_ok[i] and H_rel[i] is not None:
+                pr = H_rel[i]
+                step = frame_ids[i] - frame_ids[i - 1] if i > 0 else 1
+                bg[i] = float(np.median(np.linalg.norm(pr[:, 2:] - pr[:, :2], axis=1))) / max(step, 1)
+        okb = np.isfinite(bg)
+        bg_motion = np.interp(np.arange(N), frame_ids[okb], bg[okb]) if okb.any() else np.zeros(N)
         np.savez_compressed(os.path.join(self.workdir, "analysis.npz"), cam_q=cam_q.astype(np.float32),
+                            bg_motion=bg_motion.astype(np.float32),
                             focal=focal.astype(np.float32), shot_of=shot_of,
                             shot_align=np.array([s["align"] for s in shots]), **tl_dump)
         thumb_dir = os.path.join(self.workdir, "thumbs")

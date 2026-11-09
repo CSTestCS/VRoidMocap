@@ -321,7 +321,10 @@ class Naturalizer:
                                       (f"{side}UpperLeg", f"{side}LowerLeg", f"{side}Foot", -Z)):
                 if not all(s.has(x) for x in (up, lo_, end)):
                     continue
-                self._limb_ik(Q, pos, rot, up, lo_, end, fwd, is_leg=(up.endswith("Leg")))
+                if up.endswith("Leg"):
+                    self._leg_no_twist(Q, pos, rot, up, lo_, end)
+                else:
+                    self._limb_ik(Q, pos, rot, up, lo_, end, fwd, is_leg=False)
         N_ = len(Q)
         # 2) forearm twist (pronation / supination): filtered as a circular signal
         #    (outliers and frames without a hand detection carry little weight),
@@ -393,72 +396,181 @@ class Naturalizer:
         return quat_mul(q2, q_axis_angle(a, t))
 
     def _limb_ik(self, Q, pos, rot, up, lo_, end, fwd, is_leg):
-        """Two-bone hinge IK that keeps the end joint where it is.
+        """Two-bone hinge IK for the arms that keeps the wrist where it is.
 
-        The thigh / upper arm twist is chosen so the elbow / knee bends as a
-        hinge towards `fwd` (forward for elbows, backward for knees); when the
-        limb is nearly straight the previous twist is kept (no flips)."""
+        The elbow is placed on the circle of positions that keep both bone
+        lengths, as close as possible to where it was observed (or, when the arm
+        is nearly straight and the elbow position says little, where it was in
+        the previous frame). The elbow path is smoothed, then the upper arm is
+        built from "points at the elbow" + "bends towards the wrist", which has
+        no singularity in any arm orientation; the forearm is a pure hinge plus
+        its own twist."""
+        from .mathutil import rot_from_axes
         s, I = self.s, self.idx
         iu, il, ie = I[up], I[lo_], I[end]
         ip = I[s.parent[up]]
         rp = s.rest_pos
         au, al = self.axis[up], self.axis[lo_]
         hinge = normalize(np.cross(al, fwd))
+        b_rest = normalize(np.cross(hinge, au))  # direction the forearm moves when the elbow flexes
         l1 = np.linalg.norm(rp[lo_] - rp[up])
         l2 = np.linalg.norm(rp[end] - rp[lo_])
-        u_h = normalize(np.cross(hinge, au))
-        rest_bend = float(np.arctan2(al @ u_h, al @ au))
-        lo_lim, hi_lim = (_deg(-2), _deg(155)) if is_leg else (_deg(-5), _deg(150))
-        tw_lim = _deg(30) if is_leg else _deg(200)
+        lo_lim, hi_lim = _deg(-5), _deg(150)
         n = len(Q)
-        Rs_all = np.zeros((n, 3, 3))
-        dn_all = np.zeros((n, 3))
-        Rh_all = np.zeros((n, 3, 3))
-        angs = np.zeros(n)
-        wts = np.zeros(n)
+        fps_ = getattr(self, "fps", 30.0)
+        Wt = np.einsum("nji,nj->ni", rot[:, ip], pos[:, ie] - pos[:, iu])   # wrist, parent frame
+        Ec = np.einsum("nji,nj->ni", rot[:, ip], pos[:, il] - pos[:, iu])   # observed elbow
+        E = np.zeros((n, 3))
+        prev_dir = None
         for k in range(n):
-            Gp = rot[k, ip]
-            S, W = pos[k, iu], pos[k, ie]
-            dv = Gp.T @ (W - S)  # target in the parent's frame
-            d = float(np.clip(np.linalg.norm(dv), abs(l1 - l2) + 1e-5, l1 + l2 - 1e-6))
-            dn = dv / max(np.linalg.norm(dv), 1e-9)
-            cos_b = (l1 * l1 + l2 * l2 - d * d) / (2 * l1 * l2)
-            phi = np.pi - np.arccos(np.clip(cos_b, -1, 1))  # angle between the two bones
-            # the rest pose need not be straight: hinge angle = phi - rest bend
-            bend = float(np.clip(phi - rest_bend, lo_lim, hi_lim))
-            Lu = quat_to_mat(Q[k, iu])
-            Rh = axis_angle_to_mat(hinge, bend)
-            end_local = au * l1 + Rh @ al * l2
-            Rs = _rot_between(normalize(end_local), dn)
-            # twist about the shoulder->wrist line: put the elbow / knee where it
-            # currently is (pole); nearly straight -> keep the current hinge direction
-            pp = lambda v: v - dn * (v @ dn)  # noqa: E731
-            e_new, e_cur = pp(Rs @ au), pp(Gp.T @ (pos[k, il] - S))
-            h_new, h_cur = pp(Rs @ hinge), pp(Lu @ hinge)
-
-            def signed(u, v):
-                return np.arctan2(np.cross(u, v) @ dn, u @ v)
-            a_pole = signed(e_new, e_cur) if np.linalg.norm(e_cur) > 1e-6 else 0.0
-            a_hinge = signed(h_new, h_cur) if np.linalg.norm(h_cur) > 1e-6 else a_pole
-            w = float(np.clip((phi - _deg(8)) / _deg(14), 0, 1))
-            angs[k] = np.angle(w * np.exp(1j * a_pole) + (1 - w) * np.exp(1j * a_hinge))
-            wts[k] = 0.15 + w
-            Rs_all[k], dn_all[k], Rh_all[k] = Rs, dn, Rh
-        # the twist about the limb axis is smoothed over time (no flips near straight)
-        angs = circular_smooth(angs, wts, 0.05 * getattr(self, "fps", 30.0))
+            w = Wt[k]
+            d = float(np.clip(np.linalg.norm(w), abs(l1 - l2) + 1e-5, l1 + l2 - 1e-6))
+            dn = w / max(np.linalg.norm(w), 1e-9)
+            x = (l1 * l1 - l2 * l2 + d * d) / (2 * d)       # elbow distance along shoulder->wrist
+            h = np.sqrt(max(l1 * l1 - x * x, 0.0))          # circle radius
+            obs = Ec[k] - dn * (Ec[k] @ dn)
+            bend = np.pi - np.arccos(np.clip((l1 * l1 + l2 * l2 - d * d) / (2 * l1 * l2), -1, 1))
+            wgt = float(np.clip((bend - _deg(25)) / _deg(35), 0, 1))
+            if prev_dir is not None:
+                pd_ = prev_dir - dn * (prev_dir @ dn)
+                u = wgt * normalize(obs) + (1 - wgt) * normalize(pd_) if np.linalg.norm(obs) > 1e-9 else normalize(pd_)
+            else:
+                u = obs
+            if np.linalg.norm(u) < 1e-9:
+                u = np.cross(dn, hinge)
+            u = normalize(u - dn * (u @ dn))
+            if bend > _deg(15):
+                u = _natural_elbow(u, dn, x, h, w, l1)
+            E[k] = dn * x + u * h
+            prev_dir = u
+        # smooth the elbow path, then put it back on the circle exactly
+        E = gaussian_smooth(E, 0.04 * fps_)
+        rot_prev = np.eye(3)
         for k in range(n):
-            Gp = rot[k, ip]
-            Lu_new = axis_angle_to_mat(dn_all[k], angs[k]) @ Rs_all[k]
-            Rh = Rh_all[k]
+            w = Wt[k]
+            d = float(np.clip(np.linalg.norm(w), abs(l1 - l2) + 1e-5, l1 + l2 - 1e-6))
+            dn = w / max(np.linalg.norm(w), 1e-9)
+            x = (l1 * l1 - l2 * l2 + d * d) / (2 * d)
+            h = np.sqrt(max(l1 * l1 - x * x, 0.0))
+            u = E[k] - dn * (E[k] @ dn)
+            u = normalize(u) if np.linalg.norm(u) > 1e-9 else normalize(np.cross(dn, hinge))
+            e = dn * x + u * h
+            fore = w - e
+            en = normalize(e)
+            bdir = fore - en * (fore @ en)
+            # nearly straight: the bend direction is a tiny, noisy vector -> keep
+            # the previous frame's bend direction (blended by how bent the elbow is)
+            bend = np.arccos(np.clip((fore @ en) / max(np.linalg.norm(fore), 1e-9), -1, 1))
+            wb = float(np.clip((bend - _deg(20)) / _deg(30), 0, 1)) if k > 0 else 1.0
+            prev_b = rot_prev @ b_rest
+            prev_b = prev_b - en * (prev_b @ en)
+            if np.linalg.norm(bdir) > 1e-9 and np.linalg.norm(prev_b) > 1e-9:
+                bdir = normalize(wb * normalize(bdir) + (1 - wb) * normalize(prev_b))
+            elif np.linalg.norm(bdir) <= 1e-9:
+                bdir = prev_b
+            Lu = rot_from_axes(au, b_rest, e, bdir)
+            rot_prev = Lu
+            # forearm: hinge about the elbow axis + its own twist
+            dl = Lu.T @ fore / max(np.linalg.norm(fore), 1e-9)
+            uh = normalize(np.cross(hinge, al))
+            th = float(np.clip(np.arctan2(dl @ uh, dl @ al), lo_lim, hi_lim))
+            Rh = axis_angle_to_mat(hinge, th)
             Ll = quat_to_mat(Q[k, il])
             _, tl = remove_twist(mat_to_quat(Rh.T @ Ll), al)
-            tl = float(np.clip(wrap(tl), -tw_lim, tw_lim))
-            Ll_new = Rh @ axis_angle_to_mat(al, tl)
-            Q[k, iu] = mat_to_quat(Lu_new)
+            Ll_new = Rh @ axis_angle_to_mat(al, float(wrap(tl)))
+            Q[k, iu] = mat_to_quat(Lu)
             Q[k, il] = mat_to_quat(Ll_new)
-            # keep the hand / foot world orientation
-            Gl_new = Gp @ Lu_new @ Ll_new
-            Q[k, ie] = mat_to_quat(Gl_new.T @ rot[k, ie])
+            Q[k, ie] = mat_to_quat((rot[k, ip] @ Lu @ Ll_new).T @ rot[k, ie])
+
+
+_CIRCLE = np.radians(np.arange(0, 360, 5.0))
+
+
+def _natural_elbow(u, dn, x, h, w, l1, lim=np.radians(110)):
+    """Among the elbow positions on the IK circle (all keep the wrist exactly in
+    place), pick the one nearest to `u` whose bend direction is anatomically
+    possible: the upper arm turned at most `lim` about its own axis from the
+    natural "arm hanging, elbow bending forward" reference."""
+    p = u
+    q = np.cross(dn, p)
+    E = dn[None] * x + h * (np.cos(_CIRCLE)[:, None] * p[None] + np.sin(_CIRCLE)[:, None] * q[None])
+    a = E / l1
+    fore = w[None] - E
+    b = fore - a * np.sum(fore * a, 1, keepdims=True)
+    # natural flex direction: +Z carried by the minimal rotation from "hanging down" (-Y) to a
+    v0 = np.array([0.0, -1.0, 0.0])
+    ax = np.cross(v0[None], a)
+    sn = np.linalg.norm(ax, axis=1)
+    cs = a @ v0
+    k_ = ax / np.maximum(sn, 1e-9)[:, None]
+    zf = np.array([0.0, 0.0, 1.0])
+    nz = (zf[None] * cs[:, None] + np.cross(k_, zf[None]) * sn[:, None]
+          + k_ * (k_ @ zf)[:, None] * (1 - cs)[:, None])
+    nz = nz - a * np.sum(nz * a, 1, keepdims=True)
+    tau = np.arctan2(np.sum(np.cross(nz, b) * a, 1), np.sum(nz * b, 1))
+    straight_up = a[:, 1] > 0.85
+    ok = (np.abs(tau) <= lim) | straight_up
+    if ok[0] or not ok.any():
+        return u
+    i = np.where(ok)[0]
+    best = i[np.argmin(np.abs(np.angle(np.exp(1j * _CIRCLE[i]))))]
+    return np.cos(_CIRCLE[best]) * p + np.sin(_CIRCLE[best]) * q
+
+
+def _leg_no_twist(self, Q, pos, rot, up, lo_, end):
+    """Legs: the thigh never twists (it only swings to point at the knee); any
+    twist the leg needs to aim the foot happens at the knee (shin twist), within
+    +-45 deg and smoothed over time. Knee and ankle positions are kept exactly."""
+    s, I = self.s, self.idx
+    iu, il, ie = I[up], I[lo_], I[end]
+    ip = I[s.parent[up]]
+    au, al = self.axis[up], self.axis[lo_]
+    n = len(Q)
+    Lu_all = np.zeros((n, 3, 3))
+    Lsw_all = np.zeros((n, 3, 3))
+    tw = np.zeros(n)
+    for k in range(n):
+        Gp = rot[k, ip]
+        knee = Gp.T @ (pos[k, il] - pos[k, iu])          # knee direction in the hips frame
+        Lu = _rot_between(au, normalize(knee))            # swing only: zero thigh twist
+        Gu = Gp @ Lu
+        ank = Gu.T @ (pos[k, ie] - pos[k, il])            # ankle direction in the thigh frame
+        Lsw = _rot_between(al, normalize(ank))
+        # twist about the shin that best keeps the foot's world orientation
+        Gl0 = Gu @ Lsw
+        foot_local = Gl0.T @ rot[k, ie]
+        _, t = remove_twist(mat_to_quat(foot_local), al)
+        tw[k] = t
+        Lu_all[k], Lsw_all[k] = Lu, Lsw
+    # a foot that seems turned more than 90 deg about the shin is a heel/toe
+    # confusion of the detector: read it the other way round
+    tw = wrap(tw)
+    flip = np.abs(tw) > _deg(90)
+    tw = np.where(flip, wrap(tw + np.pi), tw)
+    tw = circular_smooth(tw, np.where(flip, 0.2, 1.0), 0.05 * getattr(self, "fps", 30.0))
+    tw = clamp_continuous(tw, _deg(-45), _deg(45))
+    for k in range(n):
+        Gp = rot[k, ip]
+        Ll = Lsw_all[k] @ axis_angle_to_mat(al, tw[k])
+        Q[k, iu] = mat_to_quat(Lu_all[k])
+        Q[k, il] = mat_to_quat(Ll)
+        Q[k, ie] = mat_to_quat((Gp @ Lu_all[k] @ Ll).T @ rot[k, ie])
+
+
+Naturalizer._leg_no_twist = _leg_no_twist
+
+
+def _legs_only(self, Q, root):
+    """Re-apply the no-thigh-twist rule (e.g. after the feet were pinned)."""
+    from .retarget import avatar_fk
+    Q = Q.copy()
+    pos, rot = avatar_fk(self.s, Q, root)
+    for side in ("left", "right"):
+        self._leg_no_twist(Q, pos, rot, f"{side}UpperLeg", f"{side}LowerLeg", f"{side}Foot")
+    return Q
+
+
+Naturalizer.legs_only = _legs_only
 
 
 def _rot_between(u, v):

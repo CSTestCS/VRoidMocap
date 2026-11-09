@@ -285,6 +285,7 @@ class RigSolver:
             # legs
             hip, kn, an = J["hip" + s_], J["kn" + s_], J["an" + s_]
             heel, toe = J["heel" + s_], J["toe" + s_]
+
             th = kn - hip
             sh_ = an - kn
             foot_f = toe - heel
@@ -374,6 +375,18 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for f in np.where(valid)[0]:
         Rray = cam.ray_rotation(focal[f], cx, cy, *cropc[f])
         Wc[f] = world[f] @ Rray.T
+    # spins: undo left/right label swaps and front/back depth flips
+    view = normalize(np.c_[(cropc[:, 0] - cx) / focal, (cropc[:, 1] - cy) / focal, np.ones(N)])
+    swap, mirror = resolve_body_flips(Wc, lm2d, valid, shot_of, view)
+    vv = view[:, None, :]
+    Wc = np.where(mirror[:, None, None], Wc - 2 * np.sum(Wc * vv, -1, keepdims=True) * vv, Wc)
+    Wc[swap] = Wc[swap][:, LR_PERM]
+    lm2d[swap] = lm2d[swap][:, LR_PERM]
+    vis[swap] = vis[swap][:, LR_PERM]
+    for arr in (h2d, hw, hs, hc):
+        arr[swap] = arr[swap][:, ::-1]
+    hvalid = (hs >= 0.5) & valid[:, None]
+    for f in np.where(valid)[0]:
         t = cam.solve_translation(Wc[f], lm2d[f], vis[f] ** 2, focal[f], cx, cy)
         if t is None:
             valid[f] = False
@@ -388,6 +401,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         Rw0 = shots[shot_of[f]]["align"] @ R_rel[f]
         yaw_at[f] = cam.hips_yaw(Wc[f], Rw0)
     R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at)
+    # a locked-off camera must not sway: hold its rotation while the background is still
+    static = camera_static_mask(npz["bg_motion"] if "bg_motion" in npz.files else None,
+                                npz["cam_q"].astype(np.float64), shot_of, fps)
+    R_w = hold_static_rotation(R_w, static, shot_of)
 
     # ---- 2. bone lengths (model metric) and snapping onto rays
     blen = median_lengths(Wc, BODY_TREE, valid)
@@ -427,6 +444,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             Ph[f, side] = snap_chain(hp, hr, ww, HAND_TREE, {e: L * k for e, L in hlen[side].items()}, fixed=(0,))
         if f % 500 == 0:
             progress(0.05 + 0.25 * f / N, "Reconstructing 3D joints")
+
+    # ---- 2b. depth ambiguity: an elbow / wrist / knee / ankle seen along the
+    # line of sight has two positions that fit its 2D detection and bone length
+    # (in front of / behind its parent). Choose per joint over time (Viterbi):
+    # the bone direction should change little between frames.
+    P, Ph = resolve_depth_ambiguity(P, Ph, lm2d, vis, h2d, hvalid, valid, shot_of, focal, cx, cy, blen)
 
     # ---- 3. temporal filtering.
     # The 2D detections are precise frame by frame; the noise is in the depth
@@ -521,11 +544,13 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     root_actor = np.einsum("nij,nj->ni", R_w, np.nan_to_num(T))
     root_actor = interp_gaps(root_actor, valid)
     root, contacts = root_motion(skel, Q, root_actor * scale, valid, shot_of, fps, Pw, scale)
+    root = anchor_root_to_camera(root, Q, skel, R_w, T, valid, static, shot_of, scale, fps, contacts)
     root = hold_root(root, valid, fps)
     progress(0.8, "Joint limits and limb IK")
     Q = nat.apply(Q, root, fps, conf)
-    if foot_lock:  # last: pins planted feet (two-bone IK that keeps the knee's bend plane)
+    if foot_lock:  # pins planted feet (two-bone IK)
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
+        Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
 
     # ---- 7. cloned camera relative to the avatar
     Ts = T.copy()
@@ -538,7 +563,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     Rh = quat_to_mat(Q[:, hi])
     off = (skel.rest_pos["leftUpperLeg"] + skel.rest_pos["rightUpperLeg"]) / 2 - skel.rest_pos["hips"]
     hipc_avatar = root + np.einsum("nij,j->ni", Rh, off)
-    cam_pos = hipc_avatar - scale * np.einsum("nij,nj->ni", R_w, Ts)
+    cam_pos = stabilize_camera(hipc_avatar - scale * np.einsum("nij,nj->ni", R_w, Ts), static, shot_of, fps)
     cam_quat = mat_to_quat(R_w @ cam.D)
     cam_vfov = np.array([cam.vfov_from_focal(fv, H) for fv in focal])
 
@@ -601,6 +626,239 @@ def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):
     sel = idx[st == 1]
     out[sel] = Hm[sel]
     return out
+
+
+# MediaPipe left/right landmark pairs
+LR_PAIRS = [(1, 4), (2, 5), (3, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16), (17, 18), (19, 20),
+            (21, 22), (23, 24), (25, 26), (27, 28), (29, 30), (31, 32)]
+LR_PERM = np.arange(33)
+for _a, _b in LR_PAIRS:
+    LR_PERM[_a], LR_PERM[_b] = _b, _a
+
+
+def _torso_basis(W):
+    """(n,33,3) -> (n,3,3) torso frame (left axis, up, forward) in camera coords."""
+    x = (W[:, L_HIP] - W[:, R_HIP]) + (W[:, L_SH] - W[:, R_SH])
+    up = (W[:, L_SH] + W[:, R_SH]) / 2 - (W[:, L_HIP] + W[:, R_HIP]) / 2
+    x = normalize(x)
+    up = normalize(up - x * np.sum(up * x, -1, keepdims=True))
+    return np.stack([x, up, np.cross(x, up)], -1)
+
+
+DEPTH_CHAINS = [(L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR),
+                (L_HIP, L_KNEE), (L_KNEE, L_ANK), (R_HIP, R_KNEE), (R_KNEE, R_ANK)]
+
+
+def resolve_depth_ambiguity(P, Ph, lm2d, vis, h2d, hvalid, valid, shot_of, focal, cx, cy, blen):
+    P = P.copy()
+    Ph = Ph.copy()
+    N = len(P)
+    for (p, c) in DEPTH_CHAINS:
+        L = blen.get((p, c))
+        if L is None:
+            continue
+        cand = np.full((N, 2, 3), np.nan)
+        hint = np.zeros((N, 2))
+        for f in np.where(valid)[0]:
+            if not (np.isfinite(P[f, p]).all() and np.isfinite(P[f, c]).all()):
+                continue
+            uv = lm2d[f, c]
+            if c in (L_WR, R_WR) and hvalid[f, 0 if c == L_WR else 1]:
+                uv = h2d[f, 0 if c == L_WR else 1, 0]
+            r = normalize(np.array([(uv[0] - cx) / focal[f], (uv[1] - cy) / focal[f], 1.0]))
+            bq = float(np.dot(r, P[f, p]))
+            disc = bq * bq - (float(np.dot(P[f, p], P[f, p])) - L * L)
+            t0 = float(np.dot(P[f, c], r))
+            if disc <= 0 or vis[f, c] < 0.5:
+                cand[f, 0] = cand[f, 1] = P[f, c]
+                continue
+            sq = np.sqrt(disc)
+            for k, t in enumerate((bq - sq, bq + sq)):
+                q = r * t
+                cand[f, k] = q
+                hint[f, k] = abs(t - t0) / L
+        for (a, b) in runs(valid & np.isfinite(cand[:, 0, 0]), shot_of):
+            if b - a < 2:
+                continue
+            d = normalize(cand[a:b] - P[a:b, p][:, None, :])  # (n,2,3) bone directions
+            n = b - a
+            cost = 0.6 * hint[a]
+            back = np.zeros((n, 2), int)
+            for j in range(1, n):
+                ang = np.arccos(np.clip(np.einsum("kx,mx->km", d[j], d[j - 1]), -1, 1))  # (k,m)
+                c2 = cost[None, :] + 2.0 * ang
+                back[j] = np.argmin(c2, 1)
+                cost = c2[np.arange(2), back[j]] + 0.6 * hint[a + j]
+            st = np.zeros(n, int)
+            st[-1] = int(np.argmin(cost))
+            for j in range(n - 1, 0, -1):
+                st[j - 1] = back[j, st[j]]
+            new = cand[a:b][np.arange(n), st]
+            delta = new - P[a:b, c]
+            P[a:b, c] = new
+            # everything below that joint moves with it
+            below = {L_EL: [L_WR, L_INDEX, L_PINKY, L_THUMB], L_WR: [L_INDEX, L_PINKY, L_THUMB],
+                     R_EL: [R_WR, R_INDEX, R_PINKY, R_THUMB], R_WR: [R_INDEX, R_PINKY, R_THUMB],
+                     L_KNEE: [L_ANK, L_HEEL, L_FOOT], L_ANK: [L_HEEL, L_FOOT],
+                     R_KNEE: [R_ANK, R_HEEL, R_FOOT], R_ANK: [R_HEEL, R_FOOT]}.get(c, [])
+            for j2 in below:
+                P[a:b, j2] += delta
+            if c in (L_EL, L_WR):
+                Ph[a:b, 0] += delta[:, None, :]
+            if c in (R_EL, R_WR):
+                Ph[a:b, 1] += delta[:, None, :]
+    return P, Ph
+
+
+def camera_static_mask(bg_motion, cam_q, shot_of, fps, thr=0.05, min_s=0.4):
+    """Frames where the real camera is not moving (background still)."""
+    N = len(shot_of)
+    if bg_motion is not None:
+        m = np.asarray(bg_motion, float)
+        k = max(1, int(round(0.15 * fps)))
+        pad = np.pad(m, k, mode="edge")
+        med = np.median(np.lib.stride_tricks.sliding_window_view(pad, 2 * k + 1), axis=-1)
+        still = med < thr
+    else:
+        from .naturalize import q_angle
+        stp = np.zeros(N)
+        stp[1:] = np.degrees(q_angle(cam_q[1:], cam_q[:-1]))
+        still = stp < 0.02
+    out = np.zeros(N, bool)
+    for (a, b) in runs(still, shot_of):
+        if b - a >= min_s * fps:
+            out[a:b] = True
+    return out
+
+
+def hold_static_rotation(R_w, static, shot_of):
+    R = R_w.copy()
+    for (a, b) in runs(static, shot_of):
+        q = quat_continuity(mat_to_quat(R_w[a:b]))
+        R[a:b] = quat_to_mat(normalize(q.mean(0)))
+    return R
+
+
+def _segments(mask, shot_of):
+    """Runs of equal `mask` value that do not cross a shot change."""
+    out, N, f = [], len(mask), 0
+    while f < N:
+        s0 = f
+        while f < N and mask[f] == mask[s0] and shot_of[f] == shot_of[s0]:
+            f += 1
+        out.append((s0, f, bool(mask[s0])))
+    return out
+
+
+def _hipc(skel, Q, root):
+    hi = skel.bones.index("hips")
+    off = (skel.rest_pos["leftUpperLeg"] + skel.rest_pos["rightUpperLeg"]) / 2 - skel.rest_pos["hips"]
+    return root + np.einsum("nij,j->ni", quat_to_mat(Q[:, hi]), off)
+
+
+def anchor_root_to_camera(root, Q, skel, R_w, T, valid, static, shot_of, scale, fps, contacts=None):
+    """While the camera is locked off, the character's position relative to it
+    is measured directly (precise across the image, noisy in depth). The
+    foot-contact root is pulled towards that measurement, but only while no foot
+    is planted (steps, hops, turns on the move), so planted feet never slide;
+    whatever cannot be applied yet waits for the next free moment. Height stays
+    with the foot contacts."""
+    root = root.copy()
+    hipc = _hipc(skel, Q, root)
+    for (a, b, st) in _segments(static & valid, shot_of):
+        if not st or b - a < 3:
+            continue
+        Ts = T[a:b].copy()
+        ok = np.isfinite(Ts).all(1)
+        if ok.sum() < 3:
+            continue
+        Ts = interp_gaps(np.nan_to_num(Ts), ok)
+        Tsm = np.stack([gaussian_smooth(Ts[:, 0], 0.04 * fps), gaussian_smooth(Ts[:, 1], 0.04 * fps),
+                        gaussian_smooth(Ts[:, 2], 0.4 * fps)], 1)
+        rel = scale * np.einsum("nij,nj->ni", R_w[a:b], Tsm)
+        C = np.median(hipc[a:b] - rel, axis=0)        # the fixed camera
+        corr = gaussian_smooth((C + rel) - hipc[a:b], 0.05 * fps)
+        # split into "across the image" (precise: applied fully) and "in depth"
+        # (noisy: applied only while no foot is planted)
+        right = R_w[a:b, :, 0].copy()
+        right[:, 1] = 0
+        right = normalize(right)
+        fwd = np.stack([-right[:, 2], np.zeros(len(right)), right[:, 0]], 1)
+        lat = np.sum(corr * right, 1)
+        dep = np.sum(corr * fwd, 1)
+        n = b - a
+        free = np.ones(n) if contacts is None else (~contacts[a:b].any(1)).astype(float)
+        dep_applied = np.zeros(n)
+        cur = 0.0
+        for k in range(n):
+            cur = cur + (dep[k] - cur) * free[k] * 0.5
+            dep_applied[k] = cur
+        delta = right * lat[:, None] + fwd * dep_applied[:, None]
+        root[a:b, 0] += delta[:, 0]
+        root[a:b, 2] += delta[:, 2]
+    return root
+
+
+def stabilize_camera(cam_pos, static, shot_of, fps):
+    """Locked-off shots: one fixed camera position. Moving shots: a smooth path."""
+    out = cam_pos.copy()
+    for (a, b, st) in _segments(static, shot_of):
+        if st:
+            out[a:b] = np.median(cam_pos[a:b], axis=0)
+        else:
+            out[a:b] = gaussian_smooth(cam_pos[a:b], 0.3 * fps)
+    # soften the hand-over between still and moving parts (never across a cut)
+    for (a, b) in runs(np.ones(len(out), bool), shot_of):
+        sm = gaussian_smooth(out[a:b], 0.1 * fps)
+        keep = static[a:b]
+        out[a:b] = np.where(keep[:, None], out[a:b], sm)
+    return out
+
+
+def resolve_body_flips(Wc, lm2d, valid, shot_of, view):
+    """Spins confuse the pose model: it swaps the left/right labels or mirrors
+    the body in depth (front <-> back). For every frame consider 4 readings
+    (as detected / sides swapped / depth mirrored / both) and pick, per shot,
+    the sequence whose torso turns smoothly (Viterbi). Returns (swap, mirror)
+    boolean arrays."""
+    N = len(Wc)
+    swap = np.zeros(N, bool)
+    mirror = np.zeros(N, bool)
+    v = view[:, None, :]
+    Wm = Wc - 2 * np.sum(Wc * v, -1, keepdims=True) * v
+    hyps = [(0, 0), (1, 0), (0, 1), (1, 1)]
+    B = [_torso_basis(W) for W in (Wc, Wc[:, LR_PERM], Wm, Wm[:, LR_PERM])]
+    L2 = [lm2d, lm2d[:, LR_PERM], lm2d, lm2d[:, LR_PERM]]
+    prior = np.array([0.0, 0.8, 0.8, 1.4])
+    hgt = np.maximum(np.ptp(lm2d[:, :, 1], axis=1), 1.0)
+    sided = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+    for (s0, e0) in runs(valid, shot_of):
+        idx = np.arange(s0, e0)
+        if len(idx) < 2:
+            continue
+        cost = prior.copy()
+        back = np.zeros((len(idx), 4), int)
+        for j in range(1, len(idx)):
+            f, g = idx[j], idx[j - 1]
+            new = np.zeros(4)
+            for k in range(4):
+                tr = np.zeros(4)
+                for m in range(4):
+                    R = B[m][g].T @ B[k][f]
+                    ang = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
+                    jump = np.mean(np.linalg.norm(L2[k][f, sided] - L2[m][g, sided], axis=1)) / hgt[f]
+                    tr[m] = 2.0 * ang + 6.0 * jump
+                c2 = cost + tr
+                back[j, k] = int(np.argmin(c2))
+                new[k] = c2[back[j, k]] + prior[k] * 0.05
+            cost = new
+        st = np.zeros(len(idx), int)
+        st[-1] = int(np.argmin(cost))
+        for j in range(len(idx) - 1, 0, -1):
+            st[j - 1] = back[j, st[j]]
+        for j, k in enumerate(st):
+            swap[idx[j]], mirror[idx[j]] = hyps[k]
+    return swap, mirror
 
 
 BONE_LANDMARKS = {
