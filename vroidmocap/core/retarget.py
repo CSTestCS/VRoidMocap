@@ -245,13 +245,12 @@ class RigSolver:
                 b = self._twist_axis(k, ua, G["hips"] @ Z, 1.0, Z)
             G[k] = rot_from_axes(self.rest_dir[k], Z, ua, b)
             # forearm carries the pronation/supination: palm normal (rest -Y)
-            rpalm, rlat = self.rest_palm[side], self.rest_lat[side]
+            rpalm = self.rest_palm[side]
             k = side + "LowerArm"
             G[k] = rot_from_axes(self.rest_dir[k], rpalm, fa, self._twist_axis(k, fa, palm_n, 0.85, rpalm))
             k = side + "Hand"
             G[k] = rot_from_axes(self.rest_dir[k], rpalm, hand_dir, palm_n)
             if hp is not None:
-                lat = normalize(hp[5] - hp[17])
                 for fg in FINGERS:
                     idx = HAND_FINGER_IDX[fg]
                     segv = [hp[idx[k + 1]] - hp[idx[k]] for k in range(3)]
@@ -714,7 +713,7 @@ def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale):
     return root, contact
 
 
-def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06):
+def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06, leash=0.035):
     """Pin each planted foot to one spot on the floor for the whole contact and
     fix the leg with two-bone IK (knee keeps its bend direction, the foot keeps
     its world orientation). Blended in/out over a few frames. Q is modified."""
@@ -746,8 +745,15 @@ def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06):
             for k in range(s, e):
                 w = min(1.0, (e - k) / nb)
                 H, K, A = pos[k, iu], pos[k, il], pos[k, ifo]
+                # leash: absorb small drift (jitter) but let a foot that really
+                # slides or pivots move, instead of bending the leg to hold it
+                dev = target_xz - A[[0, 2]]
+                dn_ = np.linalg.norm(dev)
+                if dn_ > leash:
+                    target_xz = A[[0, 2]] + dev / dn_ * leash
+                    dev = target_xz - A[[0, 2]]
                 At = A.copy()
-                At[[0, 2]] = A[[0, 2]] + w * (target_xz - A[[0, 2]])
+                At[[0, 2]] = A[[0, 2]] + w * dev
                 d_vec = At - H
                 d = float(np.clip(np.linalg.norm(d_vec), abs(l1 - l2) + 1e-4, l1 + l2 - 1e-4))
                 dn = d_vec / max(np.linalg.norm(d_vec), 1e-9)
