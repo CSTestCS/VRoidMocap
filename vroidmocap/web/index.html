@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRoid Mocap</title>
+<link rel="stylesheet" href="/web/style.css">
+<script type="importmap">
+{ "imports": {
+    "three": "/web/vendor/three/three.module.min.js",
+    "three/addons/": "/web/vendor/three/addons/",
+    "@pixiv/three-vrm": "/web/vendor/three-vrm.module.min.js"
+} }
+</script>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">●</span> VRoid Mocap</div>
+  <nav id="steps">
+    <button data-step="setup" class="active">1 · Files</button>
+    <button data-step="analysis" disabled>2 · Analysis</button>
+    <button data-step="viewer" disabled>3 · Animation</button>
+  </nav>
+  <div id="jobbar" hidden>
+    <div class="jobmsg" id="jobmsg"></div>
+    <div class="progress"><div id="jobprog"></div></div>
+    <button id="jobcancel" class="ghost small">Cancel</button>
+  </div>
+</header>
+
+<main>
+  <!-- STEP 1 -->
+  <section id="step-setup" class="step active">
+    <div class="setup-grid">
+      <div class="card">
+        <h2>Video</h2>
+        <p class="muted">The footage to analyse. Any common format (mp4, mov, mkv, webm, avi).</p>
+        <div class="filerow">
+          <button id="pickVideo">Choose video…</button>
+          <input type="file" id="fileVideo" accept="video/*" hidden>
+          <div class="path" id="videoPath">No video selected</div>
+        </div>
+        <div class="muted small" id="videoInfo"></div>
+      </div>
+      <div class="card">
+        <h2>Avatar</h2>
+        <p class="muted">Your .vrm model (VRM 0.x or 1.0, e.g. exported from VRoid Studio).</p>
+        <div class="filerow">
+          <button id="pickVrm">Choose .vrm…</button>
+          <input type="file" id="fileVrm" accept=".vrm" hidden>
+          <div class="path" id="vrmPath">No avatar selected</div>
+        </div>
+        <div class="muted small" id="vrmInfo"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="analyzeBtn" class="primary" disabled>Analyze video</button>
+      <label class="check"><input type="checkbox" id="forceAnalysis"> Re-run even if a saved analysis exists</label>
+    </div>
+    <div class="card how">
+      <h3>How it works</h3>
+      <ol>
+        <li><b>Analysis</b> scans every frame once: finds camera cuts, tracks every person, recognises recurring characters (even after they leave the frame or the shot changes), measures their height against the scenery and solves the camera angle, tilt and lens for each frame.</li>
+        <li>Pick a character. <b>Motion capture</b> runs a second, high-accuracy pass on just that character (body, hands, fingers and feet) and uses the analysis data for depth, scale and camera angles.</li>
+        <li>Watch the result from the video's camera or a free camera, scrub, lock movement in place, and export <b>.fbx</b>. Pick another character any time without re-analysing.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section id="step-analysis" class="step">
+    <div class="analysis-head">
+      <div>
+        <h2>Characters found</h2>
+        <div class="muted" id="analysisSummary"></div>
+      </div>
+      <div class="smooth">
+        <label for="smoothing">Smoothing</label>
+        <input type="range" id="smoothing" min="0" max="3" step="0.25" value="1">
+        <span id="smoothingVal">1.0</span>
+      </div>
+    </div>
+    <div id="charGrid" class="char-grid"></div>
+    <div class="card">
+      <div class="chart-head">
+        <h3>Camera per frame</h3>
+        <div class="legend" id="camLegend"></div>
+      </div>
+      <canvas id="camChart" height="220"></canvas>
+      <div class="muted small" id="camHover">Hover the chart to read the camera angle of any frame.</div>
+    </div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section id="step-viewer" class="step">
+    <div class="viewer-top">
+      <div class="seg" id="layoutSeg">
+        <button data-layout="side" class="active">Side by side</button>
+        <button data-layout="overlay">Avatar over video</button>
+        <button data-layout="3d">3D only</button>
+      </div>
+      <div class="seg" id="camSeg">
+        <button data-cam="video" class="active">Video camera</button>
+        <button data-cam="free">Free camera</button>
+      </div>
+      <label class="check"><input type="checkbox" id="lockMove"> Lock movement</label>
+      <label class="check"><input type="checkbox" id="lockHeight" disabled> also height</label>
+      <label class="check"><input type="checkbox" id="showLm" checked> Landmarks</label>
+      <label class="check"><input type="checkbox" id="showGrid" checked> Floor</label>
+      <div class="spacer"></div>
+      <span class="muted" id="viewerChar"></span>
+      <button id="otherChar" class="ghost">Choose another character</button>
+      <button id="exportBtn" class="primary">Export .fbx</button>
+    </div>
+    <div class="stage" id="stage">
+      <div class="pane" id="pane3d"><canvas id="gl"></canvas><div class="badge" id="camBadge"></div></div>
+      <div class="pane" id="paneVideo">
+        <div class="videobox" id="videobox">
+          <img id="frameImg" alt="">
+          <canvas id="lmCanvas"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="transport">
+      <button id="playBtn" class="icon" title="Play / pause (space)">▶</button>
+      <button id="stepBack" class="icon" title="Previous frame (←)">⏮</button>
+      <button id="stepFwd" class="icon" title="Next frame (→)">⏭</button>
+      <input type="range" id="scrub" min="0" max="0" value="0">
+      <div class="timecode" id="timecode">0 / 0</div>
+      <select id="speed" title="Playback speed">
+        <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option><option value="2">2×</option>
+      </select>
+    </div>
+    <div class="track"><canvas id="trackCanvas" height="18"></canvas></div>
+    <div class="muted small" id="frameInfo"></div>
+  </section>
+</main>
+
+<dialog id="exportDlg">
+  <form method="dialog">
+    <h3>Export animation</h3>
+    <label class="check"><input type="checkbox" id="exInPlace"> In place (lock movement)</label>
+    <label class="check"><input type="checkbox" id="exLockHeight"> Also lock height</label>
+    <label class="check"><input type="checkbox" id="exCamera" checked> Include the video's camera</label>
+    <p class="muted small">The skeleton uses your avatar's own bone names and rest pose, so the clip binds directly to the same model in Blender, Unity (Humanoid), Unreal or Maya.</p>
+    <div class="actions"><button value="cancel" class="ghost">Cancel</button><button value="ok" class="primary" id="exGo">Export</button></div>
+  </form>
+</dialog>
+<div id="toast" hidden></div>
+<script type="module" src="/web/app.js"></script>
+</body>
+</html>
