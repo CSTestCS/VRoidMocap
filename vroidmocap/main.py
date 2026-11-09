@@ -126,8 +126,38 @@ def cli(argv):
     return 0
 
 
+def setup_logging():
+    """A windowed .exe has no console: send output to a log file instead."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    from .server import data_root
+    f = open(os.path.join(data_root(), "vroidmocap.log"), "a", buffering=1, encoding="utf-8")
+    sys.stdout = sys.stdout or f
+    sys.stderr = sys.stderr or f
+
+
+def selftest():
+    """Load every model and run it once (used by the build to verify the exe)."""
+    import numpy as np
+    from .core.detect import Embedder, HandDetector, PoseDetector
+    img = np.zeros((256, 256, 3), np.uint8)
+    for name, make in (("pose_full", lambda: PoseDetector(False)), ("pose_heavy", lambda: PoseDetector(True)),
+                       ("hand", HandDetector), ("embed", Embedder)):
+        m = make()
+        (m.embed if name == "embed" else m.detect)(img)
+        m.close()
+        print("ok", name, flush=True)
+    import cv2
+    print("opencv", cv2.__version__, "ffmpeg backend", "FFMPEG" in cv2.getBuildInformation())
+    print("SELFTEST PASSED", flush=True)
+    return 0
+
+
 def main():
     multiprocessing.freeze_support()
+    setup_logging()
+    if sys.argv[1:2] == ["selftest"]:
+        sys.exit(selftest())
     sys.exit(cli(sys.argv[1:]) or 0)
 
 
