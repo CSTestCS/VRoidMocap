@@ -199,7 +199,8 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
                 continue
             jobs.append((video, cs, ce, boxes[cs:ce].copy(), fps, os.path.join(cdir, f"chunk_{cs:07d}_{ce:07d}.npz")))
     total = sum(j[2] - j[1] for j in jobs)
-    workers = workers or max(1, min(len(jobs), (os.cpu_count() or 2) - 1))
+    # each worker holds its own models (~300 MB): cap the count to keep memory reasonable
+    workers = workers or max(1, min(len(jobs), (os.cpu_count() or 2) - 1, 6))
     t0 = time.time()
     done = 0
     if jobs:

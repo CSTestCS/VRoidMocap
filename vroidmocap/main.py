@@ -158,7 +158,9 @@ def main():
     multiprocessing.freeze_support()
     setup_logging()
     if sys.argv[1:2] == ["selftest"]:
-        sys.exit(selftest())
+        code = selftest()
+        sys.stdout.flush()
+        os._exit(code)  # skip interpreter teardown (model threads can stall it)
     sys.exit(cli(sys.argv[1:]) or 0)
 
 

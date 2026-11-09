@@ -12,6 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -37,20 +38,21 @@ jobs:
 
       - name: Smoke test the exe
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $log = "$env:LOCALAPPDATA\VRoidMocap\vroidmocap.log"
-          $t = Start-Process -FilePath dist\VRoidMocap.exe -ArgumentList "selftest" -PassThru -Wait
+          $t = Start-Process -FilePath dist\VRoidMocap.exe -ArgumentList "selftest" -PassThru
+          if (-not $t.WaitForExit(240000)) { Stop-Process -Id $t.Id -Force; if (Test-Path $log) { Get-Content $log }; throw "selftest timed out" }
           if (Test-Path $log) { Get-Content $log }
-          if ($t.ExitCode -ne 0) { throw "selftest failed ($($t.ExitCode))" }
+          if (-not (Select-String -Path $log -Pattern "SELFTEST PASSED" -Quiet)) { throw "selftest failed" }
           $p = Start-Process -FilePath dist\VRoidMocap.exe -ArgumentList "--browser","--port","8799" -PassThru
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
-            try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8799/api/state; Write-Host $r.Content; $ok = $true; break } catch {}
+            try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:8799/api/state; Write-Host $r.Content; $ok = $true; break } catch {}
           }
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          if (Test-Path $log) { Get-Content $log }
-          if (-not $ok) { throw "app did not start" }
+          Get-Process VRoidMocap -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $ok) { if (Test-Path $log) { Get-Content $log }; throw "app did not start" }
 
       - uses: actions/upload-artifact@v4
         with:
