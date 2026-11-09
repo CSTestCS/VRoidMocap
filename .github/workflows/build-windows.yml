@@ -33,6 +33,10 @@ jobs:
       - name: Self-test (core pipeline on synthetic data)
         run: python -m unittest discover -s tests -v
 
+      - name: Model self-test (from source)
+        timeout-minutes: 5
+        run: python run_app.py selftest
+
       - name: Build exe
         run: pyinstaller --noconfirm VRoidMocap.spec
 

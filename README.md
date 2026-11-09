@@ -41,12 +41,12 @@ A Windows app that turns a video into a motion-capture animation for your own
   python run_app.py            # or: python run_app.py --browser
   ```
 
-Command line (same exe):
+Command line: use `VRoidMocapCLI.exe` (same app, console build):
 
 ```
-VRoidMocap.exe analyze video.mp4
-VRoidMocap.exe capture video.mp4 avatar.vrm 1 out.fbx [--in-place] [--smoothing 1] [--no-foot-lock]
-VRoidMocap.exe selftest
+VRoidMocapCLI.exe analyze video.mp4
+VRoidMocapCLI.exe capture video.mp4 avatar.vrm 1 out.fbx [--in-place] [--smoothing 1] [--no-foot-lock]
+VRoidMocapCLI.exe selftest
 ```
 
 ## The exported FBX
