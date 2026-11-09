@@ -31,7 +31,7 @@ from .detect import (L_ANK, L_EAR, L_EL, L_EYE, L_FOOT, L_HEEL, L_HIP, L_INDEX, 
                      R_EL, R_EYE, R_FOOT, R_HEEL, R_HIP, R_INDEX, R_KNEE, R_PINKY, R_SH,
                      R_THUMB, R_WR)
 from .mathutil import (gaussian_smooth, interp_gaps, mat_to_quat, normalize, quat_continuity,
-                       quat_to_mat, rot_from_axes, slerp)
+                       quat_to_mat, rot_between, rot_from_axes, slerp)
 from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
@@ -340,7 +340,7 @@ def avatar_fk(skel, Q, root):
 
 
 # ----------------------------------------------------------------------------- main
-def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None):
+def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True):
     progress = progress or (lambda *a: None)
     with open(os.path.join(workdir, "analysis.json")) as f:
         A = json.load(f)
@@ -511,6 +511,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     root_actor = np.einsum("nij,nj->ni", R_w, np.nan_to_num(T))
     root_actor = interp_gaps(root_actor, valid)
     root, contacts = root_motion(skel, Q, root_actor * scale, valid, shot_of, fps, Pw, scale)
+    if foot_lock:
+        Q = foot_lock_ik(skel, Q, root, contacts, fps)
 
     # ---- 7. cloned camera relative to the avatar
     Ts = T.copy()
@@ -710,3 +712,60 @@ def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale):
     root[:, 1] = gaussian_smooth(y, 0.8 * fps / 30.0)
     root[:, [0, 2]] = gaussian_smooth(root[:, [0, 2]], 0.5 * fps / 30.0)
     return root, contact
+
+
+def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06):
+    """Pin each planted foot to one spot on the floor for the whole contact and
+    fix the leg with two-bone IK (knee keeps its bend direction, the foot keeps
+    its world orientation). Blended in/out over a few frames. Q is modified."""
+    N = len(Q)
+    bi = {b: i for i, b in enumerate(skel.bones)}
+    nb = max(1, int(round(blend_s * fps)))
+    pos, rot = avatar_fk(skel, Q, root)
+    rp = skel.rest_pos
+    for side in ("left", "right"):
+        si = 0 if side == "left" else 1
+        iu, il, ifo = bi[side + "UpperLeg"], bi[side + "LowerLeg"], bi[side + "Foot"]
+        ip = bi[skel.parent[side + "UpperLeg"]]
+        l1 = np.linalg.norm(rp[side + "LowerLeg"] - rp[side + "UpperLeg"])
+        l2 = np.linalg.norm(rp[side + "Foot"] - rp[side + "LowerLeg"])
+        c = contact[:, si]
+        f = 0
+        while f < N:
+            if not c[f]:
+                f += 1
+                continue
+            s = f
+            while f < N and c[f]:
+                f += 1
+            e = f
+            if e - s < 2:
+                continue
+            # pin where the foot lands; release smoothly at lift-off
+            target_xz = pos[s:min(e, s + 2), ifo][:, [0, 2]].mean(0)
+            for k in range(s, e):
+                w = min(1.0, (e - k) / nb)
+                H, K, A = pos[k, iu], pos[k, il], pos[k, ifo]
+                At = A.copy()
+                At[[0, 2]] = A[[0, 2]] + w * (target_xz - A[[0, 2]])
+                d_vec = At - H
+                d = float(np.clip(np.linalg.norm(d_vec), abs(l1 - l2) + 1e-4, l1 + l2 - 1e-4))
+                dn = d_vec / max(np.linalg.norm(d_vec), 1e-9)
+                pole = (K - H) - dn * np.dot(K - H, dn)
+                if np.linalg.norm(pole) < 1e-6:
+                    pole = rot[k, iu] @ Z
+                    pole = pole - dn * np.dot(pole, dn)
+                pole = normalize(pole)
+                a = (l1 * l1 - l2 * l2 + d * d) / (2 * d)
+                h = np.sqrt(max(l1 * l1 - a * a, 0.0))
+                Kn = H + dn * a + pole * h
+                Ae = H + dn * d
+                Gu = rot_between(K - H, Kn - H) @ rot[k, iu]
+                Gl0 = Gu @ (rot[k, iu].T @ rot[k, il])
+                shin_now = Gl0 @ (rp[side + "Foot"] - rp[side + "LowerLeg"])
+                Gl = rot_between(shin_now, Ae - Kn) @ Gl0
+                Gf = rot[k, ifo]
+                Q[k, iu] = mat_to_quat(rot[k, ip].T @ Gu)
+                Q[k, il] = mat_to_quat(Gu.T @ Gl)
+                Q[k, ifo] = mat_to_quat(Gl.T @ Gf)
+    return Q

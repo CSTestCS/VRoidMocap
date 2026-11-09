@@ -152,9 +152,11 @@ function renderCharacters() {
           <dt>Height vs scenery</dt><dd title="Character height divided by the camera's height above the floor (horizon method), averaged over shots">${hc}</dd>
         </dl>
         <button class="${animated.has(c.id) ? "" : "primary"}">${animated.has(c.id) ? "Open animation" : "Motion capture this character"}</button>
+        ${animated.has(c.id) ? '<button class="ghost small redo" title="Re-solve with the current smoothing / foot-lock settings (re-uses the captured landmarks: takes seconds)">Re-solve with current settings</button>' : ""}
       </div>`;
     el.querySelector("input").onchange = (e) => api("/api/rename", { character: c.id, name: e.target.value }).then(() => (c.name = e.target.value));
     el.querySelector("button").onclick = () => (animated.has(c.id) ? openAnimation(c.id) : startCapture(c.id));
+    el.querySelector(".redo")?.addEventListener("click", () => startCapture(c.id));
     grid.appendChild(el);
   }
   drawCamChart();
@@ -213,7 +215,7 @@ window.addEventListener("resize", () => drawCamChart());
 async function startCapture(cid) {
   try {
     if (!S.state?.vrm) { toast("Choose your .vrm avatar first (step 1).", true); showStep("setup"); return; }
-    await api("/api/capture", { character: cid, smoothing: Number($("smoothing").value) });
+    await api("/api/capture", { character: cid, smoothing: Number($("smoothing").value), foot_lock: $("footLock").checked });
     const st = await watchJob();
     await refreshState();
     if (!st.error) openAnimation(cid);

@@ -157,7 +157,7 @@ class AppState:
             return {"characters": len(res["characters"])}
         self.job = Job("analysis", run)
 
-    def start_capture(self, char_id, smoothing=1.0):
+    def start_capture(self, char_id, smoothing=1.0, foot_lock=True):
         if self.job and not self.job.done:
             raise ValueError("Another task is still running")
         if self.analysis is None:
@@ -176,7 +176,7 @@ class AppState:
                               lambda f, m: progress(f * 0.85, m), cancel)
                 np.savez_compressed(cap_path, **cap)
             anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
-                                   lambda f, m: progress(0.85 + 0.15 * f, m))
+                                   lambda f, m: progress(0.85 + 0.15 * f, m), foot_lock=foot_lock)
             self._save_anim(char_id, anim)
             return {"character": char_id}
         self.job = Job("capture", run)
@@ -354,7 +354,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.start_analysis(bool(body.get("force")))
                 return self._send(200, {"ok": True})
             if p == "/api/capture":
-                STATE.start_capture(int(body["character"]), float(body.get("smoothing", 1.0)))
+                STATE.start_capture(int(body["character"]), float(body.get("smoothing", 1.0)),
+                                    bool(body.get("foot_lock", True)))
                 return self._send(200, {"ok": True})
             if p == "/api/cancel":
                 if STATE.job:

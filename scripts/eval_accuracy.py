@@ -103,6 +103,17 @@ def main(workdir, cid, vrm):
         acc = np.linalg.norm(p[2:] - 2 * p[1:-1] + p[:-2], axis=1)[valid[1:-1]]
         jit.append(np.median(acc) * 1000)
     print(f"jitter (median joint acceleration): {np.mean(jit):.2f} mm/frame^2")
+    # foot sliding: horizontal speed of a foot while it is marked as planted
+    contacts = d["contacts"].astype(bool)
+    slide = []
+    for side, b in ((0, "leftFoot"), (1, "rightFoot")):
+        p = pos[:, bi[b]][:, [0, 2]]
+        v = np.linalg.norm(np.diff(p, axis=0), axis=1) * meta["fps"]
+        m = contacts[1:, side] & contacts[:-1, side] & valid[1:]
+        slide.append(v[m])
+    sl = np.concatenate(slide) if slide else np.zeros(1)
+    print(f"foot sliding while planted: median {np.median(sl) * 100:.1f} cm/s, p90 {np.percentile(sl, 90) * 100:.1f} cm/s "
+          f"(planted {contacts.mean() * 100:.0f}% of foot-frames)")
     print(f"hips position error: median {np.median(pe) * 100:.1f}% of body height, p90 {np.percentile(pe, 90) * 100:.1f}%")
 
 

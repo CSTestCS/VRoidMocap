@@ -85,6 +85,7 @@ def cli(argv):
     c.add_argument("out")
     c.add_argument("--in-place", action="store_true")
     c.add_argument("--smoothing", type=float, default=1.0)
+    c.add_argument("--no-foot-lock", action="store_true", help="do not pin planted feet (raw leg angles)")
     g = sub.add_parser("gui")
     g.add_argument("--browser", action="store_true")
     g.add_argument("--port", type=int, default=0)
@@ -113,7 +114,7 @@ def cli(argv):
         if STATE.analysis is None:
             from .core.analysis import Analyzer
             STATE.analysis = Analyzer(args.video, STATE.workdir, prog).run()
-        STATE.start_capture(args.character - 1, args.smoothing)
+        STATE.start_capture(args.character - 1, args.smoothing, not args.no_foot_lock)
         while not STATE.job.done:
             prog(STATE.job.progress, STATE.job.message)
             time.sleep(0.5)

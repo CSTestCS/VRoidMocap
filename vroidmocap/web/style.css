@@ -51,6 +51,7 @@ button.icon { width: 36px; padding: 6px 0; }
 .stats dt { color: var(--muted); } .stats dd { margin: 0; text-align: right; }
 .char .tag { font-size: 11px; color: var(--accent); }
 .char button { margin-top: auto; }
+.char button.redo { margin-top: 0; }
 .chart-head { display: flex; justify-content: space-between; align-items: center; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
