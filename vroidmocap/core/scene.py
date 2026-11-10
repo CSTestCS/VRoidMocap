@@ -30,6 +30,8 @@ from .mathutil import normalize
 
 STILL_PX = 0.12       # median background motion below this (full-res px per step): camera still
 HUBER_PX = 1.5
+STILL_FRAC_PX = 0.3   # ...or this share of the tracked scenery moves less than this
+STILL_FRAC = 0.35
 
 
 def skew(v):
@@ -70,7 +72,10 @@ def rotation_zoom(p1, p2, f1, cx, cy, allow_zoom=True, zlim=(0.8, 1.25)):
     if n < 8:
         return None
     disp = np.linalg.norm(p2 - p1, axis=1)
-    if np.median(disp) < STILL_PX:
+    # a still camera: the background does not move. Things in the scene may
+    # (balloons, hair, other people), but when a large share of the scenery is
+    # perfectly still, the camera is.
+    if np.median(disp) < STILL_PX or np.mean(disp < STILL_FRAC_PX) > STILL_FRAC:
         return np.eye(3), 1.0, float(np.median(disp)), disp < 3.0
     Hm, inl = cv2.findHomography(p1, p2, cv2.RANSAC, 2.0)
     if Hm is None or inl is None or inl.sum() < 8:
@@ -151,6 +156,8 @@ def parallax_profile(obs, Rref, focal, cx, cy, win=8):
         pa, pb = _common(obs[k - win], obs[k])
         if len(pa) < 12:
             continue
+        if np.mean(np.linalg.norm(pb - pa, axis=1) < 2 * STILL_FRAC_PX) > STILL_FRAC:
+            continue  # much of the scenery has not moved at all: a still camera
         R = Rref[k].T @ Rref[k - win]  # v_k ~ R v_{k-win}
         e = np.linalg.norm(_rz_project(pa, R, focal[k - win], focal[k], cx, cy) - pb, axis=1)
         par[k] = float(np.median(e))
@@ -630,13 +637,15 @@ def solve_shot(pairs, ids, ok, f0, cx, cy, fps_a, H=1080, par_thr=1.2, win=8):
         focal = f0 * zoom
         out = _travel(obs, R, zoom, focal, moving.copy(), cx, cy, fps_a, win, search_focal=search and attempt < 3)
         R, zoom, C, moving_t, seg, fscale = out
+        if np.mean(seg >= 0) < 0.25 or (seg >= 0).sum() < 2 * fps_a:
+            fscale = 1.0  # too little travel in this shot to measure the lens by
         if search and attempt < 3 and abs(fscale - 1) > 0.03:
             f0 *= fscale
             R_chain, zoom_chain = _chain(pairs, ok, f0, cx, cy)
             calibrated = True
             continue
         break
-    calibrated = calibrated or (seg >= 0).any()
+    calibrated = calibrated or (np.mean(seg >= 0) >= 0.25 and (seg >= 0).sum() >= 2 * fps_a)
     return R, zoom, C, moving_t, seg, par, f0, calibrated
 
 
