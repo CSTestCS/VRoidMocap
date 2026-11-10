@@ -25,6 +25,7 @@ import os
 import numpy as np
 
 from . import camera as cam
+from . import lift
 from .analysis import world_cameras
 from .detect import (L_ANK, L_EAR, L_EL, L_EYE, L_FOOT, L_HEEL, L_HIP, L_INDEX, L_KNEE,
                      L_PINKY, L_SH, L_THUMB, L_WR, MOUTH_L, MOUTH_R, NOSE, R_ANK, R_EAR,
@@ -343,7 +344,8 @@ def avatar_fk(skel, Q, root):
 
 
 # ----------------------------------------------------------------------------- main
-def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True):
+def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True, debug=None):
+    dbg = (lambda k, v: debug.__setitem__(k, np.array(v, copy=True))) if debug is not None else (lambda k, v: None)
     progress = progress or (lambda *a: None)
     with open(os.path.join(workdir, "analysis.json")) as f:
         A = json.load(f)
@@ -394,39 +396,44 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             T[f] = t
     if valid.sum() < 2:
         raise RuntimeError("The selected character was not tracked well enough to animate.")
-    progress(0.05, "Solving camera continuity")
+    # ---- 2. body in 3D: bone lengths + picture positions + learned depth, solved over time
+    uv, conf = body_keypoints(lm2d, vis, capture.get("wb2d"), capture.get("wbs"), valid, swap, W, H)
+    P0 = np.full((N, 33, 3), np.nan)
+    P0[valid] = Wc[valid] + T[valid][:, None]
+    segs = runs(valid, shot_of)
+    P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps,
+                             progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
+    P[~valid] = np.nan
+    T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
+    lm2d = uv
+    # landmarks that are not part of the solve ride along with their parent joint
+    shc0, shc = (P0[:, L_SH] + P0[:, R_SH]) / 2, (P[:, L_SH] + P[:, R_SH]) / 2
+    for j in range(0, 11):
+        P[:, j] = P0[:, j] - shc0 + shc
+    for wi, tips in ((L_WR, (L_INDEX, L_PINKY, L_THUMB)), (R_WR, (R_INDEX, R_PINKY, R_THUMB))):
+        for j in tips:
+            P[:, j] = P0[:, j] - P0[:, wi] + P[:, wi]
+    progress(0.27, "Solving camera continuity")
     # yaw continuity across cuts using THIS character
+    refine_gravity(P, vis, R_rel, shot_of, shots, valid)
     yaw_at = {}
     for f in np.where(valid)[0]:
         Rw0 = shots[shot_of[f]]["align"] @ R_rel[f]
-        yaw_at[f] = cam.hips_yaw(Wc[f], Rw0)
+        yaw_at[f] = cam.hips_yaw(P[f], Rw0)
     R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at)
     # a locked-off camera must not sway: hold its rotation while the background is still
     static = camera_static_mask(npz["bg_motion"] if "bg_motion" in npz.files else None,
                                 npz["cam_q"].astype(np.float64), shot_of, fps)
     R_w = hold_static_rotation(R_w, static, shot_of)
 
-    # ---- 2. bone lengths (model metric) and snapping onto rays
-    blen = median_lengths(Wc, BODY_TREE, valid)
     Hc = np.zeros((N, 2, 21, 3))
     for side in (0, 1):
         for f in np.where(hvalid[:, side])[0]:
             Rr = cam.ray_rotation(focal[f], cx, cy, *hc[f, side])
             Hc[f, side] = hw[f, side] @ Rr.T
     hlen = [median_lengths(Hc[:, s], HAND_TREE, hvalid[:, s]) if hvalid[:, s].sum() > 3 else {} for s in (0, 1)]
-    # the hand model's metric scale differs from the body model's: match forearm proportions
-    P = np.full((N, 33, 3), np.nan)
     Ph = np.full((N, 2, 21, 3), np.nan)
     for f in np.where(valid)[0]:
-        p2 = lm2d[f].copy()
-        w = np.clip((vis[f] - 0.3) / 0.3, 0, 1)
-        for side, wi in ((0, L_WR), (1, R_WR)):
-            if hvalid[f, side]:
-                p2[wi] = h2d[f, side, 0]
-                w[wi] = 1.0
-        rays = rays_for(p2, focal[f], cx, cy)
-        P0 = Wc[f] + T[f]
-        P[f] = snap_chain(P0, rays, w, BODY_TREE, blen)
         for side, wi in ((0, L_WR), (1, R_WR)):
             if not hvalid[f, side] or not hlen[side]:
                 continue
@@ -445,12 +452,6 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         if f % 500 == 0:
             progress(0.05 + 0.25 * f / N, "Reconstructing 3D joints")
 
-    # ---- 2b. depth ambiguity: an elbow / wrist / knee / ankle seen along the
-    # line of sight has two positions that fit its 2D detection and bone length
-    # (in front of / behind its parent). Choose per joint over time (Viterbi):
-    # the bone direction should change little between frames.
-    P, Ph = resolve_depth_ambiguity(P, Ph, lm2d, vis, h2d, hvalid, valid, shot_of, focal, cx, cy, blen)
-
     # ---- 3. temporal filtering.
     # The 2D detections are precise frame by frame; the noise is in the depth
     # estimate. So depth along each camera ray is smoothed strongly while the
@@ -460,7 +461,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     sig_2d = 0.5 * max(0.0, smoothing) * fs
     segs = runs(valid, shot_of)
     for (s, e) in segs:
-        P[s:e] = ray_depth_smooth(P[s:e], sig_depth, sig_2d)
+        if sig_2d > 0:
+            P[s:e] = ray_depth_smooth(P[s:e], 0.0, sig_2d)
         for side in (0, 1):
             m = hvalid[s:e, side]
             if m.sum() >= 2:
@@ -524,6 +526,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             corr = quat_to_mat(np.array([np.sin(-off / 2), 0, 0, np.cos(off / 2)]))
             Q[qvalid, hi] = mat_to_quat(R @ corr)
 
+    dbg("Pcam", P)
+    dbg("Q_raw", Q)
     # ---- 5. temporal: per-bone confidence -> hold unseen bones, reject spikes, smooth
     progress(0.55, "Filtering (hold unseen bones, remove spikes, smooth)")
     conf = bone_confidence(skel, vis, hs, valid, hvalid)
@@ -531,6 +535,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     Q = nat.unflip_fingers(Q)
     strength = np.array([2.0 if (b.endswith("Hand") or any(f in b for f in FINGERS)) else 1.0 for b in skel.bones])
     Q = filter_rotations(Q, conf, fps, smoothing, strength=strength)
+    dbg("Q_filt", Q)
 
     # ---- 6. root motion on the avatar
     progress(0.7, "Solving root motion and foot contacts")
@@ -548,6 +553,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     root = hold_root(root, valid, fps)
     progress(0.8, "Joint limits and limb IK")
     Q = nat.apply(Q, root, fps, conf)
+    dbg("Q_nat", Q)
     if foot_lock:  # pins planted feet (two-bone IK)
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
@@ -578,6 +584,68 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         "h2d": h2d.astype(np.float32), "hs": hs.astype(np.float32), "scale": scale,
     }
     return anim
+
+
+def refine_gravity(P, vis, R_rel, shot_of, shots, valid):
+    """Which way is up, per shot, from the reconstructed body. Averaged over a
+    shot, the line from the feet to the hips of a dancer points up (the torso
+    leans too much to be a good reference; it is only used when the legs are
+    out of the picture). Uses the 3D solve, not the raw model output, which
+    matters for high and low camera angles."""
+    legs = [L_KNEE, R_KNEE, L_ANK, R_ANK]
+    for si, sh in enumerate(shots):
+        acc_l, n_l, acc_t, w_t = np.zeros(3), 0, np.zeros(3), 0.0
+        for f in np.where(valid & (shot_of == si))[0]:
+            if not np.isfinite(P[f]).all():
+                continue
+            hip = (P[f, L_HIP] + P[f, R_HIP]) / 2
+            if vis[f, legs].min() > 0.5:
+                acc_l += R_rel[f] @ normalize(hip - (P[f, L_ANK] + P[f, R_ANK]) / 2)
+                n_l += 1
+            up, w = cam.body_up_vector(P[f], vis[f])
+            if up is not None and w > 0:
+                acc_t += w * (R_rel[f] @ up)
+                w_t += w
+        if n_l >= 15:
+            up_ref = normalize(acc_l)
+        elif w_t >= 3.0:
+            up_ref = normalize(acc_t)
+        else:
+            continue
+        if np.degrees(np.arccos(np.clip(-up_ref[1], -1, 1))) > 70:
+            continue
+        sh["align"] = cam.align_from_up(up_ref)
+
+
+def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H):
+    """Picture positions of the body joints: the whole-body model where it is
+    confident (it is the more precise one), the MediaPipe landmarks otherwise.
+    The whole-body model's left/right labels are matched to the (already
+    resolved) MediaPipe ones. Returns (uv (N,33,2), conf (N,33))."""
+    from .detect import WB_SWAP, WB_TO_MP
+    uv = lm2d.copy()
+    conf = np.clip((vis - 0.3) / 0.3, 0, 1)
+    if wb2d is None or not np.any(wbs):
+        return uv, conf
+    wb2d = wb2d.astype(np.float64).copy()
+    wbs = wbs.astype(np.float64).copy()
+    mp_i = np.array([m for m in WB_TO_MP if 11 <= m <= 28])
+    wb_i = np.array([WB_TO_MP[m] for m in mp_i])
+    d0 = np.linalg.norm(wb2d[:, wb_i] - lm2d[:, mp_i], axis=-1).mean(1)
+    d1 = np.linalg.norm(wb2d[:, WB_SWAP][:, wb_i] - lm2d[:, mp_i], axis=-1).mean(1)
+    sw = valid & (d1 < 0.7 * d0)
+    wb2d[sw] = wb2d[sw][:, WB_SWAP]
+    wbs[sw] = wbs[sw][:, WB_SWAP]
+    margin = 0.01 * max(W, H)
+    for m, w in WB_TO_MP.items():
+        if m < 11:
+            continue
+        p = wb2d[:, w]
+        inside = (p[:, 0] > -margin) & (p[:, 0] < W + margin) & (p[:, 1] > -margin) & (p[:, 1] < H + margin)
+        use = valid & inside & (wbs[:, w] > 0.35)
+        uv[use, m] = p[use]
+        conf[use, m] = np.clip(wbs[use, w] / 0.6, 0.3, 1.0)
+    return uv, conf
 
 
 def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):

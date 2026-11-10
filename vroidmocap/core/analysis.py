@@ -27,7 +27,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 4
+ANALYSIS_VERSION = 5
 
 
 class Cancelled(Exception):
@@ -106,12 +106,16 @@ def is_human_track(t):
     L = np.array(t.lm2d, np.float64)[:, CORE]
     bx = np.array(t.boxes, np.float64)
     bh = np.maximum(bx[:, 3] - bx[:, 1], 1.0)
-    if V.mean() < 0.7:
-        return False
+    jit = 0.0
     if len(L) > 2:
         jit = np.median(np.linalg.norm(np.diff(L, axis=0), axis=2).mean(1) / bh[1:])
-        if jit > 0.15:
-            return False
+    # a person seen from above / from behind / partly out of frame has lower
+    # landmark confidence but still moves coherently: only reject when the
+    # landmarks are both unsure and unstable
+    if V.mean() < 0.5 or jit > 0.15:
+        return False
+    if V.mean() < 0.7 and jit > 0.08:
+        return False
     return True
 
 

@@ -14,13 +14,16 @@ A Windows app that turns a video into a motion-capture animation for your own
      view, from background motion with people masked out, aligned to gravity,
      with the focal length fitted per shot.
 2. **Motion capture** (per character). Pick a character and a second, high
-   accuracy pass runs on just that person: heavy body model on a stabilised
-   crop plus hand tracking on every wrist. It uses the analysis data for depth,
-   scale and camera angles. Every joint is fitted onto the camera ray through
-   its detection with fixed bone lengths, then turned into VRM bone rotations,
-   including all 15 finger bones per hand, wrists, forearm twist and feet.
-   Root motion is integrated from planted feet on your avatar's own skeleton,
-   and planted feet are pinned with leg IK so they do not slide.
+   accuracy pass runs on just that person:
+   * a whole-body keypoint model (RTMW) finds every joint in the picture,
+   * the MediaPipe body model adds a rough depth for every joint, and the hand
+     model tracks both hands on crops around the wrists,
+   * the **3D solve** combines them over the whole shot (see below) into joint
+     positions in front of the camera,
+   * these become VRM bone rotations, including all 15 finger bones per hand,
+     wrists, forearm twist and feet. Root motion is integrated from planted
+     feet on your avatar's own skeleton, and planted feet are pinned with leg
+     IK so they do not slide.
 3. **Viewer**. Watch side by side with the video, as *avatar over video*
    (the clip rendered through the solved camera, to check alignment), or with a
    free orbit camera. Scrub, step frame by frame, pick the output frame rate
@@ -35,10 +38,13 @@ A Windows app that turns a video into a motion-capture animation for your own
   [GitHub Actions build](../../actions/workflows/build-windows.yml) (artifact
   *VRoidMocap-windows*) or from Releases, and double-click it. It needs no
   install. It uses the Edge WebView2 runtime that ships with Windows 10/11.
+  The first motion capture downloads the whole-body model once (370 MB, into
+  `%LOCALAPPDATA%\VRoidMocap\models`). Without internet the app still works,
+  using the MediaPipe body model alone (less precise).
 * **From source** (any OS, Python 3.10–3.12):
   ```
   pip install -r requirements.txt
-  python scripts/fetch_models.py
+  python scripts/fetch_models.py --all
   python run_app.py            # or: python run_app.py --browser
   ```
 
@@ -69,6 +75,28 @@ VRoidMocapCLI.exe selftest
 Verified by importing into Blender: bone positions match the app's solve to
 0.0 cm, the camera matches exactly, and skinned vertices follow their bones
 exactly.
+
+## How the body is reconstructed in 3D
+
+One camera shows precisely *where* a joint is in the picture, but not how far
+away it is. What fixes the depth is that bones do not change length: a bone of
+known length seen at a given size leaves exactly two possible positions for
+its far end, pointing towards the camera or away from it. The solve
+(`vroidmocap/core/lift.py`) is built on that:
+
+1. **Bone lengths** are measured from the video itself, from the frames in
+   which a bone lies parallel to the picture (where it appears at full length).
+2. **Distance of the character** per frame follows from how large the bones
+   appear, smoothed over time.
+3. **Towards or away** is chosen per limb over the whole shot (not frame by
+   frame): the choice has to agree with the learned depth bone by bone, keep
+   knees and elbows bending the right way, keep the thigh within the hip's
+   range, and not flip between frames.
+4. **Refinement**: all joints of all frames are then adjusted together
+   (Gauss-Newton) so that they match the picture, keep their bone lengths,
+   stay near the learned depth and move smoothly along the line of sight.
+5. **Which way is up** is taken per shot from the reconstructed legs, which
+   gives the camera's tilt (high and low camera angles).
 
 ## How the motion is cleaned up
 
@@ -102,24 +130,34 @@ exactly.
 
 ## Accuracy
 
-`scripts/eval_accuracy.py` projects the posed avatar through the solved camera
-and compares every limb with the video. Full 3-minute sample (1080p60 dance,
-moving camera), default settings:
+Measured against ground truth: the sample avatar is rendered with a known
+animation and known cameras (1080p, four shots: frontal, high angle with a
+turn, orbiting camera, close-up), the app captures that video, and the result
+is compared bone by bone in 3D.
 
-| | |
-|---|---|
-| body limbs, median 2D angle error vs video | 1.2° |
-| fingers vs the hand detector | ~11° (the detector itself is noisy on small hands) |
-| rotation jitter (median / 99th pct) | 0.2 / 4.7 °/frame² |
-| hips position | 1% of body height |
-| planted foot sliding | 0 cm/s median |
+| | before | now |
+|---|---|---|
+| limb direction error in 3D, frontal shot (mean / median) | 16.0° / 10.5° | 13.8° / 9.3° |
+| limb direction error in 3D, orbiting camera | 14.2° / 12.0° | 10.3° / 8.7° |
+| limb direction error in 3D, close-up | 30.3° / 27.0° | 22.1° / 12.6° |
+| joint position error, orbiting camera (mean) | 6.4 cm | 4.9 cm |
+| camera tilt error (frontal / high angle / orbit) | 3.5° / 17.5° / 7.1° | 2.0° / 10.1° / 6.1° |
+| frames of the high-angle turn that are tracked | 32% | 94% |
+| joint position in the picture (median, 1080p) | 12 to 15 px | 6 to 8 px |
+
+In the picture the result lines up closely with the video; the remaining
+error is depth.
 
 Honest limits of single-camera capture:
-* **Depth**, meaning how far a limb points toward or away from the camera, is
-  inferred, not measured.
-* **Hidden or tiny hands:** fingers are only as good as what can be seen; when
-  unseen they hold their last pose.
-* **Very fast spins** can briefly confuse front and back.
+* **Depth** is inferred, not measured. A limb that points only slightly
+  towards or away from the camera can be reconstructed on the wrong side
+  (about 6% of limbs are more than 45° off in the test above).
+* **Hidden limbs** (behind the body, outside the picture) are held in their
+  last seen pose.
+* **Fingers:** in a full-body shot a hand is about 40 pixels. Finger bones are
+  within roughly 30° of the truth; in close-ups they are better.
+* **Field of view** cannot be measured from a single view of a person; it is
+  estimated, which affects how far away the cloned camera stands, not the pose.
 * **Proportions:** the avatar receives rotations, not positions, so an avatar
   with different limb lengths will not overlap the video pixel for pixel.
 
@@ -129,7 +167,7 @@ On Windows with Python 3.12:
 
 ```
 pip install -r requirements-build.txt
-python scripts/fetch_models.py
+python scripts/fetch_models.py --all
 pyinstaller VRoidMocap.spec      # -> dist/VRoidMocap.exe
 ```
 
@@ -141,8 +179,9 @@ exe to a release when a `v*` tag is pushed.
 
 ```
 vroidmocap/core/analysis.py   pass 1: shots, tracking, identities, cameras, heights
-vroidmocap/core/capture.py    pass 2a: per-frame body + hand landmarks (parallel)
-vroidmocap/core/retarget.py   pass 2b: 3D reconstruction, VRM rotations, root motion, foot IK
+vroidmocap/core/capture.py    pass 2a: per-frame whole-body, body-depth and hand landmarks (parallel)
+vroidmocap/core/lift.py       pass 2b: the 3D body solve (bone lengths, towards/away, refinement)
+vroidmocap/core/retarget.py   pass 2c: VRM rotations, root motion, foot IK, cloned camera
 vroidmocap/core/camera.py     camera geometry (focal fit, gravity, rays)
 vroidmocap/core/vrm.py        VRM 0.x / 1.0 humanoid skeleton reader
 vroidmocap/core/fbx_writer.py binary FBX 7.4 writer
@@ -150,6 +189,7 @@ vroidmocap/server.py          local API used by the UI
 vroidmocap/web/               UI (three.js + three-vrm viewer)
 ```
 
-Models: Google MediaPipe Pose Landmarker (heavy/full), Hand Landmarker and
+Models: RTMW whole-body keypoints (OpenMMLab, Apache 2.0, run with ONNX
+Runtime), Google MediaPipe Pose Landmarker (heavy/full), Hand Landmarker and
 MobileNetV3 image embedder (Apache 2.0). Viewer: three.js and @pixiv/three-vrm
 (MIT).

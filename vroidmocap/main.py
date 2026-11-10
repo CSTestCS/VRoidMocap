@@ -156,6 +156,16 @@ def selftest():
         (m.embed if name == "embed" else m.detect)(img)
         m.close()
         print("ok", name, flush=True)
+    import onnxruntime as ort
+    print("onnxruntime", ort.__version__, flush=True)
+    from .core.detect import WholeBody, model_available
+    wb = model_available("wholebody")
+    if wb:
+        kp, sc = WholeBody(wb).detect(img, (0, 0, 256, 256))
+        assert kp.shape == (133, 2)
+        print("ok wholebody", flush=True)
+    else:
+        print("wholebody model not present (the app downloads it on first use)", flush=True)
     import cv2
     print("opencv", cv2.__version__, "ffmpeg backend", "FFMPEG" in cv2.getBuildInformation())
     print("SELFTEST PASSED", flush=True)

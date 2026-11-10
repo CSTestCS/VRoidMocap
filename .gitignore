@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 *.vmcache/
 /workspace/
+/vroidmocap/assets/models/*.onnx

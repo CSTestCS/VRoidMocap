@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from .detect import (L_EL, L_INDEX, L_PINKY, L_THUMB, L_WR, R_EL, R_INDEX, R_PINKY, R_THUMB,
-                     R_WR, HandDetector, PoseDetector, box_iou, crop_square, landmark_box)
+                     R_WR, HandDetector, PoseDetector, WholeBody, box_iou, crop_square, landmark_box)
 from .mathutil import gaussian_smooth
 from .video import VideoReader
 
@@ -109,7 +109,7 @@ def hand_plausibility(p, score, label, ctx):
 
 def process_chunk(args):
     """Worker: landmarks for frames [s, e) given per-frame boxes."""
-    video, s, e, boxes, fps, out_path = args
+    video, s, e, boxes, fps, out_path, wb_path = args
     if os.path.exists(out_path):
         return out_path
     n = e - s
@@ -120,6 +120,9 @@ def process_chunk(args):
     h2d = np.zeros((n, 2, 21, 2), np.float32)
     hw = np.zeros((n, 2, 21, 3), np.float32)
     hs = np.zeros((n, 2), np.float32)
+    wb2d = np.zeros((n, 133, 2), np.float32)
+    wbs = np.zeros((n, 133), np.float32)
+    wbody = WholeBody(wb_path) if wb_path else None
     hc = np.zeros((n, 2, 2), np.float32)
     pose = PoseDetector(heavy=True, num_poses=1, video=True, min_conf=0.3)
     pose_img = None
@@ -142,6 +145,13 @@ def process_chunk(args):
                 pose_img = PoseDetector(heavy=True, num_poses=1, video=False, min_conf=0.25)
             res = pose_img.detect(crop, x0, y0, sc, sc)
             ok = bool(res) and box_iou(landmark_box(res[0].lm2d, res[0].vis), b) > 0.2
+        if wbody is not None:
+            # box: the tracked box, widened by the body model's own landmarks
+            bb = np.array(b, float)
+            if ok:
+                lb = landmark_box(res[0].lm2d, res[0].vis)
+                bb = np.array([min(bb[0], lb[0]), min(bb[1], lb[1]), max(bb[2], lb[2]), max(bb[3], lb[3])])
+            wb2d[i], wbs[i] = wbody.detect(rgb, bb)
         if not ok:
             prev_hand = [None, None]
             continue
@@ -179,7 +189,7 @@ def process_chunk(args):
     if pose_img is not None:
         pose_img.close()
     np.savez_compressed(out_path + ".tmp.npz", lm2d=lm2d, vis=vis, world=world, cropc=cropc,
-                        h2d=h2d, hw=hw, hs=hs, hc=hc)
+                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs)
     os.replace(out_path + ".tmp.npz", out_path)
     return out_path
 
@@ -191,13 +201,17 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     N, fps = A["frames"], A["fps"]
     cdir = os.path.join(workdir, f"capture_c{char_id}")
     os.makedirs(cdir, exist_ok=True)
+    from .detect import ensure_model
+    progress(0.0, "Getting the whole-body model (one-time download, 370 MB)")
+    wb_path = ensure_model("wholebody", lambda f: progress(0.0, f"Downloading the whole-body model: {f * 100:.0f}%"))
+    tag = "w" if wb_path else "m"
     jobs = []
     for (s, e) in segs:
         for cs in range(s, e, CHUNK):
             ce = min(e, cs + CHUNK)
             if ce - cs < 1:
                 continue
-            jobs.append((video, cs, ce, boxes[cs:ce].copy(), fps, os.path.join(cdir, f"chunk_{cs:07d}_{ce:07d}.npz")))
+            jobs.append((video, cs, ce, boxes[cs:ce].copy(), fps, os.path.join(cdir, f"chunk{tag}_{cs:07d}_{ce:07d}.npz"), wb_path))
     total = sum(j[2] - j[1] for j in jobs)
     # each worker holds its own models (~300 MB): cap the count to keep memory reasonable
     workers = workers or max(1, min(len(jobs), (os.cpu_count() or 2) - 1, 6))
@@ -211,7 +225,7 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
                     pool.terminate()
                     from .analysis import Cancelled
                     raise Cancelled()
-                name = os.path.basename(path)[6:-4].split("_")
+                name = os.path.basename(path)[:-4].split("_")[1:]
                 done += int(name[1]) - int(name[0])
                 el = time.time() - t0
                 eta = el / max(done, 1) * (total - done)
@@ -222,6 +236,7 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         "world": np.zeros((N, 33, 3), np.float32), "cropc": np.zeros((N, 2), np.float32),
         "h2d": np.zeros((N, 2, 21, 2), np.float32), "hw": np.zeros((N, 2, 21, 3), np.float32),
         "hs": np.zeros((N, 2), np.float32), "hc": np.zeros((N, 2, 2), np.float32),
+        "wb2d": np.zeros((N, 133, 2), np.float32), "wbs": np.zeros((N, 133), np.float32),
     }
     for j in jobs:
         d = np.load(j[5])

@@ -385,3 +385,66 @@ class Naturalize(unittest.TestCase):
         d = quat_to_mat(Q2[0, i]) @ a
         u = normalize(np.cross(h, a))
         self.assertAlmostEqual(np.degrees(np.arctan2(d @ u, d @ a)), 50.0, places=3)
+
+
+class TestLift(unittest.TestCase):
+    """The 3D body solve: bone lengths + picture positions + a rough depth guess."""
+
+    def _scene(self, n=120, seed=0):
+        from vroidmocap.core import lift
+        rng = np.random.default_rng(seed)
+        t = np.linspace(0, 2 * np.pi, n)
+        X = np.zeros((n, 33, 3))
+        X[..., 2] = 3.0
+        hip = np.array([0.0, 0.1, 3.0])
+        X[:, 23] = hip + [0.09, 0, 0]
+        X[:, 24] = hip - [0.09, 0, 0]
+        X[:, 11] = hip + [0.12, -0.5, 0]
+        X[:, 12] = hip + [-0.12, -0.5, 0]
+
+        def limb(root, mid, end, L1, L2, a1, a2, side):
+            d1 = np.stack([side * 0.3 * np.cos(a1), np.cos(a1 * 0.5) * 0.8 + 0.2, np.sin(a1) * 0.6], 1)
+            d1 /= np.linalg.norm(d1, axis=1, keepdims=True)
+            d2 = np.stack([side * 0.2 * np.sin(a2), np.abs(np.cos(a2)) * 0.7 + 0.3, 0.5 * np.sin(a2 + 1)], 1)
+            d2 /= np.linalg.norm(d2, axis=1, keepdims=True)
+            X[:, mid] = X[:, root] + L1 * d1
+            X[:, end] = X[:, mid] + L2 * d2
+        limb(11, 13, 15, 0.26, 0.24, t, 2 * t, 1)
+        limb(12, 14, 16, 0.26, 0.24, t + 1, 2 * t + 2, -1)
+        limb(23, 25, 27, 0.40, 0.42, 0.5 * np.sin(t), 0.4 * np.sin(t) - 0.5, 1)
+        limb(24, 26, 28, 0.40, 0.42, 0.5 * np.sin(t + 2), 0.4 * np.sin(t + 2) - 0.5, -1)
+        for a, h, toe in ((27, 29, 31), (28, 30, 32)):
+            X[:, h] = X[:, a] + [0, 0.05, 0.05]
+            X[:, toe] = X[:, a] + [0, 0.07, -0.13]
+        f = np.full(n, 1400.0)
+        uv = np.stack([X[..., 0] / X[..., 2] * 1400 + 960, X[..., 1] / X[..., 2] * 1400 + 540], -1)
+        # rough input: right picture position, depth squashed to 40% plus noise
+        P0 = X.copy()
+        zc = X[:, [23, 24], 2].mean(1, keepdims=True)
+        P0[..., 2] = zc + 0.4 * (X[..., 2] - zc) + rng.normal(0, 0.01, X.shape[:2])
+        P0[..., :2] = X[..., :2] / X[..., 2:3] * P0[..., 2:3]
+        return lift, X, P0, uv, f
+
+    def test_recovers_depth(self):
+        lift, X, P0, uv, f = self._scene()
+        n = len(X)
+        P, L = lift.fuse_body(P0, uv, np.ones((n, 33)), f, 960, 540, [(0, n)], 30.0)
+        self.assertAlmostEqual(L[(11, 13)], 0.26, delta=0.02)
+        self.assertAlmostEqual(L[(25, 27)], 0.42, delta=0.03)
+
+        def err(Q):
+            out = []
+            for a, b in ((11, 13), (13, 15), (12, 14), (14, 16), (23, 25), (25, 27), (24, 26), (26, 28)):
+                u, v = Q[:, b] - Q[:, a], X[:, b] - X[:, a]
+                c = np.sum(u * v, -1) / (np.linalg.norm(u, axis=-1) * np.linalg.norm(v, axis=-1))
+                out.append(np.degrees(np.arccos(np.clip(c, -1, 1))))
+            return float(np.mean(out))
+        self.assertLess(err(P), 0.5 * err(P0))
+        self.assertLess(err(P), 8.0)
+
+    def test_bone_lengths_constant(self):
+        lift, X, P0, uv, f = self._scene(seed=1)
+        n = len(X)
+        P, L = lift.fuse_body(P0, uv, np.ones((n, 33)), f, 960, 540, [(0, n)], 30.0)
+        d = np.linalg.norm(P[:, 13] - P[:, 11], axis=-1)
+        self.assertLess(np.std(d), 0.01)

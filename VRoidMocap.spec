@@ -1,14 +1,17 @@
 # PyInstaller spec - build with:  pyinstaller VRoidMocap.spec
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
-datas = [
-    ("vroidmocap/web", "vroidmocap/web"),
-    ("vroidmocap/assets/models", "vroidmocap/assets/models"),
-]
+import glob
+
+datas = [("vroidmocap/web", "vroidmocap/web")]
+# the MediaPipe models are packed; the large whole-body model (.onnx) is
+# downloaded by the app on first use
+datas += [(f, "vroidmocap/assets/models") for f in glob.glob("vroidmocap/assets/models/*")
+          if f.endswith((".task", ".tflite"))]
 datas += collect_data_files("mediapipe", excludes=["**/*.pyc"])
 datas += collect_data_files("webview")
-binaries = collect_dynamic_libs("mediapipe")
-hiddenimports = collect_submodules("mediapipe.tasks") + collect_submodules("webview")
+binaries = collect_dynamic_libs("mediapipe") + collect_dynamic_libs("onnxruntime")
+hiddenimports = collect_submodules("mediapipe.tasks") + collect_submodules("webview") + ["onnxruntime"]
 
 a = Analysis(
     ["run_app.py"],

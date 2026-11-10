@@ -18,12 +18,20 @@ MODEL_FILES = {
     "pose_heavy": "pose_landmarker_heavy.task",
     "hand": "hand_landmarker.task",
     "embed": "mobilenet_v3_large.tflite",
+    "wholebody": "rtmw3d-x_384x288.onnx",
+}
+# large models that are not packed into the exe: fetched once on first use
+DOWNLOAD_ON_USE = {"wholebody"}
+MODEL_SIZES = {"wholebody": 369330857}
+MODEL_MIRRORS = {
+    "wholebody": ["https://huggingface.co/bukuroo/RTMW3D-ONNX/resolve/main/rtmw3d-x-384.onnx"],
 }
 MODEL_URLS = {
     "pose_full": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
     "pose_heavy": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
     "hand": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
     "embed": "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_large/float32/latest/mobilenet_v3_large.tflite",
+    "wholebody": "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx",
 }
 
 
@@ -52,11 +60,55 @@ def user_model_dir():
     return d
 
 
-def download_model(key, dest):
+def download_model(key, dest, progress=None):
+    """Fetch a model file (tries mirrors, checks the size, atomic rename)."""
     import urllib.request
     tmp = dest + ".part"
-    urllib.request.urlretrieve(MODEL_URLS[key], tmp)
-    os.replace(tmp, dest)
+    err = None
+    for url in [MODEL_URLS[key]] + MODEL_MIRRORS.get(key, []):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                total = int(r.headers.get("Content-Length") or MODEL_SIZES.get(key, 0) or 0)
+                got = 0
+                while True:
+                    buf = r.read(1 << 20)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    got += len(buf)
+                    if progress and total:
+                        progress(got / total)
+            want = MODEL_SIZES.get(key)
+            if want and os.path.getsize(tmp) != want:
+                raise IOError("incomplete download")
+            os.replace(tmp, dest)
+            return
+        except Exception as e:  # try the next mirror
+            err = e
+    raise RuntimeError(f"could not download model '{key}': {err}")
+
+
+def model_available(key):
+    for d in (os.path.join(resource_dir(), "assets", "models"), user_model_dir()):
+        p = os.path.join(d, MODEL_FILES[key])
+        if os.path.exists(p) and os.path.getsize(p) == MODEL_SIZES.get(key, os.path.getsize(p)):
+            return p
+    return None
+
+
+def ensure_model(key, progress=None):
+    """Path of a model, downloading it into the user's data folder if needed.
+    Returns None when it cannot be obtained (offline)."""
+    p = model_available(key)
+    if p:
+        return p
+    dest = os.path.join(user_model_dir(), MODEL_FILES[key])
+    try:
+        download_model(key, dest, progress)
+        return dest
+    except Exception:
+        return None
 
 
 def _opts(key):
@@ -217,3 +269,48 @@ def box_iou(a, b):
     inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
     ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / ua if ua > 0 else 0.0
+
+
+# ----------------------------------------------------------------------------- whole-body 2D model
+# COCO-WholeBody (133 keypoints): 0-16 body, 17-22 feet, 23-90 face, 91-111 left hand, 112-132 right hand
+WB_TO_MP = {11: 5, 12: 6, 13: 7, 14: 8, 15: 9, 16: 10, 23: 11, 24: 12, 25: 13, 26: 14, 27: 15, 28: 16,
+            29: 19, 30: 22, 31: 17, 32: 20, 0: 0, 2: 1, 5: 2, 7: 3, 8: 4}
+WB_SWAP = np.arange(133)
+for _a, _b in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16), (17, 20), (18, 21), (19, 22)]:
+    WB_SWAP[_a], WB_SWAP[_b] = _b, _a
+WB_SWAP[91:112], WB_SWAP[112:133] = np.arange(112, 133), np.arange(91, 112)
+
+
+class WholeBody:
+    """RTMW whole-body keypoints (ONNX). Much more precise in the picture than
+    the MediaPipe body model; used for where the joints are in 2D."""
+    W, H = 288, 384
+    MEAN = np.array([123.675, 116.28, 103.53], np.float32)
+    STD = np.array([58.395, 57.12, 57.375], np.float32)
+
+    def __init__(self, path, threads=1):
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
+        so.log_severity_level = 3
+        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        self.inp = self.sess.get_inputs()[0].name
+
+    def detect(self, rgb, box, pad=1.25):
+        """box: x0,y0,x1,y1 around the person. Returns (kp (133,2) px, score (133,))."""
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        w, h = (box[2] - box[0]) * pad, (box[3] - box[1]) * pad
+        if w / max(h, 1e-6) > self.W / self.H:
+            h = w * self.H / self.W
+        else:
+            w = h * self.W / self.H
+        M = np.array([[self.W / w, 0, self.W / 2 - cx * self.W / w], [0, self.H / h, self.H / 2 - cy * self.H / h]])
+        crop = cv2.warpAffine(rgb, M, (self.W, self.H), flags=cv2.INTER_LINEAR)
+        x = ((crop.astype(np.float32) - self.MEAN) / self.STD).transpose(2, 0, 1)[None]
+        out = self.sess.run(None, {self.inp: x})
+        sx, sy = out[0][0], out[1][0]
+        kx, ky = sx.argmax(1) / 2.0, sy.argmax(1) / 2.0
+        score = np.minimum(sx.max(1), sy.max(1))
+        kp = np.stack([(kx - self.W / 2) * w / self.W + cx, (ky - self.H / 2) * h / self.H + cy], 1)
+        return kp.astype(np.float32), score.astype(np.float32)
