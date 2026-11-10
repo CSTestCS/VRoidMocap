@@ -63,6 +63,15 @@ class Job:
                 "error": self.error, "done": self.done}
 
 
+def load_avatar_skeleton(path):
+    """.vrm (VRM 0.x / 1.0) or .fbx character model -> humanoid skeleton."""
+    if str(path).lower().endswith(".fbx"):
+        from .core.fbx_avatar import load_fbx_skeleton
+        return load_fbx_skeleton(path)
+    from .core.vrm import load_vrm_skeleton
+    return load_vrm_skeleton(path)
+
+
 def _anim_is_current(path):
     """An animation saved by an older solver is not used (it is solved again)."""
     from .core.retarget import SOLVE_VERSION
@@ -88,12 +97,11 @@ class AppState:
     # ------------------------------------------------------------------ setup
     def open(self, video=None, vrm=None):
         from .core.video import FrameServer, VideoReader
-        from .core.vrm import load_vrm_skeleton
         out = {}
         if vrm:
             if not os.path.isfile(vrm):
                 raise ValueError(f"Avatar file not found: {vrm}")
-            self.skel = load_vrm_skeleton(vrm)
+            self.skel = load_avatar_skeleton(vrm)
             self.vrm = vrm
             out["vrm"] = {"path": vrm, "title": self.skel.title, "version": self.skel.version,
                           "bones": len(self.skel.bones)}
@@ -132,6 +140,7 @@ class AppState:
         return {
             "video": self.video, "vrm": self.vrm,
             "vrm_title": self.skel.title if self.skel else None,
+            "avatar_kind": ("fbx" if self.skel.version == "fbx" else "vrm") if self.skel else None,
             "analysis": self.analysis is not None,
             "animated": sorted(self.available_anims()),
             "job": self.job.status() if self.job else None,
@@ -238,6 +247,11 @@ class AppState:
                  ("lm2d", a["lm2d"]), ("vis", a["vis"]), ("h2d", a["h2d"]), ("hs", a["hs"]),
                  ("shot_of", a["shot_of"].astype(np.float32))]
         meta = {k: a[k] for k in ("fps", "frames", "width", "height", "character", "bones", "scale", "src_fps")}
+        if self.skel is not None and self.skel.version == "fbx":
+            # the model's own bones: local rotations as in the file + hips translation
+            names, fq, fh = self.skel.fbx.pose(list(a["bones"]), a["quats"], a["root"])
+            parts += [("fbx_quats", fq), ("fbx_hips", fh)]
+            meta["fbx_names"] = names
         meta["layout"] = {}
         off = 0
         blobs = []
@@ -249,10 +263,18 @@ class AppState:
         return meta, b"".join(blobs)
 
     def export(self, char_id, path, in_place=False, lock_height=False, include_camera=True, fps=30,
-               include_model=True, write_textures=True):
+               include_model=True, write_textures=True, start=None, end=None):
         from .core.fbx_writer import export_animation_fbx
+        from .core.retarget import crop_anim
         tex_dir = os.path.splitext(path)[0] + ".fbm" if (include_model and write_textures) else None
-        return export_animation_fbx(path, self.skel, self.anim_at(char_id, fps), in_place=in_place,
+        anim = self.anim_at(char_id, fps)
+        if start is not None and end is not None:
+            anim = crop_anim(anim, int(start), int(end))
+        if self.skel.version == "fbx":  # the FBX avatar's own file, with the animation added
+            return self.skel.fbx.export(path, anim, list(anim["bones"]), include_model=include_model,
+                                        include_camera=include_camera, in_place=in_place, lock_height=lock_height,
+                                        rest_hips_y=float(self.skel.rest_pos["hips"][1]))
+        return export_animation_fbx(path, self.skel, anim, in_place=in_place,
                                     lock_height=lock_height, include_camera=include_camera,
                                     vrm_path=self.vrm, include_model=include_model, texture_dir=tex_dir)
 
@@ -332,6 +354,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, data, "image/jpeg", {"Cache-Control": "max-age=3600"})
             if p == "/api/vrm":
                 return self._file(STATE.vrm, "application/octet-stream")
+            if p == "/api/avatar_info":
+                sk = STATE.skel
+                if sk is None:
+                    return self._send(404, {"error": "no avatar"})
+                info = {"kind": "fbx" if sk.version == "fbx" else "vrm", "title": sk.title}
+                if sk.version == "fbx":
+                    fb = sk.fbx
+                    info.update(placement=fb.placement().reshape(-1).tolist(),
+                                hips=fb.models[fb.hb["hips"]]["name"],
+                                feet=[fb.models[fb.hb[b]]["name"] for b in ("leftFoot", "rightFoot")],
+                                rest_hips_y=float(sk.rest_pos["hips"][1]))
+                return self._send(200, info)
             if p.startswith("/api/anim/"):
                 parts = p.split("/")
                 cid = int(parts[3])
@@ -345,7 +379,8 @@ class Handler(BaseHTTPRequestHandler):
                 os.close(fd)
                 STATE.export(cid, tmp, q.get("in_place") == "1", q.get("lock_height") == "1",
                              q.get("camera", "1") == "1", int(q.get("fps", 30)), q.get("model", "1") == "1",
-                             write_textures=False)  # single-file download: textures are embedded
+                             write_textures=False,  # single-file download: textures are embedded
+                             start=q.get("start"), end=q.get("end"))
                 base = os.path.splitext(os.path.basename(STATE.video or "video"))[0]
                 self._file(tmp, "application/octet-stream", f"{base}_character{cid + 1}.fbx")
                 os.remove(tmp)
@@ -397,7 +432,8 @@ class Handler(BaseHTTPRequestHandler):
                 path = body["path"]
                 STATE.export(int(body["character"]), path, bool(body.get("in_place")),
                              bool(body.get("lock_height")), bool(body.get("camera", True)),
-                             int(body.get("fps", 30)), bool(body.get("model", True)))
+                             int(body.get("fps", 30)), bool(body.get("model", True)),
+                             start=body.get("start"), end=body.get("end"))
                 return self._send(200, {"ok": True, "path": path})
             if p == "/api/rename":
                 cid = int(body["character"])

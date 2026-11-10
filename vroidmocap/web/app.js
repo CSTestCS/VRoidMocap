@@ -71,7 +71,8 @@ function onOpened(res) {
   }
   if (res.vrm) {
     $("vrmPath").textContent = res.vrm.path;
-    $("vrmInfo").textContent = `${res.vrm.title || "Avatar"} · VRM ${res.vrm.version === "1" ? "1.0" : "0.x"} · ${res.vrm.bones} humanoid bones`;
+    const kind = res.vrm.version === "fbx" ? "FBX" : `VRM ${res.vrm.version === "1" ? "1.0" : "0.x"}`;
+    $("vrmInfo").textContent = `${res.vrm.title || "Avatar"} · ${kind} · ${res.vrm.bones} humanoid bones`;
     S.vrmLoaded = false;
     S.anim = null;
     $("steps").children[2].disabled = true;
@@ -214,7 +215,7 @@ window.addEventListener("resize", () => drawCamChart());
 
 async function startCapture(cid) {
   try {
-    if (!S.state?.vrm) { toast("Choose your .vrm avatar first (step 1).", true); showStep("setup"); return; }
+    if (!S.state?.vrm) { toast("Choose your avatar (.vrm or .fbx) first (step 1).", true); showStep("setup"); return; }
     await api("/api/capture", { character: cid, smoothing: Number($("smoothing").value), foot_lock: $("footLock").checked });
     const st = await watchJob();
     await refreshState();
@@ -227,7 +228,9 @@ async function ensureViewer() {
   if (!S.viewer) S.viewer = new Viewer($("gl"), $("pane3d"));
   if (!S.vrmLoaded) {
     setJob({ message: "Loading avatar…", progress: 0.5, done: false });
-    await S.viewer.loadVRM(`/api/vrm?${Date.now()}`);
+    const info = await api("/api/avatar_info");
+    if (info.kind === "fbx") await S.viewer.loadFBX(`/api/vrm?${Date.now()}`, info);
+    else await S.viewer.loadVRM(`/api/vrm?${Date.now()}`);
     S.vrmLoaded = true;
     setJob(null);
   }
@@ -247,7 +250,12 @@ async function openAnimation(cid) {
     const c = S.analysis.characters.find((x) => x.id === cid);
     $("viewerChar").textContent = c ? c.name : "";
     $("scrub").max = meta.frames - 1;
-    drawTrack();
+    if (S.crop && S.cropFps && S.cropFps !== meta.fps) {  // keep the same moments at another frame rate
+      const k = meta.fps / S.cropFps;
+      S.crop = [Math.round(S.crop[0] * k), Math.round(S.crop[1] * k)];
+    }
+    S.cropFps = meta.fps;
+    setCrop(S.crop && S.character === cid ? S.crop[0] : null, S.crop ? S.crop[1] : null);
     seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
@@ -302,12 +310,38 @@ $("scrub").oninput = (e) => { S.playing = false; updatePlay(); seek(Number(e.tar
 $("stepBack").onclick = () => { S.playing = false; updatePlay(); seek(S.frame - 1); };
 $("stepFwd").onclick = () => { S.playing = false; updatePlay(); seek(S.frame + 1); };
 function updatePlay() { $("playBtn").textContent = S.playing ? "⏸" : "▶"; }
-$("playBtn").onclick = () => { S.playing = !S.playing; if (S.playing && S.frame >= S.anim.frames - 1) seek(0); S.last = performance.now(); updatePlay(); };
+$("playBtn").onclick = () => {
+  S.playing = !S.playing;
+  const [a, b] = playRange();
+  if (S.playing && (S.frame >= b || S.frame < a)) seek(a);
+  S.last = performance.now(); updatePlay();
+};
+// ---- range (crop) for looping and export
+function playRange() {
+  if (S.crop) return [S.crop[0], S.crop[1]];
+  return [0, S.anim.frames - 1];
+}
+function setCrop(a, b) {
+  if (a == null) S.crop = null;
+  else S.crop = [Math.max(0, Math.min(a, b)), Math.min(S.anim.frames - 1, Math.max(a, b))];
+  $("cropClear").disabled = !S.crop;
+  const fps = S.anim.fps;
+  $("cropInfo").textContent = S.crop
+    ? `Range ${fmtTime(S.crop[0] / fps)} – ${fmtTime(S.crop[1] / fps)} (frames ${S.crop[0]}–${S.crop[1]}, ${S.crop[1] - S.crop[0] + 1} frames)`
+    : "Whole clip";
+  drawTrack();
+}
+$("cropIn").onclick = () => setCrop(S.frame, S.crop ? Math.max(S.crop[1], S.frame) : S.anim.frames - 1);
+$("cropOut").onclick = () => setCrop(S.crop ? Math.min(S.crop[0], S.frame) : 0, S.frame);
+$("cropClear").onclick = () => setCrop(null);
 document.addEventListener("keydown", (e) => {
   if (!$("step-viewer").classList.contains("active") || e.target.tagName === "INPUT" && e.target.type !== "range") return;
   if (e.code === "Space") { e.preventDefault(); $("playBtn").click(); }
   if (e.code === "ArrowLeft") { e.preventDefault(); $("stepBack").click(); }
   if (e.code === "ArrowRight") { e.preventDefault(); $("stepFwd").click(); }
+  if (e.code === "KeyI") $("cropIn").click();
+  if (e.code === "KeyO") $("cropOut").click();
+  if (e.code === "KeyL") $("loop").click();
 });
 function tick(now) {
   requestAnimationFrame(tick);
@@ -315,8 +349,12 @@ function tick(now) {
   const dt = (now - (S.last || now)) / 1000;
   S.last = now;
   S.t += dt * Number($("speed").value);
-  const f = Math.floor(S.t * S.anim.fps);
-  if (f >= S.anim.frames - 1) { S.playing = false; updatePlay(); seek(S.anim.frames - 1); return; }
+  const [a, b] = playRange();
+  let f = Math.floor(S.t * S.anim.fps);
+  if (f > b || f >= S.anim.frames - 1 && b >= S.anim.frames - 1) {
+    if ($("loop").checked) { S.t = a / S.anim.fps; f = a; }
+    else { S.playing = false; updatePlay(); seek(b); return; }
+  }
   if (f !== S.frame) { const t = S.t; seek(f); S.t = t; }
 }
 requestAnimationFrame(tick);
@@ -336,9 +374,30 @@ function drawTrack() {
     ctx.fillStyle = ["#2a2f36", "#7b5a2a", "#c98a3a"][h];
     ctx.fillRect(x, 10, 1, 6);
   }
+  if (S.crop) {
+    const x0 = (S.crop[0] / n) * W, x1 = ((S.crop[1] + 1) / n) * W;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, x0, 18); ctx.fillRect(x1, 0, W - x1, 18);
+    ctx.fillStyle = "#e8c547";
+    ctx.fillRect(x0, 0, 2, 18); ctx.fillRect(x1 - 2, 0, 2, 18);
+  }
 }
-$("trackCanvas").title = "Top: character tracked · bottom: hands tracked (dim = one hand, bright = both). Click to jump.";
-$("trackCanvas").onclick = (e) => seek((e.offsetX / e.target.clientWidth) * S.anim.frames);
+$("trackCanvas").title = "Top: character tracked · bottom: hands tracked (dim = one hand, bright = both). Click to jump, drag to select a range.";
+// click: jump there · drag: select a range (for looping and export)
+{
+  const tc = $("trackCanvas");
+  let down = null;
+  const frameAt = (e) => Math.max(0, Math.min(S.anim.frames - 1, Math.round((e.offsetX / tc.clientWidth) * S.anim.frames)));
+  tc.onmousedown = (e) => { if (S.anim) down = frameAt(e); };
+  tc.onmousemove = (e) => { if (down != null && Math.abs(frameAt(e) - down) > 2) setCrop(down, frameAt(e)); };
+  window.addEventListener("mouseup", (e) => {
+    if (down == null) return;
+    const f = e.target === tc ? frameAt(e) : null;
+    if (f != null && Math.abs(f - down) <= 2) seek(f);
+    else if (S.crop) seek(S.crop[0]);
+    down = null;
+  });
+}
 
 document.querySelectorAll("#layoutSeg button").forEach((b) => (b.onclick = () => setLayout(b.dataset.layout)));
 function setLayout(l) {
@@ -371,15 +430,19 @@ $("frameImg").addEventListener("load", () => sizeLm());
 
 $("exportBtn").onclick = () => {
   $("exFps").textContent = `${S.anim.frames} frames at exactly ${S.anim.fps} fps (change it with “Frame rate” in the toolbar).`;
+  $("exCropRow").hidden = !S.crop;
+  if (S.crop) $("exCropInfo").textContent = `(${$("cropInfo").textContent.replace(/^Range /, "")})`;
   $("exportDlg").showModal();
 };
 $("fpsSel").onchange = () => { if (S.character != null) openAnimation(S.character); };
 $("exportDlg").addEventListener("close", async () => {
   if ($("exportDlg").returnValue !== "ok") return;
   const opts = { character: S.character, in_place: $("exInPlace").checked, lock_height: $("exLockHeight").checked, camera: $("exCamera").checked, fps: S.anim.fps, model: $("exModel").checked };
+  if (S.crop && $("exCrop").checked) { opts.start = S.crop[0]; opts.end = S.crop[1]; }
   const c = S.analysis.characters.find((x) => x.id === S.character);
   const base = (S.state.video || "video").split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
-  const name = `${base}_${(c?.name || "character").replace(/[^\w-]+/g, "_")}.fbx`;
+  const rng = opts.start != null ? `_${opts.start}-${opts.end}` : "";
+  const name = `${base}_${(c?.name || "character").replace(/[^\w-]+/g, "_")}${rng}.fbx`;
   try {
     if (native()) {
       const path = await native().save_file(name);
@@ -390,6 +453,7 @@ $("exportDlg").addEventListener("close", async () => {
       toast(`Saved ${path}`);
     } else {
       const q = new URLSearchParams({ character: S.character, in_place: opts.in_place ? 1 : 0, lock_height: opts.lock_height ? 1 : 0, camera: opts.camera ? 1 : 0, fps: opts.fps, model: opts.model ? 1 : 0 });
+      if (opts.start != null) { q.set("start", opts.start); q.set("end", opts.end); }
       const a = document.createElement("a");
       a.href = `/api/export.fbx?${q}`;
       a.download = name;

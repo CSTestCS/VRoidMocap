@@ -1,7 +1,9 @@
 # VRoid Mocap
 
 A Windows app that turns a video into a motion-capture animation for your own
-`.vrm` avatar (VRoid Studio, VRM 0.x and 1.0).
+avatar: a `.vrm` (VRoid Studio, VRM 0.x and 1.0) or an `.fbx` humanoid
+character (Mixamo, VRoid FBX, Unity, Unreal, Blender/Rigify, 3ds Max Biped,
+MMD conversions...).
 
 1. **Analysis** (once per video). Every frame is scanned to find:
    * every camera cut,
@@ -10,9 +12,10 @@ A Windows app that turns a video into a motion-capture animation for your own
    * each character's **height relative to the scenery** (single-view
      metrology against the ground plane's horizon, linked across shots through
      shared characters),
-   * the **camera angle and lens for every frame**: yaw, pitch, roll and field of
-     view, from background motion with people masked out, aligned to gravity,
-     with the focal length fitted per shot.
+   * **the camera, from the scenery alone** (see *The camera* below): how it
+     turns and zooms every frame, and where it travels (dolly, truck, crane,
+     handheld) wherever the background shows parallax. People are masked out,
+     so a character moving never moves the camera.
 2. **Motion capture** (per character). Pick a character and a second, high
    accuracy pass runs on just that person:
    * a whole-body keypoint model (RTMW) finds every joint in the picture
@@ -23,15 +26,17 @@ A Windows app that turns a video into a motion-capture animation for your own
    * the **3D solve** combines them over the whole shot (see below) into joint
      positions in front of the camera,
    * these become VRM bone rotations, including all 15 finger bones per hand,
-     wrists, forearm twist and feet. Root motion is integrated from planted
-     feet on your avatar's own skeleton, and planted feet are pinned with leg
-     IK so they do not slide.
+     wrists, forearm twist and feet. The character is placed in the scene
+     where the camera sees it (camera position + what is in the picture), and
+     planted feet are pinned with leg IK so they do not slide.
 3. **Viewer**. Watch side by side with the video, as *avatar over video*
    (the clip rendered through the solved camera, to check alignment), or with a
    free orbit camera. Scrub, step frame by frame, pick the output frame rate
    (12/24/30/60 fps), **lock movement** (keeps the character in the middle of
-   the room, optionally height too) and **export `.fbx`**, with or without
-   the avatar model. Go back and pick another character at any time without
+   the room, optionally height too), **select a range** (drag on the timeline,
+   or `[ In` / `Out ]`, keys I / O) and **loop** it (key L), and **export
+   `.fbx`** of the whole clip or just the range, with or without the avatar
+   model. Go back and pick another character at any time without
    re-analysing.
 
 ## Download / run
@@ -54,7 +59,7 @@ Command line: use `VRoidMocapCLI.exe` (same app, console build):
 
 ```
 VRoidMocapCLI.exe analyze video.mp4
-VRoidMocapCLI.exe capture video.mp4 avatar.vrm 1 out.fbx [--fps 30] [--no-model] [--in-place] [--smoothing 1] [--no-foot-lock]
+VRoidMocapCLI.exe capture video.mp4 avatar.vrm|avatar.fbx 1 out.fbx [--fps 30] [--no-model] [--in-place] [--smoothing 1] [--no-foot-lock]
 VRoidMocapCLI.exe selftest
 ```
 
@@ -72,6 +77,18 @@ VRoidMocapCLI.exe selftest
   in Blender, Unity (Humanoid), Unreal or Maya.
 * Optional animated **VideoCamera** that reproduces the original camera
   (position, rotation, focal length).
+* **Range:** with a range selected in the viewer, *Only the selected range*
+  exports just those frames (the file name gets the frame numbers).
+* **FBX avatars:** the export is your own FBX file written again with the
+  animation added: the model, skin, materials and textures are the file's own,
+  untouched (or, without the model, only its skeleton). Every humanoid bone is
+  animated in the file's own axes, units and rotation order; twist, helper,
+  hair and other extra bones keep their rest pose relative to their parent.
+  Bones are found by name and by the hierarchy (the hips are where legs and
+  spine branch, the spine is what lies between hips and neck...), and the
+  skeleton is stood in a T-pose for the solver, whatever its own rest pose
+  (A-pose etc.) is. Verified in Blender with a Mixamo-named, Z-up, A-pose
+  model: every bone within 0.001 cm of the solve.
 * *In place* / *lock height* match the viewer's *lock movement* toggle.
 
 Verified by importing into Blender: bone positions match the app's solve to
@@ -128,40 +145,90 @@ whole-body model (`head.py`: the 3D layout of an anime face, fitted with
 perspective). This is only used while the face is really visible; seen from
 behind, the head holds its pose relative to the neck.
 
+## The camera
+
+The camera is worked out from the background, never from the characters:
+
+* Background points are tracked over many frames (people masked out, every
+  track checked forwards and backwards).
+* **Turning and zooming** are fitted per frame (rotation + focal length change
+  explaining how the background moves). A camera whose background does not
+  move is exactly still.
+* **Travelling** (dolly, truck, crane, handheld) shows up as parallax: near
+  things slide over far ones, which turning and zooming cannot explain.
+  Wherever it appears, the camera path and the depth of the tracked scenery
+  are solved together (bundle adjustment, grown a few frames at a time). A
+  stretch only counts as travel if it explains the background clearly better
+  than the best turn + zoom fit, so a zoom is never mistaken for a dolly.
+* **The lens** comes from the scenery when the camera turns or travels (only
+  the right focal length makes it consistent), otherwise from the people's
+  proportions.
+* The camera's travel has no absolute size from the background alone; each
+  travelling stretch gets one scale (the one that leaves the character's hips
+  moving least across it). That is a single number per stretch: the shape and
+  direction of the path are the background's.
+* The character is placed **in that same scene**: camera position + what the
+  picture shows (depth along the camera ray is smoothed, the position across
+  the picture follows the video exactly). The cloned camera is where the real
+  camera is; it does not follow the character, and a character that walks out
+  of the picture simply leaves it.
+* Across a cut the character continues where it was; the floor is where the
+  feet are (one vertical shift per shot for the whole scene, so the picture is
+  unchanged).
+
+Measured on rendered ground truth (locked-off camera, pan + 2.6x zoom, a 3.9 m
+dolly with a 45 degree turn, an occluder): still cameras 0.00 degrees / 0.00 m
+of movement, pan and zoom within 0.1 degrees and 0.3%, the dolly within 0.5
+degrees and 17 cm, lens within 1 degree where the camera turns or travels.
+
 ## How the motion is cleaned up
 
 * **Camera cuts are found on every frame.** A cut is a sudden one- or
   two-frame spike in picture change; fast pans are not mistaken for cuts.
   Short camera "snaps" become their own short shots, and wherever camera
   tracking is lost the camera alignment restarts instead of drifting.
-* **A still camera stays still.** Wherever the background does not move, the
-  cloned camera is locked (fixed position and rotation). The character moves
-  within that fixed view: across the image it follows the video exactly, while
-  depth is corrected only while the feet are free, so planted feet never slide.
+* **A still camera stays still** (see *The camera*): it is exactly still
+  wherever the background is.
 * **Spins and back views.** See *Which way the body faces* above.
 * **Only what is seen is animated; everything else keeps its pose.** A bone
   moves only while all the joints that define it are clearly inside the
-  picture and detected (by either detector; a joint the whole-body model puts
-  on the edge of the picture needs MediaPipe to see it too, and glimpses
-  shorter than 0.15 s do not count). Otherwise it keeps exactly the pose it
-  had in the previous frame, and when it is seen again it moves on from that
-  pose (eased over 0.2 s), never from a T-pose or any default. So:
-  * the character out of the shot: nothing moves (the root holds too),
-  * only partly in the shot: only the visible part moves (legs out of the
-    picture stay as they were, the torso holds while the shoulders are cut
-    off, a hand that is not detected keeps its pose and its forearm twist),
-  * before the character first appears, the avatar already stands in the
-    first reliable pose; a bone never seen at all stays relaxed (arms down).
+  picture, detected (the whole-body model sure of it or MediaPipe calling it
+  visible) and not behind something (the person mask says the pixel is not
+  the person and the pose model agrees). A joint the whole-body model puts on
+  the edge of the picture needs MediaPipe to see it too, and glimpses shorter
+  than 0.15 s do not count. Otherwise the bone keeps exactly the pose it had
+  in the previous frame, and when it is seen again it moves on from that pose
+  (eased over 0.2 s). So:
+  * the character out of the shot: nothing moves; it stays where it was,
+  * only partly in the shot, walking behind something, closer to the camera,
+    zoomed or cut in: only the visible part moves (legs out of the picture or
+    behind an object stay as they were, a hand that is not detected keeps its
+    pose and its forearm twist); the character's position follows whatever
+    part of it is seen (hips, shoulders, eyes, a knee, a foot, a hand),
+  * until a bone is first seen it is in the **A pose** (arms 45 degrees down),
+    and it starts moving only once it is actually in the picture.
   A visible bone whose parent is held keeps the direction it is seen in.
   Frames whose detection contradicts everything around them count as not
   seen.
+* **Walking out of the picture.** The person tracker loses someone whose
+  body has mostly left the picture; where a track ends (or starts) at the edge
+  of the picture, the character is followed on along their motion for up to a
+  second, so the foot or hand still in the picture is still captured as the
+  same character. Recurring characters are re-identified by appearance.
 * **Tracking box.** In back views the tracker can lose the body and follow
   only the head; the detectors then "find" a tiny, contorted person in that
   box. Within a shot the box may not collapse below 60% of the body size
   seen around it; a collapsed box is extended from the head to full size.
-* **No flips.** Single-frame spikes are rejected. Palm vs back-of-hand and
-  the two possible depths of every elbow, wrist, knee and ankle are resolved
-  over time. Finger joints that appear bent backwards are mirrored forward.
+* **No flips.** Single-frame spikes are rejected. The two possible depths of
+  every elbow, wrist, knee and ankle are resolved over time. Finger joints that
+  appear bent backwards are mirrored forward.
+* **Hands: palm or back, from context.** At full-body distance a hand is only
+  ~40 pixels, so a single frame is often unsure which way round it is. Both
+  hand detectors vote every frame (the whole-body model is the more reliable
+  one), and the answer is decoded over the whole clip: a hand cannot switch
+  from showing its palm to showing its back without turning edge-on, so
+  reliable frames carry the decision through unsure ones. On rendered ground
+  truth this raised the left hand from 70% to 83% right (right hand 91% to 93%).
 * **Natural joints (IK + limits).**
   * Elbows: hinge IK that keeps the wrist where it is. The elbow sits where it
     was seen; the joint limit may nudge it (at most 35 degrees around the
@@ -211,15 +278,22 @@ Honest limits of single-camera capture:
 * **Depth** is inferred, not measured. A limb that points only slightly
   towards or away from the camera can be reconstructed on the wrong side
   (about 6% of limbs are more than 45° off in the test above).
-* **Hands:** in a full-body shot a hand is about 40 pixels. Whether the palm
-  or the back of the hand faces the camera is read correctly only about 75%
-  of the time, so forearm twist and hand orientation are the least reliable
-  part. Finger bones are within roughly 30° of the truth; in close-ups they
-  are better.
+* **Hands:** in a full-body shot a hand is about 40 pixels. Decoded over the
+  clip, whether the palm or the back faces the camera is right in about 83-93%
+  of frames in the tests; forearm twist and hand orientation are still the
+  least reliable part. Finger bones are within roughly 30° of the truth; in
+  close-ups they are better.
 * **Upper-arm twist** of a nearly straight arm cannot be seen (only the
   hand shows it); it follows the last bent position.
-* **Field of view** cannot be measured from a single view of a person; it is
-  estimated, which affects how far away the cloned camera stands, not the pose.
+* **Field of view** of a camera that never turns or travels cannot be read
+  from the scenery; it is then estimated from the people's proportions
+  (within ~5 degrees in the tests), which affects distances, not the pose.
+* **Hidden joints:** a joint behind an object is recognised as hidden most of
+  the time; hip joints just behind an object's edge are often still inferred
+  (correctly) from the upper body.
+* **Camera travel size:** the background gives the travel's shape, not its
+  size; one scale per travelling stretch comes from the character (assumes the
+  character does not travel with the camera the whole stretch).
 * **Proportions:** the avatar receives rotations, not positions, so an avatar
   with different limb lengths will not overlap the video pixel for pixel.
 
@@ -240,7 +314,8 @@ exe to a release when a `v*` tag is pushed.
 ## Project layout
 
 ```
-vroidmocap/core/analysis.py   pass 1: shots, tracking, identities, cameras, heights
+vroidmocap/core/analysis.py   pass 1: shots, tracking, identities, heights
+vroidmocap/core/scene.py      pass 1: the camera from the scenery (turn, zoom, lens, travel)
 vroidmocap/core/capture.py    pass 2a: per-frame whole-body, body-depth and hand landmarks (parallel)
 vroidmocap/core/facing.py     pass 2b: which way chest and pelvis face (turns, back views, left/right labels)
 vroidmocap/core/head.py       pass 2b: head orientation fitted to the face points
@@ -248,9 +323,11 @@ vroidmocap/core/lift.py       pass 2b: the 3D body solve (bone lengths, towards/
 vroidmocap/core/retarget.py   pass 2c: VRM rotations, root motion, foot IK, cloned camera
 vroidmocap/core/camera.py     camera geometry (focal fit, gravity, rays)
 vroidmocap/core/vrm.py        VRM 0.x / 1.0 humanoid skeleton reader
+vroidmocap/core/fbx_reader.py FBX reader (binary 7.x and ASCII)
+vroidmocap/core/fbx_avatar.py FBX characters: humanoid mapping, T-pose, motion back onto the model, export
 vroidmocap/core/fbx_writer.py binary FBX 7.4 writer
 vroidmocap/server.py          local API used by the UI
-vroidmocap/web/               UI (three.js + three-vrm viewer)
+vroidmocap/web/               UI (three.js + three-vrm / FBXLoader viewer)
 ```
 
 Models: RTMW whole-body keypoints (OpenMMLab, Apache 2.0, run with ONNX

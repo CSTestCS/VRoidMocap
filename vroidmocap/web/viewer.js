@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
 
@@ -55,15 +56,57 @@ export class Viewer {
     loop();
   }
 
+  _clearAvatar() {
+    if (this.vrm) {
+      this.scene.remove(this.vrm.scene);
+      VRMUtils.deepDispose(this.vrm.scene);
+      this.vrm = null;
+    }
+    if (this.fbx) {
+      this.scene.remove(this.fbx.group);
+      this.fbx = null;
+    }
+  }
+
+  /** An FBX character: info = {placement (4x4 row-major: file -> app world), hips, feet} */
+  async loadFBX(url, info) {
+    const obj = await new FBXLoader().loadAsync(url);
+    this._clearAvatar();
+    const group = new THREE.Group();
+    group.matrixAutoUpdate = false;
+    const m = new THREE.Matrix4();
+    m.set(...info.placement);
+    this.fbxPlacement = m;
+    group.matrix.copy(m);
+    group.add(obj);
+    obj.traverse((o) => {
+      o.frustumCulled = false;
+      if (o.isMesh) {
+        for (const mat of [].concat(o.material)) { if (mat) mat.side = THREE.DoubleSide; }
+      }
+    });
+    // FBX animations in the file itself are not used
+    obj.animations = [];
+    const byName = new Map();
+    obj.traverse((o) => { if (o.name && !byName.has(o.name)) byName.set(o.name, o); });
+    const get = (n) => byName.get(THREE.PropertyBinding.sanitizeNodeName(n)) || byName.get(n);
+    this.fbx = { group, root: obj, get, hips: get(info.hips), feet: info.feet.map(get), restHipsY: info.rest_hips_y };
+    this.scene.add(group);
+    this.nodes = null;
+    return obj;
+  }
+
+  hipsObject() {
+    if (this.fbx) return this.fbx.hips;
+    return this.vrm?.humanoid.getNormalizedBoneNode("hips");
+  }
+
   async loadVRM(url) {
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
     const gltf = await loader.loadAsync(url);
     const vrm = gltf.userData.vrm;
-    if (this.vrm) {
-      this.scene.remove(this.vrm.scene);
-      VRMUtils.deepDispose(this.vrm.scene);
-    }
+    this._clearAvatar();
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
     VRMUtils.combineSkeletons?.(gltf.scene);
     this.isVrm0 = vrm.meta?.metaVersion === "0";
@@ -82,6 +125,8 @@ export class Viewer {
       meta, frames: meta.frames, fps: meta.fps, bones: meta.bones, B: meta.bones.length,
       quats: f32("quats"), root: f32("root"), camPos: f32("cam_pos"), camQuat: f32("cam_quat"),
       vfov: f32("cam_vfov"), valid: f32("valid"), contacts: f32("contacts"),
+      fbxQuats: L.fbx_quats ? f32("fbx_quats") : null, fbxHips: L.fbx_hips ? f32("fbx_hips") : null,
+      fbxNames: meta.fbx_names || null,
       lm2d: f32("lm2d"), vis: f32("vis"), h2d: f32("h2d"), hs: f32("hs"), shot: f32("shot_of"), src: f32("src_frame"),
     };
     this.videoCam.aspect = meta.width / meta.height;
@@ -107,9 +152,35 @@ export class Viewer {
     this.frame = Math.max(0, Math.min(f, (this.anim?.frames ?? 1) - 1));
   }
 
+  _applyFbx(A, f) {
+    const F = this.fbx;
+    if (!A.fbxQuats) return;
+    if (!this.nodes) this.nodes = A.fbxNames.map((n) => F.get(n));
+    const M = this.nodes.length;
+    for (let i = 0; i < M; i++) {
+      const n = this.nodes[i];
+      if (!n) continue;
+      const k = (f * M + i) * 4;
+      n.quaternion.set(A.fbxQuats[k], A.fbxQuats[k + 1], A.fbxQuats[k + 2], A.fbxQuats[k + 3]);
+    }
+    if (F.hips) F.hips.position.set(A.fbxHips[f * 3], A.fbxHips[f * 3 + 1], A.fbxHips[f * 3 + 2]);
+    // "lock movement": move the whole model back instead of its hips
+    const off = this.lockOffset(f);
+    F.group.matrix.copy(new THREE.Matrix4().makeTranslation(-off.x, -off.y, -off.z).multiply(this.fbxPlacement));
+    F.group.matrixWorldNeedsUpdate = true;
+    F.group.updateMatrixWorld(true);
+  }
+
   applyPose() {
     const A = this.anim;
-    if (!A || !this.vrm) return;
+    if (!A || (!this.vrm && !this.fbx)) return;
+    if (this.fbx) {
+      this.restHipsY = this.fbx.restHipsY;
+      this._applyFbx(A, this.frame);
+      this.lastFrame = this.frame;
+      this._applyCommon(A, this.frame, this.fbx.hips, this.fbx.feet);
+      return;
+    }
     if (!this.nodes) {
       this._bindNodes();
       const hips = this.vrm.humanoid.getNormalizedBoneNode("hips");
@@ -135,11 +206,16 @@ export class Viewer {
     this.vrm.update(dt);
     if (jumped) this.vrm.springBoneManager?.reset?.();
     this.lastFrame = f;
+    this._applyCommon(A, f, hips, ["leftFoot", "rightFoot"].map((b) => this.vrm.humanoid.getNormalizedBoneNode(b)));
+  }
+
+  _applyCommon(A, f, hips, feet) {
+    const off = this.lockOffset(f);
     // contact markers
     for (let side = 0; side < 2; side++) {
       const m = this.contactMarkers[side];
       const on = A.contacts[f * 2 + side] > 0.5;
-      const foot = this.vrm.humanoid.getNormalizedBoneNode(side === 0 ? "leftFoot" : "rightFoot");
+      const foot = feet[side];
       if (foot && on) {
         const p = new THREE.Vector3();
         foot.getWorldPosition(p);
@@ -167,7 +243,7 @@ export class Viewer {
       // start the free camera where the video camera is
       this.freeCam.position.copy(this.videoCam.position);
       this.freeCam.quaternion.copy(this.videoCam.quaternion);
-      const hips = this.vrm?.humanoid.getNormalizedBoneNode("hips");
+      const hips = this.hipsObject();
       const p = new THREE.Vector3(0, 1, 0);
       hips?.getWorldPosition(p);
       this.controls.target.copy(p);

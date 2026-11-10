@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 6
+SOLVE_VERSION = 7
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -370,6 +370,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     margin = 0.01 * max(W, H)
     inside = (lm2d[..., 0] > -margin) & (lm2d[..., 0] < W + margin) & (lm2d[..., 1] > -margin) & (lm2d[..., 1] < H + margin)
     vis = np.where(inside, vis, 0.0)
+    vis_raw = vis.copy()
+    seg = capture["seg"].astype(np.float64) if "seg" in capture else None  # person mask at each landmark
     valid = capture["tracked"] & (vis.mean(1) > 0.35) & (np.abs(world).sum((1, 2)) > 0)
     hvalid = (hs >= 0.5) & valid[:, None]
 
@@ -399,7 +401,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
     psi_c[bad] = psi_p[bad] = np.nan
-    for arr in (Wc, lm2d, vis, uv, conf):
+    for arr in (Wc, lm2d, vis, uv, conf, vis_raw) + ((seg,) if seg is not None else ()):
         arr[swap] = arr[swap][:, LR_PERM]
     for arr in (h2d, hw, hs, hc):
         arr[swap] = arr[swap][:, ::-1]
@@ -445,10 +447,6 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         Rw0 = shots[shot_of[f]]["align"] @ R_rel[f]
         yaw_at[f] = cam.hips_yaw(P[f], Rw0)
     R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at)
-    # a locked-off camera must not sway: hold its rotation while the background is still
-    static = camera_static_mask(npz["bg_motion"] if "bg_motion" in npz.files else None,
-                                npz["cam_q"].astype(np.float64), shot_of, fps)
-    R_w = hold_static_rotation(R_w, static, shot_of)
 
     # head: fitted to the face points (turn, nod, tilt), in world space
     Rface, face_q = headfit.head_from_face(wb2d, wbs, focal, cx, cy, valid)
@@ -463,6 +461,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     head_w = np.einsum("nij,njk->nik", R_w, Rface)
     dbg("face_q", face_q)
 
+    # which way round each hand is (palm or back towards the camera), decided
+    # over the whole clip from both hand detectors, with continuity
+    for side in (0, 1):
+        h2d[:, side], hw[:, side], flipped = hand_facing(h2d[:, side], hw[:, side], hvalid[:, side], wb_sync,
+                                                         side, uv[:, L_WR if side == 0 else R_WR], fps)
+        dbg(f"hand_flip{side}", flipped)
     Hc = np.zeros((N, 2, 21, 3))
     for side in (0, 1):
         for f in np.where(hvalid[:, side])[0]:
@@ -571,10 +575,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # seen / not seen per bone. A bone is animated only while all the joints
     # that define it are clearly inside the picture and detected (both
     # detectors count; brief glimpses do not). Everything else keeps its pose.
-    js = joint_seen(lm2d, np.maximum(body_conf, np.clip((vis - 0.3) / 0.3, 0, 1)), valid & ~bad, W, H, fps, shot_of)
+    hidden = occluded_joints(seg, vis_raw)
+    # (seen: the whole-body model is sure (>= 0.6) or MediaPipe calls it visible (>= 0.5);
+    # measured against rendered ground truth with occluders, this is the best trade-off)
+    js = joint_seen(lm2d, np.maximum(body_conf - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden)
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
     seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of)
-    root_seen = _min_run(js[:, L_HIP] & js[:, R_HIP], fps, shot_of)
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
     conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
     if face_seen is not None and skel.has("head"):
@@ -587,56 +593,54 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     Q = filter_rotations(Q, conf, fps, smoothing, strength=strength)
     dbg("Q_filt", Q)
 
-    # ---- 6. root motion on the avatar
-    progress(0.7, "Solving root motion and foot contacts")
+    # ---- 6. the scene: the camera from the scenery, the character inside it
+    progress(0.7, "Placing the character in the scene")
     leg_actor = np.median([blen.get((L_HIP, L_KNEE), 0.4) + blen.get((L_KNEE, L_ANK), 0.4),
                            blen.get((R_HIP, R_KNEE), 0.4) + blen.get((R_KNEE, R_ANK), 0.4)])
     rp = skel.rest_pos
     leg_avatar = (np.linalg.norm(rp["leftUpperLeg"] - rp["leftLowerLeg"]) +
                   np.linalg.norm(rp["leftLowerLeg"] - rp["leftFoot"]))
     scale = float(leg_avatar / max(leg_actor, 1e-3))
-    # actor root in world assuming a camera that only rotates within a shot
-    root_actor = np.einsum("nij,nj->ni", R_w, np.nan_to_num(T))
-    root_actor = interp_gaps(root_actor, valid)
-    root, contacts = root_motion(skel, Q, root_actor * scale, valid & root_seen, shot_of, fps, Pw, scale,
-                                 feet_seen=feet_seen)
-    root = anchor_root_to_camera(root, Q, skel, R_w, T, valid & root_seen, static, shot_of, scale, fps, contacts)
-    root = hold_unseen_root(root, valid & root_seen, fps)
+    # joints in the camera frame: depth (along the ray) is the noisy part, so it is
+    # smoothed much more than the position across the picture
+    Pc = P.copy()
+    for (s0, e0) in runs(valid, shot_of):
+        if e0 - s0 >= 2:
+            Pc[s0:e0] = ray_depth_smooth(P[s0:e0], 0.35 * fps, 0.04 * fps)
+    C_ref = npz["cam_C"].astype(np.float64) if "cam_C" in npz.files else np.zeros((N, 3))
+    cseg = npz["cam_seg"].astype(np.int64) if "cam_seg" in npz.files else -np.ones(N, np.int64)
+    G = np.einsum("nij,nkj->nik", R_w, R_rel)  # shot reference frame -> world
+    js_ok = js & valid[:, None]
+    C_w = camera_path(C_ref, cseg, G, R_w, Pc, js_ok[:, L_HIP] & js_ok[:, R_HIP], shot_of, fps)
+    Xw = C_w[:, None] + np.einsum("nij,nkj->nki", R_w, np.nan_to_num(Pc))  # every joint in the world
+    O = shot_offsets(Xw, js_ok, shot_of, C_w, leg_actor)
+    Xw = Xw + O[:, None]
+    cam_world = C_w + O
+    dbg("Xw", Xw)
+
+    # ---- 7. limits, IK, hold unseen bones, then the avatar's root from what is seen
     progress(0.8, "Joint limits and limb IK")
-    Q = nat.apply(Q, root, fps, conf)
+    root0 = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
+    Q = nat.apply(Q, root0, fps, conf)
     dbg("Q_nat", Q)
-    if foot_lock:  # pins planted feet (two-bone IK)
+    # every bone moves on only from its own previous pose: unseen bones keep it
+    # exactly, and pick the motion up again smoothly when they are seen again;
+    # before a bone is first seen it is in the A pose
+    Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
+    root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
+    contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
+    lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of)
+    root[:, 1] += lift_y
+    if foot_lock:  # pins planted feet (two-bone IK) - only legs that are seen
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
-    # every bone moves on only from its own previous pose: unseen bones keep it
-    # exactly, and pick the motion up again smoothly when they are seen again
-    Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
+        Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
     dbg("Q_final", Q)
 
-    # ---- 7. cloned camera relative to the avatar: the actor's hip-joint centre
-    # must land where the avatar's is (or, while the hips are out of the
-    # picture, the shoulder centre: a reference that is actually seen)
-    posA, _ = avatar_fk(skel, Q, root)
-    bix = {b_: i for i, b_ in enumerate(skel.bones)}
-    hipc_avatar = (posA[:, bix["leftUpperLeg"]] + posA[:, bix["rightUpperLeg"]]) / 2
-    shc_avatar = (posA[:, bix["leftUpperArm"]] + posA[:, bix["rightUpperArm"]]) / 2
-    sh_seen = _min_run(js[:, L_SH] & js[:, R_SH], fps, shot_of)
-    use_sh = ~root_seen & sh_seen
-    ref_cam = np.where(use_sh[:, None], (P[:, L_SH] + P[:, R_SH]) / 2, T)
-    ref_av = np.where(use_sh[:, None], shc_avatar, hipc_avatar)
-    # (neither seen, e.g. only the legs in the picture: the solved hip position)
-    have = valid & np.isfinite(ref_cam).all(1)
-    cam_raw = ref_av - scale * np.einsum("nij,nj->ni", R_w, np.nan_to_num(ref_cam))
-    for (s0, e0) in runs(np.ones(N, bool), shot_of):  # gaps are bridged within a shot only
-        h0 = have[s0:e0]
-        if h0.any():
-            cam_raw[s0:e0] = interp_gaps(cam_raw[s0:e0], h0)
-            cam_raw[s0:e0] = gaussian_smooth(cam_raw[s0:e0], 2.0 * fps / 30.0, valid=h0)
-            have[s0:e0] = True
-    # shots in which the character is never seen: keep the nearest framing
-    if have.any() and not have.all():
-        cam_raw = interp_gaps(cam_raw, have)
-    cam_pos = stabilize_camera(cam_raw, static, shot_of, fps)
+    # ---- 8. the cloned camera: where the real camera is in the scene (it never
+    # follows the character)
+    cam_pos = scale * cam_world
+    cam_pos[:, 1] += lift_y
     cam_quat = mat_to_quat(R_w @ cam.D)
     cam_vfov = np.array([cam.vfov_from_focal(fv, H) for fv in focal])
 
@@ -758,6 +762,92 @@ def hand_winding(h2d, hok, wb, side, wrist_uv):
     return np.sign(w_mp) * np.sign(w_wb) * np.minimum(np.abs(w_mp), np.abs(w_wb))
 
 
+def _winding(p):
+    a, b = p[:, 5] - p[:, 0], p[:, 17] - p[:, 0]
+    sz = np.sum((p[:, 9] - p[:, 0]) ** 2, 1) + 1e-6
+    return (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]) / sz
+
+
+def hand_facing(h2d, hw, hok, wb, side, wrist_uv, fps, w_mp=0.9, w_wb=1.5, w_turn=4.0):
+    """Palm or back of the hand towards the camera, per frame.
+
+    In the picture this is the order of the thumb and little-finger sides;
+    both hand detectors read it, the whole-body model more reliably (measured
+    on rendered ground truth: 82-92% vs 72-83%). A hand cannot go from showing
+    its palm to showing its back without turning edge-on in between, so the
+    reading is decoded over the whole clip (Viterbi: both detectors' votes per
+    frame, a cost for switching that is high while the palm faces the camera
+    squarely). Where the result disagrees with the hand model, its hand is
+    reflected across its own long axis (thumb and little-finger sides swap, the
+    fingers keep pointing the same way), and the whole-body model's finger
+    points are used in the picture when it has them.
+    Returns h2d, hw and the frames that were flipped."""
+    N = len(h2d)
+    h2d, hw = h2d.copy(), hw.copy()
+    flipped = np.zeros(N, bool)
+    idx = np.where(hok)[0]
+    if len(idx) < 2:
+        return h2d, hw, flipped
+    s_mp = _winding(h2d)
+    have_wb = np.zeros(N, bool)
+    s_wb = np.zeros(N)
+    pw = None
+    if wb is not None:
+        k0 = 91 if side == 0 else 112
+        pw = wb[0][:, k0:k0 + 21]
+        sc = wb[1][:, k0:k0 + 21].mean(1)
+        span = np.ptp(pw, axis=1).max(1)
+        near = np.linalg.norm(pw[:, 0] - wrist_uv, axis=1) < 0.6 * np.maximum(span, 10)
+        have_wb = (sc > 0.4) & near
+        s_wb = _winding(pw)
+    # states: 0 = as the hand model reads it, 1 = the other way round
+    sgn = np.sign(s_mp[idx])
+    un = np.zeros((len(idx), 2))
+    un[:, 1] += w_mp  # the hand model votes for itself
+    hw_i = have_wb[idx] & (np.abs(s_wb[idx]) > 0.05)
+    agree = np.sign(s_wb[idx]) == sgn
+    un[hw_i & agree, 1] += w_wb
+    un[hw_i & ~agree, 0] += w_wb
+    # facing amount (|winding| ~ how squarely the palm faces the camera)
+    face = np.clip(np.abs(s_mp[idx]) / 0.3, 0, 1)
+    cost = un[0].copy()
+    back = np.zeros((len(idx), 2), int)
+    for j in range(1, len(idx)):
+        gap = idx[j] - idx[j - 1]
+        # the reading's sign in the picture for each state: state 0 = sgn, state 1 = -sgn
+        sw = w_turn * min(face[j], face[j - 1]) / max(1.0, gap / max(1.0, 0.1 * fps))
+        new = np.zeros(2)
+        for k in (0, 1):
+            sk = sgn[j] * (1 if k == 0 else -1)
+            tr = np.array([0.0 if sk == sgn[j - 1] * (1 if m == 0 else -1) else sw for m in (0, 1)])
+            c2 = cost + tr
+            back[j, k] = int(np.argmin(c2))
+            new[k] = c2[back[j, k]] + un[j, k]
+        cost = new
+    st = np.zeros(len(idx), int)
+    st[-1] = int(np.argmin(cost))
+    for j in range(len(idx) - 1, 0, -1):
+        st[j - 1] = back[j, st[j]]
+    for f in idx[st == 1]:
+        # reflect the hand model's hand across its long axis (wrist -> middle knuckle)
+        rel = hw[f] - hw[f, 0]
+        ax = rel[9]
+        u = np.cross(np.array([0, 0, 1.0]), ax)
+        if np.linalg.norm(u) < 1e-9:
+            continue
+        u = u / np.linalg.norm(u)
+        hw[f] = hw[f, 0] + rel - 2 * np.outer(rel @ u, u)
+        if have_wb[f] and np.sign(s_wb[f]) != np.sign(s_mp[f]):
+            h2d[f] = pw[f]
+        else:
+            q = h2d[f] - h2d[f, 0]
+            a2 = q[9] / max(np.linalg.norm(q[9]), 1e-9)
+            n2 = np.array([-a2[1], a2[0]])
+            h2d[f] = h2d[f, 0] + q - 2 * np.outer(q @ n2, n2)
+        flipped[f] = True
+    return h2d, hw, flipped
+
+
 def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn, wind=None):
     """H: (N,21,3) hand points relative to the wrist (world). Returns H with some
     frames mirrored in depth, chosen by a 2-state Viterbi over the clip."""
@@ -818,109 +908,227 @@ for _a, _b in LR_PAIRS:
     LR_PERM[_a], LR_PERM[_b] = _b, _a
 
 
-def camera_static_mask(bg_motion, cam_q, shot_of, fps, thr=0.05, min_s=0.4):
-    """Frames where the real camera is not moving (background still)."""
-    N = len(shot_of)
-    if bg_motion is not None:
-        m = np.asarray(bg_motion, float)
-        k = max(1, int(round(0.15 * fps)))
-        pad = np.pad(m, k, mode="edge")
-        med = np.median(np.lib.stride_tricks.sliding_window_view(pad, 2 * k + 1), axis=-1)
-        still = med < thr
+def camera_path(C_ref, cseg, G, R_w, Pc, hips_seen, shot_of, fps):
+    """Where the camera is in the world (actor metres), frame by frame.
+
+    The scenery gives the camera's travel (shape and direction) but not its
+    size: each travelling stretch gets one scale, the one that leaves the
+    character's hips moving least across the stretch (a dancer does not race
+    the camera). The camera is still wherever the scenery says it does not
+    travel. Each shot starts at the origin (shot_offsets places it)."""
+    N = len(C_ref)
+    d = np.zeros((N, 3))
+    same = np.r_[False, shot_of[1:] == shot_of[:-1]]
+    d[1:] = C_ref[1:] - C_ref[:-1]
+    d[~same] = 0
+    sg = np.where(cseg >= 0, cseg, np.r_[-1, cseg[:-1]])
+    sg[~same] = -1
+    dw = np.einsum("nij,nj->ni", G, d)
+    hip = (Pc[:, L_HIP] + Pc[:, R_HIP]) / 2
+    Y = np.einsum("nij,nj->ni", R_w, np.nan_to_num(hip))
+    ok = hips_seen & np.isfinite(hip).all(1)
+    L = max(1, int(round(0.25 * fps)))
+    scales = {}
+    for k in np.unique(sg[sg >= 0]):
+        m = sg == k
+        path = np.cumsum(np.where(m[:, None], dw, 0.0), axis=0)
+        f = np.where(m[:-L] & m[L:] & ok[:-L] & ok[L:])[0] if N > L else np.zeros(0, int)
+        if len(f) < 10:
+            continue
+        dU = path[f + L] - path[f]
+        dY = Y[f + L] - Y[f]
+        den0 = np.sum(dU * dU)
+        if den0 < 1e-10:
+            continue
+        w = np.ones(len(f))
+        sc = 0.0
+        for _ in range(4):
+            sc = -np.sum(w * np.sum(dU * dY, 1)) / max(np.sum(w * np.sum(dU * dU, 1)), 1e-12)
+            r = np.linalg.norm(sc * dU + dY, axis=1)
+            w = np.where(r < 0.05, 1.0, 0.05 / np.maximum(r, 1e-9))
+        if sc > 0:
+            scales[k] = sc
+    if scales:
+        default = float(np.median(list(scales.values())))
     else:
-        from .naturalize import q_angle
-        stp = np.zeros(N)
-        stp[1:] = np.degrees(q_angle(cam_q[1:], cam_q[:-1]))
-        still = stp < 0.02
-    out = np.zeros(N, bool)
-    for (a, b) in runs(still, shot_of):
-        if b - a >= min_s * fps:
-            out[a:b] = True
-    return out
+        zc = Pc[ok, L_HIP, 2] if ok.any() else np.array([3.0])
+        default = 2.0 * float(np.median(zc))
+    s_f = np.array([scales.get(k, default) if k >= 0 else 0.0 for k in sg])
+    cs = np.cumsum(dw * s_f[:, None], axis=0)
+    return cs - _shot_start_values(cs, shot_of)
 
 
-def hold_static_rotation(R_w, static, shot_of):
-    R = R_w.copy()
-    for (a, b) in runs(static, shot_of):
-        q = quat_continuity(mat_to_quat(R_w[a:b]))
-        R[a:b] = quat_to_mat(normalize(q.mean(0)))
-    return R
+def _shot_start_values(x, shot_of):
+    """x[first frame of each frame's shot] (to restart a cumulative sum per shot)."""
+    starts = np.r_[0, np.where(shot_of[1:] != shot_of[:-1])[0] + 1]
+    idx = starts[np.searchsorted(starts, np.arange(len(x)), side="right") - 1]
+    return x[idx]
 
 
-def _segments(mask, shot_of):
-    """Runs of equal `mask` value that do not cross a shot change."""
-    out, N, f = [], len(mask), 0
-    while f < N:
-        s0 = f
-        while f < N and mask[f] == mask[s0] and shot_of[f] == shot_of[s0]:
-            f += 1
-        out.append((s0, f, bool(mask[s0])))
-    return out
+def _ref_point(Xw, js_ok):
+    """A body reference point per frame (hip centre, or estimated from the
+    shoulders) and whether it is known."""
+    hip = (Xw[:, L_HIP] + Xw[:, R_HIP]) / 2
+    sh = (Xw[:, L_SH] + Xw[:, R_SH]) / 2 - np.array([0, 0.5, 0])
+    hs = js_ok[:, L_HIP] & js_ok[:, R_HIP]
+    ss = js_ok[:, L_SH] & js_ok[:, R_SH]
+    return np.where(hs[:, None], hip, sh), hs | ss
 
 
-def _hipc(skel, Q, root):
-    hi = skel.bones.index("hips")
-    off = (skel.rest_pos["leftUpperLeg"] + skel.rest_pos["rightUpperLeg"]) / 2 - skel.rest_pos["hips"]
-    return root + np.einsum("nij,j->ni", quat_to_mat(Q[:, hi]), off)
-
-
-def anchor_root_to_camera(root, Q, skel, R_w, T, valid, static, shot_of, scale, fps, contacts=None):
-    """While the camera is locked off, the character's position relative to it
-    is measured directly (precise across the image, noisy in depth). The
-    foot-contact root is pulled towards that measurement, but only while no foot
-    is planted (steps, hops, turns on the move), so planted feet never slide;
-    whatever cannot be applied yet waits for the next free moment. Height stays
-    with the foot contacts."""
-    root = root.copy()
-    hipc = _hipc(skel, Q, root)
-    for (a, b, st) in _segments(static & valid, shot_of):
-        if not st or b - a < 3:
+def shot_offsets(Xw, js_ok, shot_of, C_w, leg_actor):
+    """Per shot, where its scene sits in the world: the floor at y = 0 (from the
+    feet, when they are seen), and across a cut the character continues from
+    where it was. Shots the character is not in keep the camera where the
+    nearest shot had it."""
+    N = len(shot_of)
+    O = np.zeros((N, 3))
+    ref, known = _ref_point(Xw, js_ok)
+    feet = [L_HEEL, R_HEEL, L_FOOT, R_FOOT]
+    fy = np.where(js_ok[:, feet], Xw[:, feet, 1], np.inf).min(1)
+    shots = []
+    starts = np.r_[0, np.where(shot_of[1:] != shot_of[:-1])[0] + 1, N]
+    prev = None
+    has = []
+    for i in range(len(starts) - 1):
+        a, b = starts[i], starts[i + 1]
+        kn = np.where(known[a:b])[0] + a
+        if not len(kn):
+            has.append(False)
+            shots.append((a, b))
             continue
-        Ts = T[a:b].copy()
-        ok = np.isfinite(Ts).all(1)
-        if ok.sum() < 3:
+        f0 = kn[0]
+        fl = fy[a:b][np.isfinite(fy[a:b])]
+        if len(fl) >= 10:
+            oy = -float(np.percentile(fl, 5))
+        elif prev is not None:
+            oy = prev[1] - ref[f0, 1]
+        else:
+            oy = leg_actor + 0.05 - ref[f0, 1]
+        oxz = (np.zeros(2) if prev is None else prev[[0, 2]]) - ref[f0, [0, 2]]
+        O[a:b] = [oxz[0], oy, oxz[1]]
+        prev = ref[kn[-1]] + O[a]
+        has.append(True)
+        shots.append((a, b))
+    # character-less shots: the camera starts where the nearest shot's camera was
+    hs = np.array(has)
+    if hs.any():
+        for i, (a, b) in enumerate(shots):
+            if hs[i]:
+                continue
+            j = min(np.where(hs)[0], key=lambda j: abs(j - i))
+            fa, fb = shots[j]
+            ref_f = fb - 1 if j < i else fa
+            O[a:b] = (C_w[ref_f] + O[ref_f]) - C_w[a if j < i else b - 1]
+    return O
+
+
+ANCHORS = [((L_HIP, R_HIP), ("leftUpperLeg", "rightUpperLeg")),
+           ((L_SH, R_SH), ("leftUpperArm", "rightUpperArm")),
+           ((L_EYE, R_EYE), ("leftEye", "rightEye")),
+           ((L_KNEE, R_KNEE), ("leftLowerLeg", "rightLowerLeg")),
+           ((L_HIP,), ("leftUpperLeg",)), ((R_HIP,), ("rightUpperLeg",)),
+           ((L_SH,), ("leftUpperArm",)), ((R_SH,), ("rightUpperArm",)),
+           ((L_KNEE,), ("leftLowerLeg",)), ((R_KNEE,), ("rightLowerLeg",)),
+           ((L_ANK,), ("leftFoot",)), ((R_ANK,), ("rightFoot",)),
+           ((L_EL,), ("leftLowerArm",)), ((R_EL,), ("rightLowerArm",)),
+           ((L_WR,), ("leftHand",)), ((R_WR,), ("rightHand",))]
+
+
+def place_root(skel, Q, Xw, js_ok, scale, fps, shot_of, tau_s=0.3):
+    """The avatar's root (hips) position, so that a part of the body that IS
+    seen sits exactly where the actor's does: the hip joints when they are in
+    the picture, otherwise the shoulders, the eyes, the knees, a single foot, a
+    hand... (with its pose as it is, held parts included). With nothing seen,
+    the character stays where it was. Switching from one reference part to
+    another (or coming back into view) is eased over tau_s."""
+    N = len(Q)
+    pos0, _ = avatar_fk(skel, Q, np.zeros((N, 3)))
+    bi = {b: i for i, b in enumerate(skel.bones)}
+    cand = np.full((N, 3), np.nan)
+    typ = -np.ones(N, np.int64)
+    for i, (aj, ab) in enumerate(ANCHORS):
+        if not all(b in bi for b in ab):
             continue
-        Ts = interp_gaps(np.nan_to_num(Ts), ok)
-        Tsm = np.stack([gaussian_smooth(Ts[:, 0], 0.04 * fps), gaussian_smooth(Ts[:, 1], 0.04 * fps),
-                        gaussian_smooth(Ts[:, 2], 0.4 * fps)], 1)
-        rel = scale * np.einsum("nij,nj->ni", R_w[a:b], Tsm)
-        C = np.median(hipc[a:b] - rel, axis=0)        # the fixed camera
-        corr = gaussian_smooth((C + rel) - hipc[a:b], 0.05 * fps)
-        # split into "across the image" (precise: applied fully) and "in depth"
-        # (noisy: applied only while no foot is planted)
-        right = R_w[a:b, :, 0].copy()
-        right[:, 1] = 0
-        right = normalize(right)
-        fwd = np.stack([-right[:, 2], np.zeros(len(right)), right[:, 0]], 1)
-        lat = np.sum(corr * right, 1)
-        dep = np.sum(corr * fwd, 1)
-        n = b - a
-        free = np.ones(n) if contacts is None else (~contacts[a:b].any(1)).astype(float)
-        dep_applied = np.zeros(n)
-        cur = 0.0
-        for k in range(n):
-            cur = cur + (dep[k] - cur) * free[k] * 0.5
-            dep_applied[k] = cur
-        delta = right * lat[:, None] + fwd * dep_applied[:, None]
-        root[a:b, 0] += delta[:, 0]
-        root[a:b, 2] += delta[:, 2]
+        m = js_ok[:, list(aj)].all(1) & (typ < 0) & np.isfinite(Xw[:, list(aj)]).all((1, 2))
+        if not m.any():
+            continue
+        actor = scale * Xw[:, list(aj)].mean(1)
+        off = pos0[:, [bi[b] for b in ab]].mean(1)
+        cand[m] = actor[m] - off[m]
+        typ[m] = i
+    root = np.zeros((N, 3))
+    seen = np.where(typ >= 0)[0]
+    if not len(seen):
+        return root
+    first = seen[0]
+    root[:first + 1] = cand[first]
+    decay = float(np.exp(-1.0 / max(tau_s * fps, 1e-6)))
+    o = np.zeros(3)
+    for f in range(first + 1, N):
+        if typ[f] < 0:
+            root[f] = root[f - 1]
+            continue
+        if typ[f] != typ[f - 1]:
+            o = root[f - 1] - cand[f]
+        else:
+            o = o * decay
+        root[f] = cand[f] + o
     return root
 
 
-def stabilize_camera(cam_pos, static, shot_of, fps):
-    """Locked-off shots: one fixed camera position. Moving shots: a smooth path."""
-    out = cam_pos.copy()
-    for (a, b, st) in _segments(static, shot_of):
-        if st:
-            out[a:b] = np.median(cam_pos[a:b], axis=0)
-        else:
-            out[a:b] = gaussian_smooth(cam_pos[a:b], 0.3 * fps)
-    # soften the hand-over between still and moving parts (never across a cut)
-    for (a, b) in runs(np.ones(len(out), bool), shot_of):
-        sm = gaussian_smooth(out[a:b], 0.1 * fps)
-        keep = static[a:b]
-        out[a:b] = np.where(keep[:, None], out[a:b], sm)
-    return out
+def _foot_lows(skel, Q, root):
+    pos, rot = avatar_fk(skel, Q, root)
+    bi = {b: i for i, b in enumerate(skel.bones)}
+    rp = skel.rest_pos
+    lows, xz = [], []
+    for side in ("left", "right"):
+        fi = bi[side + "Foot"]
+        heel_off = np.array([0, -rp[side + "Foot"][1], -0.04])
+        toe_off = rp[side + "Toes"] - rp[side + "Foot"] + np.array([0, -rp[side + "Toes"][1], 0.04]) \
+            if (side + "Toes") in rp else np.array([0, -rp[side + "Foot"][1], 0.15])
+        heel = pos[:, fi] + np.einsum("nij,j->ni", rot[:, fi], heel_off)
+        toe = pos[:, fi] + np.einsum("nij,j->ni", rot[:, fi], toe_off)
+        lows.append(np.minimum(heel[:, 1], toe[:, 1]))
+        xz.append((heel + toe)[:, [0, 2]] / 2)
+    return np.stack(lows, 1), np.stack(xz, 1)
+
+
+def foot_contacts(skel, Q, root, fps, feet_ok):
+    """(N,2) planted feet: low (near the lowest the feet get around then), slow,
+    and seen (a foot outside the picture is not known to be planted)."""
+    N = len(Q)
+    low, xz = _foot_lows(skel, Q, root)
+    win = int(1.5 * fps)
+    floor = np.zeros(N)
+    m = low.min(1)
+    for f in range(N):
+        a, b = max(0, f - win), min(N, f + win + 1)
+        ok = feet_ok[a:b].any(1)
+        vals = m[a:b][ok] if ok.any() else m[a:b]
+        floor[f] = np.percentile(vals, 10)
+    sp = np.zeros((N, 2))
+    sp[1:] = np.linalg.norm(np.diff(xz, axis=0), axis=-1) * fps
+    contact = (low - floor[:, None] < 0.035) & (sp < 0.6) & feet_ok
+    k = max(1, int(round(0.05 * fps)))
+    for s_ in (0, 1):
+        c = contact[:, s_].astype(float)
+        contact[:, s_] = np.convolve(c, np.ones(2 * k + 1) / (2 * k + 1), mode="same") > 0.5
+    return contact
+
+
+def settle_on_floor(skel, Q, root, contacts, fps, shot_of):
+    """Per shot, one vertical shift of the whole scene (character and camera
+    together, so the picture is unchanged) that puts the planted feet on the
+    floor (y = 0). Returns the shift per frame."""
+    low, _ = _foot_lows(skel, Q, root)
+    shift = np.zeros(len(root))
+    corr = np.where(contacts, -low, np.inf).min(1)
+    for (a, b) in runs(np.ones(len(root), bool), shot_of):
+        c = corr[a:b]
+        c = c[np.isfinite(c)]
+        if len(c) >= 3:
+            shift[a:b] = float(np.median(c))
+    return shift
 
 
 BONE_LANDMARKS = {
@@ -947,12 +1155,25 @@ def _min_run(mask, fps, shot_of, min_s=0.15):
     return out
 
 
-def joint_seen(uv, conf, valid, W, H, fps, shot_of):
-    """(N,33) joint clearly inside the picture (not on its edge) and detected."""
+def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None):
+    """(N,33) joint clearly inside the picture (not on its edge), detected, and
+    not behind something (hidden: see occluded_joints)."""
     m = 0.015 * max(W, H)
     inside = (uv[..., 0] > m) & (uv[..., 0] < W - m) & (uv[..., 1] > m) & (uv[..., 1] < H - m)
     s = inside & (conf >= 0.5) & valid[:, None]
+    if hidden is not None:
+        s &= ~hidden
     return np.stack([_min_run(s[:, j], fps, shot_of) for j in range(s.shape[1])], 1)
+
+
+def occluded_joints(seg, vis):
+    """(N,33) joints behind something: the person mask says the pixel there is
+    not the person (something is in front of it) and the pose model agrees it
+    is not clearly visible. seg = -1 where no mask was available."""
+    if seg is None:
+        return None
+    seg = np.asarray(seg, np.float64)
+    return (seg >= 0) & (seg < 0.25) & (vis < 0.6)
 
 
 def bone_seen(skel, js, hvalid, face_seen, fps, shot_of):
@@ -979,14 +1200,14 @@ def bone_seen(skel, js, hvalid, face_seen, fps, shot_of):
 
 
 def neutral_pose(skel):
-    """Local rotations for bones never seen in the whole clip: relaxed standing
-    (arms down at the sides) rather than the T-pose."""
+    """The A pose (arms 45 degrees down from the T-pose, everything else at
+    rest): what every bone shows until it is first seen."""
     q = np.zeros((len(skel.bones), 4))
     q[:, 3] = 1.0
     for side, sg in (("left", -1.0), ("right", 1.0)):
         b = side + "UpperArm"
         if skel.has(b):
-            a = np.radians(70) * sg
+            a = np.radians(45) * sg
             q[skel.bones.index(b)] = [0, 0, np.sin(a / 2), np.cos(a / 2)]
     return q
 
@@ -994,8 +1215,8 @@ def neutral_pose(skel):
 def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
     """Per bone: while not seen, keep the previous frame's rotation exactly;
     when seen again, move from that held pose to the observed one over
-    blend_s. Before a bone is first seen it has its first seen pose; a bone
-    never seen keeps the neutral pose. With skel, a seen bone under a held
+    blend_s. Until a bone is first seen it is in the neutral (A) pose, and it
+    eases from there into its first seen pose. With skel, a seen bone under a held
     parent keeps the direction it was observed in (its rotation relative to
     the held parent is recomputed)."""
     from .naturalize import slerp_many
@@ -1032,9 +1253,9 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
             col = target.copy()
             if not sb.all():
                 first = int(np.argmax(sb))
-                col[:first] = target[first]
-                since = nb  # frames since the bone was seen again
-                for f in range(first + 1, N):
+                col[:first] = neutral[b]
+                since = nb if first == 0 else 0  # frames since the bone was seen (again)
+                for f in range(max(first, 1), N):
                     if not sb[f]:
                         col[f] = col[f - 1]
                         since = 0
@@ -1049,27 +1270,6 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
             Lb = quat_to_mat(out[:, b])
             G_out[:, b] = Lb if p is None else G_out[:, idx[p]] @ Lb
     return normalize(out)
-
-
-def hold_unseen_root(root, seen, fps, blend_s=0.25):
-    """Root position: held while the hips are not seen, then eased back."""
-    out = root.copy()
-    if not seen.any():
-        return out
-    nb = max(1, int(round(blend_s * fps)))
-    first = int(np.argmax(seen))
-    out[:first] = root[first]
-    since = nb
-    for f in range(first + 1, len(root)):
-        if not seen[f]:
-            out[f] = out[f - 1]
-            since = 0
-        elif since < nb:
-            since += 1
-            t = since / nb
-            t = t * t * (3 - 2 * t)
-            out[f] = out[f - 1] + t * (root[f] - out[f - 1])
-    return out
 
 
 def bone_confidence(skel, vis, hs, valid, hvalid):
@@ -1185,93 +1385,6 @@ def fill_and_smooth_quats(q, valid, sigma, max_gap):
     return q
 
 
-def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale, feet_seen=None):
-    """Root (hips) trajectory for the avatar.
-
-    Horizontal motion is integrated from planted feet on the avatar's own
-    skeleton (no foot sliding, works for tracking cameras); flight phases use
-    the camera-based estimate. Vertical position keeps the planted foot on the
-    floor (y = 0)."""
-    N = len(Q)
-    pos, rot = avatar_fk(skel, Q, np.zeros((N, 3)))
-    bi = {b: i for i, b in enumerate(skel.bones)}
-    rp = skel.rest_pos
-    feet = []
-    for side in ("left", "right"):
-        fi = bi[side + "Foot"]
-        ti = bi.get(side + "Toes", fi)
-        heel_off = np.array([0, -rp[side + "Foot"][1], -0.04])
-        toe_off = rp[side + "Toes"] - rp[side + "Foot"] + np.array([0, -rp[side + "Toes"][1], 0.04]) \
-            if (side + "Toes") in rp else np.array([0, -rp[side + "Foot"][1], 0.15])
-        heel = pos[:, fi] + np.einsum("nij,j->ni", rot[:, fi], heel_off)
-        toe = pos[:, fi] + np.einsum("nij,j->ni", rot[:, fi], toe_off)
-        _ = ti
-        feet.append(np.stack([heel, toe], 1))  # (N,2,3) relative to hips
-    feet = np.stack(feet, 1)  # (N, side, point, 3)
-    low = feet[..., 1].min(2)  # lowest point per foot (N,2), relative to hips
-    # actor-based absolute height cue (camera assumed not to crane quickly)
-    abs_low = low + root_guess[:, 1:2]
-    ground = np.zeros(N)
-    win = int(1.5 * fps)
-    for f in range(N):
-        a, b = max(0, f - win), min(N, f + win + 1)
-        m = valid[a:b]
-        vals = abs_low[a:b][m].min(1) if m.any() else abs_low[a:b].min(1)
-        ground[f] = np.percentile(vals, 10)
-    height_abs = abs_low - ground[:, None]
-    rel = low - low.min(1, keepdims=True)
-    vel = np.zeros((N, 2))
-    vel[1:] = np.linalg.norm(np.diff(feet[:, :, :, [0, 2]].mean(2), axis=0), axis=-1) * fps
-    contact = (rel < 0.03) & (height_abs < 0.10) | (rel < 0.015) & (height_abs < 0.2)
-    if feet_seen is not None:  # a foot outside the picture is not known to be planted
-        contact &= feet_seen
-    # hysteresis / debounce: remove 1-2 frame flickers
-    k = max(1, int(round(0.05 * fps)))
-    for s in (0, 1):
-        c = contact[:, s].astype(float)
-        c = np.convolve(c, np.ones(2 * k + 1) / (2 * k + 1), mode="same") > 0.5
-        contact[:, s] = c
-    root = np.zeros((N, 3))
-    root[0, [0, 2]] = root_guess[0, [0, 2]]
-    for f in range(1, N):
-        both = contact[f] & contact[f - 1]
-        if both.any() and shot_of[f] == shot_of[f - 1] or both.any():
-            d = np.zeros(3)
-            wsum = 0.0
-            for s in (0, 1):
-                if both[s]:
-                    w = 1.0 / (1e-3 + low[f, s] - low[f].min() + 0.01)
-                    d += w * (feet[f, s].mean(0) - feet[f - 1, s].mean(0))
-                    wsum += w
-            d /= wsum
-            root[f, [0, 2]] = root[f - 1, [0, 2]] - d[[0, 2]]
-        else:
-            step = root_guess[f, [0, 2]] - root_guess[f - 1, [0, 2]]
-            if shot_of[f] != shot_of[f - 1]:
-                step = np.zeros(2)
-            sp = np.linalg.norm(step) * fps
-            if sp > 6.0:
-                step *= 6.0 / sp
-            root[f, [0, 2]] = root[f - 1, [0, 2]] + step
-    # vertical
-    y = np.full(N, np.nan)
-    anyc = contact.any(1)
-    y[anyc] = -np.where(contact[anyc], low[anyc], np.inf).min(1)
-    if anyc.any():
-        idx = np.arange(N)
-        base = np.interp(idx, idx[anyc], y[anyc])
-        g = root_guess[:, 1]
-        gb = np.interp(idx, idx[anyc], g[anyc])
-        flight = ~anyc
-        y = np.where(anyc, y, base + np.clip(g - gb, -0.5, 3.0))
-        y[flight] = np.maximum(y[flight], -low[flight].min(1))
-    else:
-        y = -low.min(1)
-    root[:, 1] = gaussian_smooth(y, 0.8 * fps / 30.0)
-    root[:, [0, 2]] = gaussian_smooth(root[:, [0, 2]], 0.5 * fps / 30.0)
-    return root, contact
-
-
 def foot_lock_ik(skel, Q, root, contact, fps, blend_s=0.06, leash=0.035):
     """Pin each planted foot to one spot on the floor for the whole contact and
     fix the leg with two-bone IK (knee keeps its bend direction, the foot keeps
@@ -1380,4 +1493,17 @@ def resample_anim(anim, fps_out):
     out["frames"] = int(n_out)
     out["src_fps"] = fps_in
     out["src_frame"] = near.astype(np.int32)
+    return out
+
+
+def crop_anim(anim, start, end):
+    """Frames start..end (inclusive) of an animation, as an animation of its own."""
+    n = int(anim["frames"])
+    start = int(np.clip(start, 0, n - 1))
+    end = int(np.clip(end, start, n - 1))
+    out = {}
+    for k, v in anim.items():
+        out[k] = v[start:end + 1] if isinstance(v, np.ndarray) and v.ndim >= 1 and len(v) == n else v
+    out["frames"] = end - start + 1
+    out["crop"] = (start, end)
     return out

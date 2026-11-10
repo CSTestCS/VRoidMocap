@@ -318,9 +318,6 @@ class FbxExport(unittest.TestCase):
         self.assertTrue(all(len(next(k for k in c[2] if k[0] == "KeyTime")[1][0]) == N for c in curves))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class Naturalize(unittest.TestCase):
     def test_anatomical_poses_are_kept(self):
@@ -529,12 +526,13 @@ class HoldUnseen(unittest.TestCase):
         seen[:10] = False
         seen[30:40] = False
         out = hold_unseen(Q, seen, 30.0, np.array([[0, 0, 0, 1.0]]))
-        # before first sight: the first seen pose
-        self.assertTrue(np.allclose(out[:10, 0], Q[10, 0]))
+        # before first sight: the neutral (A) pose, then easing into the motion
+        self.assertTrue(np.allclose(out[:10, 0], [0, 0, 0, 1]))
+        self.assertLess(np.degrees(q_angle(out[17:30, 0], Q[17:30, 0])).max(), 0.5)
         # unseen: exactly the last pose
         self.assertTrue(np.allclose(out[30:40, 0], out[29, 0]))
         # no frame-to-frame step larger than the motion itself plus the catch-up
-        steps = np.degrees(q_angle(out[1:, 0], out[:-1, 0]))
+        steps = np.degrees(q_angle(out[11:, 0], out[10:-1, 0]))
         self.assertLess(steps.max(), 12.0)
         # caught up within 0.2 s
         self.assertLess(np.degrees(q_angle(out[47:, 0], Q[47:, 0])).max(), 0.5)
@@ -548,3 +546,131 @@ class HoldUnseen(unittest.TestCase):
         seen[:, skel.bones.index("leftUpperArm")] = False
         out = hold_unseen(Q, seen, 30.0, neutral_pose(skel), skel)
         self.assertFalse(np.allclose(out[:, skel.bones.index("leftUpperArm")], [0, 0, 0, 1]))
+
+
+class SceneCamera(unittest.TestCase):
+    """Camera from the scenery alone: turns, zooms and travel."""
+
+    def _track(self, K, Cf, Rf, zf, f0=1500.0, seed=1):
+        rng = np.random.default_rng(seed)
+        X = np.c_[rng.uniform(-8, 8, 1500), rng.uniform(-3, 3, 1500), rng.uniform(3, 12, 1500)]
+        pairs, ids, prev = [None], [None], None
+        for k in range(K):
+            v = (X - Cf(k)) @ Rf(k)
+            f = f0 * zf(k)
+            p = np.c_[f * v[:, 0] / v[:, 2] + 960, f * v[:, 1] / v[:, 2] + 540] + rng.normal(0, 0.3, (len(X), 2))
+            vis = (v[:, 2] > 0.5) & (p[:, 0] > 0) & (p[:, 0] < 1920) & (p[:, 1] > 0) & (p[:, 1] < 1080)
+            if prev is not None:
+                sel = np.where(vis & prev[1])[0][:300]
+                pairs.append(np.c_[prev[0][sel], p[sel]])
+                ids.append(sel)
+            prev = (p, vis)
+        return pairs, ids
+
+    def test_still_pan_zoom_and_travel(self):
+        from vroidmocap.core import scene
+        K = 40
+        cases = [("still", lambda k: np.zeros(3), lambda k: np.eye(3), lambda k: 1.0, False),
+                 ("pan+zoom", lambda k: np.zeros(3), lambda k: scene.expmap(np.array([0, 0.004 * k, 0])), lambda k: 1 + 0.01 * k, False),
+                 ("truck", lambda k: np.array([0.03 * k, 0, 0]), lambda k: np.eye(3), lambda k: 1.0, True)]
+        for name, Cf, Rf, zf, travels in cases:
+            pairs, ids = self._track(K, Cf, Rf, zf)
+            R, zoom, C, moving, seg, par, f_used, _ = scene.solve_shot(pairs, ids, [True] * K, 1500.0, 960, 540, 30)
+            err = max(np.degrees(np.arccos(np.clip((np.trace(R[k].T @ Rf(k)) - 1) / 2, -1, 1))) for k in range(K))
+            self.assertLess(err, 0.1, name)
+            self.assertAlmostEqual(zoom[-1], zf(K - 1), delta=0.01, msg=name)
+            self.assertEqual(bool((seg >= 0).any()), travels, name)
+            if not travels:
+                self.assertTrue(np.allclose(C, 0), name)  # a camera that only turns / zooms never moves
+            else:
+                d = C[-1] / np.linalg.norm(C[-1])
+                self.assertGreater(d[0], 0.99, name)  # travel direction from the parallax
+
+
+class FbxAvatars(unittest.TestCase):
+    def test_bone_names(self):
+        from vroidmocap.core.fbx_avatar import classify
+        for name, kind, side in [("mixamorig:LeftForeArm", "lowerArm", "left"), ("mixamorig:RightUpLeg", "upperLeg", "right"),
+                                 ("thigh_l", "upperLeg", "left"), ("calf_r", "lowerLeg", "right"), ("J_Bip_L_UpperArm", "upperArm", "left"),
+                                 ("upper_arm.R", "upperArm", "right"), ("upperarm_twist_01_l", "skip", "left"),
+                                 ("左ひじ", "lowerArm", "left"), ("mixamorig:LeftHandIndex1", "finger:Index", "left"),
+                                 ("Bip01 R Clavicle", "shoulder", "right"), ("pelvis", "hips", None), ("HeadTop_End", "skip", None)]:
+            k, sd, _ = classify(name)
+            self.assertEqual((k, sd), (kind, side), name)
+
+    def test_fbx_avatar_matches_solver_pose(self):
+        from vroidmocap.core.fbx_avatar import FbxAvatar
+        from vroidmocap.core.fbx_writer import export_animation_fbx
+        from vroidmocap.core.mathutil import quat_to_mat
+        from vroidmocap.core.retarget import avatar_fk
+        skel = synthetic_skeleton()
+        rng = np.random.default_rng(3)
+        N = 4
+        anim = {"bones": skel.bones, "quats": np.tile([0, 0, 0, 1.0], (N, len(skel.bones), 1)).astype(np.float32),
+                "root": np.tile(skel.rest_pos["hips"], (N, 1)), "fps": 30.0, "frames": N, "width": 1920, "height": 1080}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.fbx")
+            write_skeleton_glb(skel, os.path.join(d, "t.glb"))
+            export_animation_fbx(p, skel, anim, vrm_path=os.path.join(d, "t.glb"), include_camera=False)
+            av = FbxAvatar(p)
+        sk = av.skeleton()
+        for b in sk.bones:  # same T-pose skeleton back
+            self.assertLess(np.linalg.norm(sk.rest_pos[b] - skel.rest_pos[b]), 1e-3, b)
+        Q = np.concatenate([random_pose(sk, rng) for _ in range(N)])
+        root = np.tile(sk.rest_pos["hips"], (N, 1)) + rng.normal(0, 0.1, (N, 3))
+        names, quats, hips_t = av.pose(sk.bones, Q, root)
+        # rebuild the model's own bones from the file's rest transforms + the posed rotations
+        id_of = {d_["name"]: m for m, d_ in av.models.items()}
+        Lq = {id_of[n]: quats[:, i] for i, n in enumerate(names)}
+        pos, _ = avatar_fk(sk, Q, root)
+        for t in range(N):
+            W = {}
+            for m in av.order:
+                L = av.local[m].copy()
+                sc = np.linalg.norm(L[:3, :3], axis=0)
+                if m in Lq:
+                    L[:3, :3] = quat_to_mat(Lq[m][t].astype(np.float64)) * sc
+                if m == av.hb["hips"]:
+                    L[:3, 3] = hips_t[t]
+                pa = av.parent.get(m)
+                W[m] = L if pa is None else W[pa] @ L
+            for i, b in enumerate(sk.bones):
+                got = av.A @ W[av.hb[b]][:3, 3] * av.unit
+                self.assertLess(np.linalg.norm(got - pos[t, i]), 2e-3, b)
+
+
+class SceneHelpers(unittest.TestCase):
+    def test_crop(self):
+        from vroidmocap.core.retarget import crop_anim
+        a = {"frames": 10, "fps": 30.0, "quats": np.zeros((10, 3, 4)), "root": np.arange(30.0).reshape(10, 3), "bones": ["a"]}
+        c = crop_anim(a, 2, 5)
+        self.assertEqual(c["frames"], 4)
+        self.assertTrue(np.allclose(c["root"][0], a["root"][2]))
+        self.assertEqual(c["bones"], ["a"])
+
+    def test_edge_continuation(self):
+        from vroidmocap.core.capture import extend_at_edges
+        N = 60
+        boxes = np.full((N, 4), np.nan)
+        for f in range(30):  # walks right and reaches the edge of a 1000 px wide picture
+            x = 600 + 10 * f
+            boxes[f] = [x, 100, x + 200, 700]
+        out, segs = extend_at_edges(boxes, [(0, 30)], np.zeros(N, int), 1000, 800, 30)
+        self.assertGreater(segs[0][1], 30)          # carried on past the end of the track
+        self.assertTrue(np.isnan(out[59, 0]))       # ...but not once it is out of the picture
+        self.assertGreater(out[31, 0], out[29, 0])  # along its motion
+
+    def test_a_pose_until_seen(self):
+        from vroidmocap.core.retarget import hold_unseen, neutral_pose
+        skel = synthetic_skeleton()
+        N = 12
+        Q = np.tile([0, 0, 0.3, 0.95], (N, len(skel.bones), 1))
+        seen = np.zeros((N, len(skel.bones)), bool)
+        seen[6:] = True
+        out = hold_unseen(Q, seen, 30.0, neutral_pose(skel), skel)
+        ua = skel.bones.index("leftUpperArm")
+        self.assertTrue(np.allclose(out[:6, ua], neutral_pose(skel)[ua], atol=1e-6))
+
+
+if __name__ == "__main__":
+    unittest.main()

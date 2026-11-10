@@ -151,8 +151,10 @@ def _pose_from(res_lms, res_world, x0, y0, sw, sh):
 
 
 class PoseDetector:
-    def __init__(self, heavy=False, num_poses=1, video=False, min_conf=0.3):
+    def __init__(self, heavy=False, num_poses=1, video=False, min_conf=0.3, masks=False):
         self.video = video
+        self.masks = masks
+        self.last_mask = None
         o = vision.PoseLandmarkerOptions(
             base_options=_opts("pose_heavy" if heavy else "pose_full"),
             running_mode=vision.RunningMode.VIDEO if video else vision.RunningMode.IMAGE,
@@ -160,6 +162,7 @@ class PoseDetector:
             min_pose_detection_confidence=min_conf,
             min_pose_presence_confidence=min_conf,
             min_tracking_confidence=min_conf,
+            output_segmentation_masks=masks,
         )
         self.lm = vision.PoseLandmarker.create_from_options(o)
 
@@ -171,6 +174,10 @@ class PoseDetector:
             r = self.lm.detect_for_video(img, int(ts_ms))
         else:
             r = self.lm.detect(img)
+        self.last_mask = None
+        if self.masks and getattr(r, "segmentation_masks", None):
+            m = r.segmentation_masks[0].numpy_view()
+            self.last_mask = np.asarray(m[..., 0] if m.ndim == 3 else m, np.float32)
         return _pose_from(r.pose_landmarks, r.pose_world_landmarks, x0, y0, w * scale_x, h * scale_y)
 
     def close(self):
@@ -229,6 +236,23 @@ class Embedder:
             pass
 
 
+def mask_at(mask, pts, x0, y0, sc, radius=0.015):
+    """Person-mask value (0..1) at frame points: the highest value within a small
+    radius (joints sit inside the limb, mask edges are soft). -1 outside the mask."""
+    h, w = mask.shape
+    r = max(1, int(round(radius * w)))
+    out = np.full(len(pts), -1.0, np.float32)
+    q = (np.asarray(pts, float) - [x0, y0]) / sc  # mask pixels = crop pixels
+    for i, (u, v) in enumerate(q):
+        u, v = int(round(u)), int(round(v))
+        if -r <= u < w + r and -r <= v < h + r:
+            a, b = max(0, v - r), min(h, v + r + 1)
+            c, d = max(0, u - r), min(w, u + r + 1)
+            if a < b and c < d:
+                out[i] = float(mask[a:b, c:d].max())
+    return out
+
+
 def crop_square(rgb, cx, cy, size, out=None):
     """Square crop centred on (cx, cy), padded with black where it leaves the frame.
     Returns (crop, x0, y0, scale) where frame = x0 + crop_px * scale."""
@@ -281,6 +305,9 @@ for _a, _b in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15,
 WB_SWAP[91:112], WB_SWAP[112:133] = np.arange(112, 133), np.arange(91, 112)
 
 
+Z_RANGE = 2.1744869  # RTMW3D depth range
+
+
 class WholeBody:
     """RTMW whole-body keypoints (ONNX). Much more precise in the picture than
     the MediaPipe body model; used for where the joints are in 2D."""
@@ -313,4 +340,9 @@ class WholeBody:
         kx, ky = sx.argmax(1) / 2.0, sy.argmax(1) / 2.0
         score = np.minimum(sx.max(1), sy.max(1))
         kp = np.stack([(kx - self.W / 2) * w / self.W + cx, (ky - self.H / 2) * h / self.H + cy], 1)
+        if len(out) > 2:  # the 3D model also says how far each point is (relative, ~metres; + = further)
+            kz = (out[2][0].argmax(1) / 2.0 / (self.H / 2) - 1) * Z_RANGE
+            self.last_z = kz.astype(np.float32)
+        else:
+            self.last_z = np.zeros(len(kp), np.float32)
         return kp.astype(np.float32), score.astype(np.float32)

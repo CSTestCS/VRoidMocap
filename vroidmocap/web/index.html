@@ -44,10 +44,10 @@
       </div>
       <div class="card">
         <h2>Avatar</h2>
-        <p class="muted">Your .vrm model (VRM 0.x or 1.0, e.g. exported from VRoid Studio).</p>
+        <p class="muted">Your character: a .vrm (VRM 0.x or 1.0, e.g. from VRoid Studio) or an .fbx humanoid (Mixamo, VRoid, Unity, Unreal, Blender, MMD...).</p>
         <div class="filerow">
-          <button id="pickVrm">Choose .vrm…</button>
-          <input type="file" id="fileVrm" accept=".vrm" hidden>
+          <button id="pickVrm">Choose .vrm / .fbx…</button>
+          <input type="file" id="fileVrm" accept=".vrm,.fbx" hidden>
           <div class="path" id="vrmPath">No avatar selected</div>
         </div>
         <div class="muted small" id="vrmInfo"></div>
@@ -134,6 +134,13 @@
         <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
         <option value="1" selected>1×</option><option value="2">2×</option>
       </select>
+      <div class="crop">
+        <button id="cropIn" class="ghost small" title="Start the range at this frame (I)">[ In</button>
+        <button id="cropOut" class="ghost small" title="End the range at this frame (O)">Out ]</button>
+        <button id="cropClear" class="ghost small" title="Use the whole clip again" disabled>Clear</button>
+        <label class="check" title="Play the range (or the whole clip) over and over (L)"><input type="checkbox" id="loop"> Loop</label>
+        <span class="muted small" id="cropInfo">Whole clip</span>
+      </div>
     </div>
     <div class="track"><canvas id="trackCanvas" height="18"></canvas></div>
     <div class="muted small" id="frameInfo"></div>
@@ -147,6 +154,7 @@
     <label class="check"><input type="checkbox" id="exLockHeight"> Also lock height</label>
     <label class="check"><input type="checkbox" id="exModel" checked> Include the avatar model (mesh, skin weights, materials, textures)</label>
     <label class="check"><input type="checkbox" id="exCamera" checked> Include the video's camera</label>
+    <label class="check" id="exCropRow"><input type="checkbox" id="exCrop" checked> Only the selected range <span class="muted" id="exCropInfo"></span></label>
     <p class="muted small" id="exFps"></p>
     <p class="muted small">The skeleton uses your avatar's own bone names and rest pose, so the clip binds directly to the same model in Blender, Unity (Humanoid), Unreal or Maya.</p>
     <div class="actions"><button value="cancel" class="ghost">Cancel</button><button value="ok" class="primary" id="exGo">Export</button></div>

@@ -22,12 +22,13 @@ import cv2
 import numpy as np
 
 from . import camera as cam
+from . import scene
 from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_HEEL, R_HIP,
                      R_SH, Embedder, PoseDetector, box_iou, crop_square, landmark_box)
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 5
+ANALYSIS_VERSION = 6
 
 
 class Cancelled(Exception):
@@ -273,7 +274,7 @@ class Analyzer:
         self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
         embedder = Embedder()
 
-        scan_path = os.path.join(self.workdir, "scan_v2.pkl")
+        scan_path = os.path.join(self.workdir, "scan_v3.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:
@@ -289,9 +290,10 @@ class Analyzer:
         cam_scale = 640.0 / W
         cw, ch = 640, int(round(H * cam_scale))
         prev_gray = prev_mask = None
+        bg_pts, bg_ids, next_bg_id = None, np.zeros(0, np.int64), 0
         tracks, finished = [], []
         shot_starts = [0]
-        frame_ids, H_rel, H_ok = [], [], []
+        frame_ids, H_rel, H_ok, H_ids = [], [], [], []
         last_scan = -10 ** 9
         lost_limit = max(2, int(round(0.6 * fps / stride)))
         thumbs = {}
@@ -307,31 +309,36 @@ class Analyzer:
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             cut = bool(cuts_here)
 
-            # ---- camera motion (background only): keep matched point pairs for later
-            pair, ok = None, False
-            if prev_gray is not None and not cut:
-                pts = cv2.goodFeaturesToTrack(prev_gray, 500, 0.01, 8, mask=prev_mask)
-                if pts is not None and len(pts) >= 12:
-                    nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None, winSize=(21, 21), maxLevel=3)
-                    good = st.ravel() == 1
-                    if good.sum() >= 12:
-                        Hs, inl = cv2.findHomography(pts[good], nxt[good], cv2.RANSAC, 2.0)
-                        ratio = float(inl.sum()) / len(pts) if inl is not None else 0.0
-                        resid = 99.0
-                        if Hs is not None:
-                            warped = cv2.warpPerspective(prev_gray, Hs, (cw, ch))
-                            valid = cv2.warpPerspective(np.full_like(prev_gray, 1), Hs, (cw, ch)) > 0
-                            if valid.sum() > 0.3 * valid.size:
-                                resid = float(np.mean(cv2.absdiff(warped, gray)[valid]))
-                        if ratio < 0.3 or resid > 14.0:
-                            pass  # fast pan / blur: no usable camera motion for this step (not a cut)
-                        else:
-                            a, b = pts[good].reshape(-1, 2), nxt[good].reshape(-1, 2)
-                            if len(a) > 300:
-                                sel = np.random.default_rng(k).choice(len(a), 300, replace=False)
-                                a, b = a[sel], b[sel]
-                            pair = np.concatenate([a, b], 1).astype(np.float32) / cam_scale
-                            ok = True
+            # ---- camera motion (background only): long feature tracks over the
+            # scenery (people masked out), kept as matched pairs with track ids
+            pair, pids, ok = None, None, False
+            if cut:
+                bg_pts = None
+            if prev_gray is not None and not cut and bg_pts is not None and len(bg_pts) >= 12:
+                p0 = bg_pts.reshape(-1, 1, 2)
+                nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None, winSize=(21, 21), maxLevel=3)
+                back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, nxt, None, winSize=(21, 21), maxLevel=3)
+                fb = np.linalg.norm((back - p0).reshape(-1, 2), axis=1)
+                q = nxt.reshape(-1, 2)
+                good = ((st.ravel() == 1) & (st2.ravel() == 1) & (fb < 0.7) &
+                        (q[:, 0] >= 0) & (q[:, 0] < cw) & (q[:, 1] >= 0) & (q[:, 1] < ch))
+                if good.sum() >= 12:
+                    a, b = p0.reshape(-1, 2)[good], q[good]
+                    Hs, inl = cv2.findHomography(a, b, cv2.RANSAC, 2.0)
+                    ratio = float(inl.sum()) / len(a) if inl is not None else 0.0
+                    resid = 99.0
+                    if Hs is not None:
+                        warped = cv2.warpPerspective(prev_gray, Hs, (cw, ch))
+                        valid = cv2.warpPerspective(np.full_like(prev_gray, 1), Hs, (cw, ch)) > 0
+                        if valid.sum() > 0.3 * valid.size:
+                            resid = float(np.mean(cv2.absdiff(warped, gray)[valid]))
+                    if ratio < 0.3 or resid > 14.0:
+                        good[:] = False  # fast pan / blur: no usable camera motion for this step (not a cut)
+                    else:
+                        pair = np.concatenate([a, b], 1).astype(np.float32) / cam_scale
+                        pids = bg_ids[good].astype(np.int32)
+                        ok = True
+                bg_pts, bg_ids = q[good], bg_ids[good]
             if cut:
                 for c in cuts_here:
                     if c not in shot_starts:
@@ -395,13 +402,31 @@ class Analyzer:
                     still.append(t)
             tracks = still
 
-            # mask for next frame's feature detection
+            # people mask: background tracks never sit on a person
             prev_mask = np.full(gray.shape, 255, np.uint8)
             for t in tracks:
                 b = (t.boxes[-1] * cam_scale).astype(int)
-                cv2.rectangle(prev_mask, (b[0] - 6, b[1] - 6), (b[2] + 6, b[3] + 6), 0, -1)
+                pad = int(6 + 0.08 * max(b[2] - b[0], b[3] - b[1]))
+                cv2.rectangle(prev_mask, (b[0] - pad, b[1] - pad), (b[2] + pad, b[3] + pad), 0, -1)
+            if bg_pts is not None and len(bg_pts):
+                qi = np.clip(bg_pts.astype(int), 0, [cw - 1, ch - 1])
+                keep = prev_mask[qi[:, 1], qi[:, 0]] > 0
+                bg_pts, bg_ids = bg_pts[keep], bg_ids[keep]
+            n_have = 0 if bg_pts is None else len(bg_pts)
+            if n_have < 350:
+                m2 = prev_mask.copy()
+                if n_have:
+                    for x_, y_ in bg_pts.astype(int):
+                        cv2.circle(m2, (int(x_), int(y_)), 8, 0, -1)
+                newp = cv2.goodFeaturesToTrack(gray, 450 - n_have, 0.01, 8, mask=m2)
+                if newp is not None:
+                    newp = newp.reshape(-1, 2).astype(np.float32)
+                    bg_pts = newp if bg_pts is None or not n_have else np.concatenate([bg_pts, newp])
+                    bg_ids = np.concatenate([bg_ids[:n_have], np.arange(next_bg_id, next_bg_id + len(newp))])
+                    next_bg_id += len(newp)
             frame_ids.append(fi)
             H_rel.append(pair)
+            H_ids.append(pids)
             H_ok.append(ok)
             prev_gray = gray
             k += 1
@@ -416,7 +441,7 @@ class Analyzer:
         self.track_pose.close()
         embedder.close()
 
-        sc = {"stride": stride, "frames": N, "frame_ids": frame_ids, "H_rel": H_rel, "H_ok": H_ok,
+        sc = {"stride": stride, "frames": N, "frame_ids": frame_ids, "H_rel": H_rel, "H_ok": H_ok, "H_ids": H_ids,
               "cuts": cut_frames,
               "shot_starts": shot_starts, "tracks": finished, "thumbs": thumbs}
         import pickle
@@ -448,14 +473,14 @@ class Analyzer:
             t.shot = int(frame_shot[t.frames[0]])
         min_len = max(3, int(round(0.4 * fps / stride)))
         tracklets = [t for t in sc["tracks"] if len(t.frames) >= min_len and t.embs and is_human_track(t)]
-        result = self._solve(N, fps, W, H, stride, np.array(sc["frame_ids"]), sc["H_rel"], sc["H_ok"],
+        result = self._solve(N, fps, W, H, stride, np.array(sc["frame_ids"]), sc["H_rel"], sc["H_ok"], sc["H_ids"],
                              merged, tracklets, sc["thumbs"])
         result["elapsed_s"] = time.time() - t_start
         self.progress(1.0, "Analysis complete")
         return result
 
     # -- post-processing ---------------------------------------------------------
-    def _solve(self, N, fps, W, H, stride, frame_ids, H_rel, H_ok, shot_starts, tracklets, thumbs):
+    def _solve(self, N, fps, W, H, stride, frame_ids, H_rel, H_ok, H_ids, shot_starts, tracklets, thumbs):
         shots = []
         for i, s in enumerate(shot_starts):
             e = shot_starts[i + 1] if i + 1 < len(shot_starts) else N
@@ -465,33 +490,52 @@ class Analyzer:
             shot_of[s["start"]:s["end"]] = i
         cx, cy = W / 2, H / 2
 
-        # ---------------- focal length (per shot) from people landmarks
+        # ---------------- camera from the scenery: turn + zoom per frame, and
+        # where the background shows parallax, the camera's travel
         nA = len(frame_ids)
         zoom = np.ones(nA)
         a_index = {f: i for i, f in enumerate(frame_ids)}
+        a_shot = shot_of[frame_ids]
+        R_ref = np.tile(np.eye(3), (nA, 1, 1))
+        C_ref = np.zeros((nA, 3))
+        seg_a = -np.ones(nA, np.int64)
+        par_a = np.zeros(nA)
+        n_seg = 0
+        fps_a = fps / stride
         for si, sh in enumerate(shots):
-            samples = []
-            for t in tracklets:
-                if t.shot != si:
-                    continue
-                step = max(1, len(t.frames) // 25)
-                for j in range(0, len(t.frames), step):
-                    if t.vis[j].mean() > 0.6:
-                        samples.append((t.world[j].astype(np.float64), t.lm2d[j].astype(np.float64),
-                                        t.vis[j].astype(np.float64), t.crop_c[j], 1.0))
-            sh["vfov"] = cam.estimate_vfov(samples[:120], W, H)
+            idx = np.where(a_shot == si)[0]
+            vf = None
+            for _pass in range(2):
+                samples = []
+                for t in tracklets:
+                    if t.shot != si:
+                        continue
+                    step = max(1, len(t.frames) // 25)
+                    for j in range(0, len(t.frames), step):
+                        if t.vis[j].mean() > 0.6:
+                            samples.append((t.world[j].astype(np.float64), t.lm2d[j].astype(np.float64),
+                                            t.vis[j].astype(np.float64), t.crop_c[j], zoom[a_index[t.frames[j]]]))
+                vf_new = cam.estimate_vfov(samples[:120], W, H)
+                if vf is not None and abs(vf_new - vf) < 0.1 * vf:
+                    break
+                vf = vf_new
+                if len(idx) == 0:
+                    break
+                pairs = [None] + [H_rel[i] for i in idx[1:]]
+                ids = [None] + [H_ids[i] for i in idx[1:]]
+                oks = [False] + [bool(H_ok[i]) for i in idx[1:]]
+                f0 = cam.focal_from_vfov(vf, H)
+                Rs, zs, Cs, mv, sg, par, f_used, from_scene = scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
+                R_ref[idx], zoom[idx], C_ref[idx], par_a[idx] = Rs, zs, Cs, par
+                seg_a[idx] = np.where(sg >= 0, sg + n_seg, -1)
+                if from_scene:  # the scenery measured the lens: better than the body's guess
+                    vf = cam.vfov_from_focal(f_used, H)
+                    break
+            n_seg = int(seg_a.max()) + 1 if (seg_a >= 0).any() else 0
+            sh["vfov"] = vf
             sh["samples"] = len(samples)
-
-        # ---------------- camera rotation chains per shot (analysed frames)
-        R_ref = np.zeros((nA, 3, 3))
-        for i in range(nA):
-            si = shot_of[frame_ids[i]]
-            if i == 0 or shot_of[frame_ids[i - 1]] != si or not H_ok[i]:
-                R_ref[i] = np.eye(3) if (i == 0 or shot_of[frame_ids[i - 1]] != si) else R_ref[i - 1]
-                continue
-            f = cam.focal_from_vfov(shots[si]["vfov"], H)
-            Rr = relative_rotation(H_rel[i], f, cx, cy)  # R_{t <- t-1}
-            R_ref[i] = R_ref[i - 1] @ Rr.T
+            sh["travel"] = float(np.mean(seg_a[idx] >= 0)) if len(idx) else 0.0
+            self.progress(0.91 + 0.04 * (si + 1) / len(shots), "Solving the camera from the scenery")
 
         # ---------------- gravity alignment per shot
         for si, sh in enumerate(shots):
@@ -523,6 +567,8 @@ class Analyzer:
         q_ref = mat_to_quat(R_ref)
         cam_q = np.zeros((N, 4))
         cam_zoom = np.ones(N)
+        cam_C = np.zeros((N, 3))
+        cam_seg = -np.ones(N, np.int64)
         for i in range(nA):
             f0 = frame_ids[i]
             f1 = frame_ids[i + 1] if i + 1 < nA else N
@@ -532,9 +578,13 @@ class Analyzer:
                     a = (f - f0) / (f1 - f0)
                     cam_q[f] = slerp(q_ref[i], q_ref[i + 1], a)
                     cam_zoom[f] = zoom[i] * (1 - a) + zoom[i + 1] * a
+                    cam_C[f] = C_ref[i] * (1 - a) + C_ref[i + 1] * a
+                    cam_seg[f] = seg_a[i] if seg_a[i] >= 0 else seg_a[i + 1]
                 else:
                     cam_q[f] = q_ref[i]
                     cam_zoom[f] = zoom[i]
+                    cam_C[f] = C_ref[i]
+                    cam_seg[f] = seg_a[i]
         # light smoothing of the camera path inside each shot
         from .mathutil import gaussian_smooth, quat_continuity
         sig = 0.75 * stride
@@ -543,6 +593,7 @@ class Analyzer:
             q = quat_continuity(cam_q[s:e].copy())
             cam_q[s:e] = normalize(gaussian_smooth(q, sig))
             cam_zoom[s:e] = gaussian_smooth(cam_zoom[s:e], sig)
+            cam_C[s:e] = gaussian_smooth(cam_C[s:e], sig)
         focal = np.array([cam.focal_from_vfov(shots[shot_of[f]]["vfov"], H) for f in range(N)]) * cam_zoom
 
         # ---------------- heights relative to the scenery
@@ -572,6 +623,8 @@ class Analyzer:
         bg_motion = np.interp(np.arange(N), frame_ids[okb], bg[okb]) if okb.any() else np.zeros(N)
         np.savez_compressed(os.path.join(self.workdir, "analysis.npz"), cam_q=cam_q.astype(np.float32),
                             bg_motion=bg_motion.astype(np.float32),
+                            cam_C=cam_C.astype(np.float32), cam_seg=cam_seg.astype(np.int32),
+                            cam_zoom=cam_zoom.astype(np.float32),
                             focal=focal.astype(np.float32), shot_of=shot_of,
                             shot_align=np.array([s["align"] for s in shots]), **tl_dump)
         thumb_dir = os.path.join(self.workdir, "thumbs")
@@ -611,52 +664,6 @@ class Analyzer:
         with open(os.path.join(self.workdir, "analysis.json"), "w") as f:
             json.dump(summary, f)
         return summary
-
-
-# ----------------------------------------------------------------------------- camera rotation
-def relative_rotation(pair, f, cx, cy):
-    """Camera rotation between two frames from matched background points.
-
-    pair: (n,4) [x1, y1, x2, y2] in full-resolution pixels. Uses a pure-rotation
-    fit when it explains the motion (pan/tilt), otherwise the essential matrix
-    (camera also translating: dolly/crane/handheld)."""
-    p1, p2 = pair[:, :2].astype(np.float64), pair[:, 2:].astype(np.float64)
-    K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
-    b1 = normalize(np.c_[(p1 - [cx, cy]) / f, np.ones(len(p1))])
-    b2 = normalize(np.c_[(p2 - [cx, cy]) / f, np.ones(len(p2))])
-
-    def kabsch(m):
-        M = b2[m].T @ b1[m]
-        U, _, Vt = np.linalg.svd(M)
-        dd = np.sign(np.linalg.det(U @ Vt))
-        return U @ np.diag([1, 1, dd]) @ Vt
-
-    def err(R):
-        q = b1 @ R.T
-        q = q[:, :2] / np.maximum(q[:, 2:3], 1e-6) * f + [cx, cy]
-        return np.linalg.norm(q - p2, axis=1)
-
-    m = np.ones(len(p1), bool)
-    for _ in range(3):
-        Rk = kabsch(m)
-        e = err(Rk)
-        thr = max(1.5, np.percentile(e, 60) * 1.5)
-        m = e < thr
-        if m.sum() < 8:
-            break
-    if m.sum() >= 8 and np.median(err(Rk)) < 1.2:
-        return Rk
-    try:
-        E, inl = cv2.findEssentialMat(p1, p2, K, cv2.RANSAC, 0.999, 1.0)
-        if E is not None and E.shape == (3, 3) and inl is not None and inl.sum() >= 12:
-            _, R, t, _ = cv2.recoverPose(E, p1, p2, K, mask=inl.copy())
-            # sanity: a single analysed step should not rotate more than ~20 degrees
-            ang = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))
-            if ang < 20:
-                return R
-    except cv2.error:
-        pass
-    return Rk
 
 
 # ----------------------------------------------------------------------------- identities

@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 
 from .detect import (L_EL, L_INDEX, L_PINKY, L_THUMB, L_WR, R_EL, R_INDEX, R_PINKY, R_THUMB,
-                     R_WR, HandDetector, PoseDetector, WholeBody, box_iou, crop_square, landmark_box)
+                     R_WR, HandDetector, PoseDetector, WholeBody, box_iou, crop_square, landmark_box,
+                     mask_at)
 from .mathutil import gaussian_smooth
 from .video import VideoReader
 
@@ -61,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 2
+CAPTURE_VERSION = 3
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -84,6 +85,68 @@ def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
                 top = boxes[s + i, 1]
                 out[s + i] = [cx - ww / 2, top, cx + ww / 2, top + ref]
     return out
+
+
+def extend_at_edges(boxes, segs, shot_of, W, H, fps, max_s=1.0, min_in=0.08):
+    """A character walking out of (or into) the picture is lost by the person
+    tracker while part of them is still visible: a foot, a hand. Where a track
+    ends (or starts) with its box at the edge of the picture, the box carries on
+    along its last motion for up to max_s, while at least min_in of it is still
+    inside the picture, so the visible part is still captured. It is the same
+    character by continuity; whatever is not in the picture is not animated."""
+    out = boxes.copy()
+    N = len(boxes)
+    taken = ~np.isnan(boxes[:, 0])
+    K = max(1, int(round(max_s * fps)))
+    L = max(2, int(round(0.3 * fps)))
+    m = 0.02 * max(W, H)
+
+    def inside_frac(b):
+        iw = max(0.0, min(b[2], W) - max(b[0], 0))
+        ih = max(0.0, min(b[3], H) - max(b[1], 0))
+        a = max((b[2] - b[0]) * (b[3] - b[1]), 1e-6)
+        return iw * ih / a
+
+    def at_edge(b):
+        return b[0] < m or b[1] < m or b[2] > W - m or b[3] > H - m
+    new = []
+    for (s, e) in segs:
+        for direction in (1, -1):
+            if direction == 1:
+                ref = boxes[max(s, e - L):e]
+                f, last = e, boxes[e - 1]
+            else:
+                ref = boxes[s:min(e, s + L)][::-1]
+                f, last = s - 1, boxes[s]
+            if len(ref) < 2 or not at_edge(last):
+                continue
+            v = (ref[-1] - ref[0]) / (len(ref) - 1)
+            v[[1, 3]] = 0.0 if abs(v[1] + v[3]) < abs(v[0] + v[2]) else v[[1, 3]]
+            b = last.copy()
+            k = 0
+            while 0 <= f < N and k < K and not taken[f] and shot_of[f] == shot_of[s]:
+                b = b + v
+                if inside_frac(b) < min_in:
+                    break
+                out[f] = b
+                taken[f] = True
+                new.append(f)
+                f += direction
+                k += 1
+    if not new:
+        return out, segs
+    valid = ~np.isnan(out[:, 0])
+    segs2 = []
+    f = 0
+    while f < N:
+        if not valid[f]:
+            f += 1
+            continue
+        s0 = f
+        while f < N and valid[f] and shot_of[f] == shot_of[s0]:
+            f += 1
+        segs2.append((s0, f))
+    return out, segs2
 
 
 def _hand_attempts(lm2d, side):
@@ -147,10 +210,12 @@ def process_chunk(args):
     hs = np.zeros((n, 2), np.float32)
     wb2d = np.zeros((n, 133, 2), np.float32)
     wbs = np.zeros((n, 133), np.float32)
+    wbz = np.zeros((n, 133), np.float16)
     wbody = WholeBody(wb_path) if wb_path else None
     wb_stride = max(1, int(round(fps / 30.0)))
     hc = np.zeros((n, 2, 2), np.float32)
-    pose = PoseDetector(heavy=True, num_poses=1, video=True, min_conf=0.3)
+    seg = np.full((n, 33), -1.0, np.float32)  # person mask at each landmark (-1: unknown)
+    pose = PoseDetector(heavy=True, num_poses=1, video=True, min_conf=0.3, masks=True)
     pose_img = None
     hand = HandDetector(min_conf=0.2)
     rd = VideoReader(video)
@@ -168,9 +233,12 @@ def process_chunk(args):
         if not ok:
             # the video-mode tracker can lose the person; retry stateless
             if pose_img is None:
-                pose_img = PoseDetector(heavy=True, num_poses=1, video=False, min_conf=0.25)
+                pose_img = PoseDetector(heavy=True, num_poses=1, video=False, min_conf=0.25, masks=True)
             res = pose_img.detect(crop, x0, y0, sc, sc)
             ok = bool(res) and box_iou(landmark_box(res[0].lm2d, res[0].vis), b) > 0.2
+            mask = pose_img.last_mask
+        else:
+            mask = pose.last_mask
         if wbody is not None and (fi % wb_stride == 0 or i == n - 1):
             # (above 30 fps the whole-body model runs on every 2nd frame; the
             # gaps are interpolated, joints barely move in 1/60 s)
@@ -180,11 +248,14 @@ def process_chunk(args):
                 lb = landmark_box(res[0].lm2d, res[0].vis)
                 bb = np.array([min(bb[0], lb[0]), min(bb[1], lb[1]), max(bb[2], lb[2]), max(bb[3], lb[3])])
             wb2d[i], wbs[i] = wbody.detect(rgb, bb)
+            wbz[i] = wbody.last_z
         if not ok:
             prev_hand = [None, None]
             continue
         r = res[0]
         lm2d[i], vis[i], world[i] = r.lm2d, r.vis, r.world
+        if mask is not None:  # is the person (and not something in front) at each joint?
+            seg[i] = mask_at(mask, r.lm2d, x0, y0, sc)
         cropc[i] = (x0 + 256 * sc, y0 + 256 * sc)
         L = r.lm2d
         unit = max(float(np.linalg.norm(L[11] - L[12])),
@@ -217,7 +288,7 @@ def process_chunk(args):
     if pose_img is not None:
         pose_img.close()
     np.savez_compressed(out_path + ".tmp.npz", lm2d=lm2d, vis=vis, world=world, cropc=cropc,
-                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs)
+                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs, wbz=wbz, seg=seg)
     os.replace(out_path + ".tmp.npz", out_path)
     return out_path
 
@@ -228,6 +299,8 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     A, boxes, segs = character_boxes(workdir, char_id)
     N, fps = A["frames"], A["fps"]
     boxes = stabilize_boxes(boxes, segs, fps)
+    npz = np.load(os.path.join(workdir, "analysis.npz"))
+    boxes, segs = extend_at_edges(boxes, segs, npz["shot_of"], A["width"], A["height"], fps)
     cdir = os.path.join(workdir, f"capture_c{char_id}")
     os.makedirs(cdir, exist_ok=True)
     from .detect import ensure_model
@@ -266,6 +339,7 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         "h2d": np.zeros((N, 2, 21, 2), np.float32), "hw": np.zeros((N, 2, 21, 3), np.float32),
         "hs": np.zeros((N, 2), np.float32), "hc": np.zeros((N, 2, 2), np.float32),
         "wb2d": np.zeros((N, 133, 2), np.float32), "wbs": np.zeros((N, 133), np.float32),
+        "seg": np.full((N, 33), -1.0, np.float32), "wbz": np.zeros((N, 133), np.float16),
     }
     for j in jobs:
         d = np.load(j[5])
@@ -273,11 +347,11 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
             out[k][j[1]:j[2]] = d[k]
     out["tracked"] = ~np.isnan(boxes[:, 0])
     out["version"] = np.array(CAPTURE_VERSION)
-    fill_wholebody_gaps(out["wb2d"], out["wbs"], [(j[1], j[2]) for j in jobs])
+    fill_wholebody_gaps(out["wb2d"], out["wbs"], [(j[1], j[2]) for j in jobs], wbz=out["wbz"])
     return out
 
 
-def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3):
+def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3, wbz=None):
     """Interpolate the whole-body keypoints over the frames it was not run on."""
     for s, e in ranges:
         have = np.where(wbs[s:e].any(1))[0] + s
@@ -287,3 +361,5 @@ def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3):
                     t = (f - a) / (b - a)
                     wb2d[f] = (1 - t) * wb2d[a] + t * wb2d[b]
                     wbs[f] = np.minimum(wbs[a], wbs[b])
+                    if wbz is not None:
+                        wbz[f] = (1 - t) * wbz[a].astype(np.float32) + t * wbz[b].astype(np.float32)

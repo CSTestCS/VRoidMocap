@@ -5,7 +5,7 @@ Double-clicking the .exe opens the app window. Command line use:
   VRoidMocap.exe                         open the app
   VRoidMocap.exe --browser               use the default web browser instead of a window
   VRoidMocap.exe analyze VIDEO           pass 1 only (prints the characters found)
-  VRoidMocap.exe capture VIDEO VRM CHAR OUT.fbx [--in-place]
+  VRoidMocap.exe capture VIDEO AVATAR(.vrm|.fbx) CHAR OUT.fbx [--in-place]
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class Api:
     def pick_file(self, kind):
         import webview
         types = ("Video files (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.wmv)", "All files (*.*)") \
-            if kind == "video" else ("VRM avatar (*.vrm)", "All files (*.*)")
+            if kind == "video" else ("Avatar (*.vrm;*.fbx)", "VRM avatar (*.vrm)", "FBX character (*.fbx)", "All files (*.*)")
         res = self.window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False, file_types=types)
         if not res:
             return None

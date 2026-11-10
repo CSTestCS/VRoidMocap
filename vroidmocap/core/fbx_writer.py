@@ -69,7 +69,7 @@ class Elem:
             return c + struct.pack("<d", v)
         if code in "SR":
             return c + struct.pack("<I", len(v)) + v
-        if code in "fdli":
+        if code in "fdlib":
             raw = np.ascontiguousarray(v).tobytes()
             if len(raw) > 128:
                 comp = zlib.compress(raw, 6)
@@ -182,27 +182,8 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
     conns.child("C", "OO", ("L", layer_id), ("L", stack_id))
     key_times = (np.arange(frames_count, dtype=np.int64) * KTIME / fps).round().astype(np.int64)
 
-    def add_curves(model_id, prop, data, kind):
-        cn_id = new_id()
-        cn = objects.child("AnimationCurveNode", ("L", cn_id), name_class(kind, "AnimCurveNode"), "")
-        cp = cn.child("Properties70")
-        for ax, k in enumerate("XYZ"):
-            P(cp, f"d|{k}", "Number", "", "A", float(data[0, ax]))
-        counts["AnimationCurveNode"] += 1
-        conns.child("C", "OO", ("L", cn_id), ("L", layer_id))
-        conns.child("C", "OP", ("L", cn_id), ("L", model_id), prop)
-        for ax, k in enumerate("XYZ"):
-            cid = new_id()
-            ac = objects.child("AnimationCurve", ("L", cid), name_class("", "AnimCurve"), "")
-            ac.child("Default", float(data[0, ax]))
-            ac.child("KeyVer", 4008)
-            ac.child("KeyTime", key_times)
-            ac.child("KeyValueFloat", data[:, ax].astype(np.float32))
-            ac.child("KeyAttrFlags", np.array([1 << 2 | 1 << 8 | 1 << 13 | 1 << 14], np.int32))
-            ac.child("KeyAttrDataFloat", np.array([0.0, 0.0, 9.419963346924634e-30, 0.0], np.float32))
-            ac.child("KeyAttrRefCount", np.array([frames_count], np.int32))
-            counts["AnimationCurve"] += 1
-            conns.child("C", "OP", ("L", cid), ("L", cn_id), f"d|{k}")
+    aw = AnimWriter(objects, conns, counts, new_id, layer_id, key_times)
+    add_curves = aw.curves
 
     ids = []
     for nd in nodes:
@@ -239,6 +220,84 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
             add_curves(mid, "Lcl Rotation", nd["anim_r"], "R")
 
     if camera is not None:
+        aw.camera(camera)
+
+    if model is not None:
+        _write_model(model, objects, conns, counts, ids, new_id)
+
+    defs = root.child("Definitions")
+    defs.child("Version", 100)
+    defs.child("Count", 1 + sum(counts.values()))
+    defs.child("ObjectType", "GlobalSettings").child("Count", 1)
+    for k, v in counts.items():
+        if v:
+            defs.child("ObjectType", k).child("Count", v)
+    root.children.append(objects)
+    root.children.append(conns)
+    takes = root.child("Takes")
+    takes.child("Current", take_name)
+    tk = takes.child("Take", take_name)
+    tk.child("FileName", take_name.replace(" ", "_") + ".tak")
+    tk.child("LocalTime", ("L", 0), ("L", t_stop))
+    tk.child("ReferenceTime", ("L", 0), ("L", t_stop))
+
+    encode_file(root, path)
+
+
+def encode_file(root, path, version=7400):
+    """Write a node tree (root.children = top-level sections) as binary FBX."""
+    out = bytearray(b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", version))
+    pos = len(out)
+    for i, ch in enumerate(root.children):
+        b = ch.encode(pos, i == len(root.children) - 1)
+        out += b
+        pos += len(b)
+    out += SENTINEL
+    out += _FOOT_ID + b"\0" * 4
+    pad = ((len(out) + 15) & ~15) - len(out)
+    out += b"\0" * (pad if pad else 16)
+    out += struct.pack("<I", version) + b"\0" * 120
+    out += b"\xf8\x5a\x8c\x6a\xde\xf5\xd9\x7e\xec\xe9\x0c\xe3\x75\x8f\x29\x0b"
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+class AnimWriter:
+    """Adds baked animation curves (and an animated camera) to an FBX tree."""
+
+    def __init__(self, objects, conns, counts, new_id, layer_id, key_times):
+        self.objects, self.conns, self.counts = objects, conns, counts
+        self.new_id, self.layer_id, self.key_times = new_id, layer_id, key_times
+
+    def curves(self, model_id, prop, data, kind):
+        objects, conns, counts, new_id = self.objects, self.conns, self.counts, self.new_id
+        key_times, frames_count = self.key_times, len(self.key_times)
+        cn_id = new_id()
+        cn = objects.child("AnimationCurveNode", ("L", cn_id), name_class(kind, "AnimCurveNode"), "")
+        cp = cn.child("Properties70")
+        for ax, k in enumerate("XYZ"):
+            P(cp, f"d|{k}", "Number", "", "A", float(data[0, ax]))
+        counts["AnimationCurveNode"] = counts.get("AnimationCurveNode", 0) + 1
+        conns.child("C", "OO", ("L", cn_id), ("L", self.layer_id))
+        conns.child("C", "OP", ("L", cn_id), ("L", model_id), prop)
+        for ax, k in enumerate("XYZ"):
+            cid = new_id()
+            ac = objects.child("AnimationCurve", ("L", cid), name_class("", "AnimCurve"), "")
+            ac.child("Default", float(data[0, ax]))
+            ac.child("KeyVer", 4008)
+            ac.child("KeyTime", key_times)
+            ac.child("KeyValueFloat", data[:, ax].astype(np.float32))
+            ac.child("KeyAttrFlags", np.array([1 << 2 | 1 << 8 | 1 << 13 | 1 << 14], np.int32))
+            ac.child("KeyAttrDataFloat", np.array([0.0, 0.0, 9.419963346924634e-30, 0.0], np.float32))
+            ac.child("KeyAttrRefCount", np.array([frames_count], np.int32))
+            counts["AnimationCurve"] = counts.get("AnimationCurve", 0) + 1
+            conns.child("C", "OP", ("L", cid), ("L", cn_id), f"d|{k}")
+
+    def camera(self, camera, parent_id=0):
+        """camera: dict(pos (N,3), rot_deg (N,3) Euler XYZ of an FBX camera (looks down +X),
+        vfov (N,) degrees, aspect)."""
+        objects, conns, counts, new_id = self.objects, self.conns, self.counts, self.new_id
+        key_times, frames_count, layer_id = self.key_times, len(self.key_times), self.layer_id
         aid, mid = new_id(), new_id()
         ca = objects.child("NodeAttribute", ("L", aid), name_class("VideoCamera", "NodeAttribute"), "Camera")
         cp = ca.child("Properties70")
@@ -269,7 +328,7 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
         ca.child("ShowAudio", 0)
         ca.child("AudioColor", 0.0, 1.0, 0.0)
         ca.child("CameraOrthoZoom", 1.0)
-        counts["NodeAttribute"] += 1
+        counts["NodeAttribute"] = counts.get("NodeAttribute", 0) + 1
         m = objects.child("Model", ("L", mid), name_class("VideoCamera", "Model"), "Camera")
         m.child("Version", 232)
         mp = m.child("Properties70")
@@ -281,16 +340,16 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
         P(mp, "Lcl Scaling", "Lcl Scaling", "", "A", 1.0, 1.0, 1.0)
         m.child("Shading", True)
         m.child("Culling", "CullingOff")
-        counts["Model"] += 1
+        counts["Model"] = counts.get("Model", 0) + 1
         conns.child("C", "OO", ("L", aid), ("L", mid))
-        conns.child("C", "OO", ("L", mid), ("L", 0))
-        add_curves(mid, "Lcl Translation", camera["pos"], "T")
-        add_curves(mid, "Lcl Rotation", camera["rot_deg"], "R")
+        conns.child("C", "OO", ("L", mid), ("L", parent_id))
+        self.curves(mid, "Lcl Translation", camera["pos"], "T")
+        self.curves(mid, "Lcl Rotation", camera["rot_deg"], "R")
         # animated lens (changes between shots / zooms)
         cn_id = new_id()
         cn = objects.child("AnimationCurveNode", ("L", cn_id), name_class("FocalLength", "AnimCurveNode"), "")
         P(cn.child("Properties70"), "d|FocalLength", "Number", "", "A", float(focal_mm[0]))
-        counts["AnimationCurveNode"] += 1
+        counts["AnimationCurveNode"] = counts.get("AnimationCurveNode", 0) + 1
         conns.child("C", "OO", ("L", cn_id), ("L", layer_id))
         conns.child("C", "OP", ("L", cn_id), ("L", aid), "FocalLength")
         cid = new_id()
@@ -302,42 +361,9 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
         ac.child("KeyAttrFlags", np.array([1 << 1], np.int32))  # constant (lens cuts between shots)
         ac.child("KeyAttrDataFloat", np.array([0.0, 0.0, 9.419963346924634e-30, 0.0], np.float32))
         ac.child("KeyAttrRefCount", np.array([frames_count], np.int32))
-        counts["AnimationCurve"] += 1
+        counts["AnimationCurve"] = counts.get("AnimationCurve", 0) + 1
         conns.child("C", "OP", ("L", cid), ("L", cn_id), "d|FocalLength")
-
-    if model is not None:
-        _write_model(model, objects, conns, counts, ids, new_id)
-
-    defs = root.child("Definitions")
-    defs.child("Version", 100)
-    defs.child("Count", 1 + sum(counts.values()))
-    defs.child("ObjectType", "GlobalSettings").child("Count", 1)
-    for k, v in counts.items():
-        if v:
-            defs.child("ObjectType", k).child("Count", v)
-    root.children.append(objects)
-    root.children.append(conns)
-    takes = root.child("Takes")
-    takes.child("Current", take_name)
-    tk = takes.child("Take", take_name)
-    tk.child("FileName", take_name.replace(" ", "_") + ".tak")
-    tk.child("LocalTime", ("L", 0), ("L", t_stop))
-    tk.child("ReferenceTime", ("L", 0), ("L", t_stop))
-
-    out = bytearray(b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", 7400))
-    pos = len(out)
-    for i, ch in enumerate(root.children):
-        b = ch.encode(pos, i == len(root.children) - 1)
-        out += b
-        pos += len(b)
-    out += SENTINEL
-    out += _FOOT_ID + b"\0" * 4
-    pad = ((len(out) + 15) & ~15) - len(out)
-    out += b"\0" * (pad if pad else 16)
-    out += struct.pack("<I", 7400) + b"\0" * 120
-    out += b"\xf8\x5a\x8c\x6a\xde\xf5\xd9\x7e\xec\xe9\x0c\xe3\x75\x8f\x29\x0b"
-    with open(path, "wb") as f:
-        f.write(out)
+        return mid
 
 
 def _mat16(m):
