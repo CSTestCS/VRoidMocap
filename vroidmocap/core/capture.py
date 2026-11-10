@@ -123,6 +123,7 @@ def process_chunk(args):
     wb2d = np.zeros((n, 133, 2), np.float32)
     wbs = np.zeros((n, 133), np.float32)
     wbody = WholeBody(wb_path) if wb_path else None
+    wb_stride = max(1, int(round(fps / 30.0)))
     hc = np.zeros((n, 2, 2), np.float32)
     pose = PoseDetector(heavy=True, num_poses=1, video=True, min_conf=0.3)
     pose_img = None
@@ -145,7 +146,9 @@ def process_chunk(args):
                 pose_img = PoseDetector(heavy=True, num_poses=1, video=False, min_conf=0.25)
             res = pose_img.detect(crop, x0, y0, sc, sc)
             ok = bool(res) and box_iou(landmark_box(res[0].lm2d, res[0].vis), b) > 0.2
-        if wbody is not None:
+        if wbody is not None and (fi % wb_stride == 0 or i == n - 1):
+            # (above 30 fps the whole-body model runs on every 2nd frame; the
+            # gaps are interpolated, joints barely move in 1/60 s)
             # box: the tracked box, widened by the body model's own landmarks
             bb = np.array(b, float)
             if ok:
@@ -243,4 +246,17 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         for k in out:
             out[k][j[1]:j[2]] = d[k]
     out["tracked"] = ~np.isnan(boxes[:, 0])
+    fill_wholebody_gaps(out["wb2d"], out["wbs"], [(j[1], j[2]) for j in jobs])
     return out
+
+
+def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3):
+    """Interpolate the whole-body keypoints over the frames it was not run on."""
+    for s, e in ranges:
+        have = np.where(wbs[s:e].any(1))[0] + s
+        for a, b in zip(have[:-1], have[1:]):
+            if 1 < b - a <= max_gap:
+                for f in range(a + 1, b):
+                    t = (f - a) / (b - a)
+                    wb2d[f] = (1 - t) * wb2d[a] + t * wb2d[b]
+                    wbs[f] = np.minimum(wbs[a], wbs[b])

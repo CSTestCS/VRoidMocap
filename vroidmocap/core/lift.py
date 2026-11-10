@@ -51,9 +51,12 @@ SIG2D = np.array([0.02, 0.02, 0.012, 0.012, 0.012, 0.012, 0.025, 0.025, 0.012, 0
                   0.02, 0.02, 0.02, 0.02])
 SIG_Z = 0.08
 W_KNEE = 60.0
+W_FOOT = 20.0
+FOOT_CHOICE = True
 W_ELBOW = 10.0
 SIG_D = 0.02    # how well a bone's apparent length is known (detection error)
 SIG_BZ = 0.05   # learned depth difference along one bone
+TORSO_WZ = 4.0   # extra trust in the learned depth of shoulders and hips
 SIG_ROOT = 0.02  # relative uncertainty of the character's distance
 # limbs: (root joint, middle, end, is_leg, side sign)
 LIMBS = [(L_SH, L_EL, L_WR, False), (R_SH, R_EL, R_WR, False),
@@ -218,6 +221,27 @@ def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps):
     return M[ar, st], E[ar, st]
 
 
+def _foot_choice(X, rays, zrel, conf, L, ank, heel, toe, fps):
+    """Towards/away for the toes of one foot (then the heel to fit): a foot
+    points forwards-ish as seen from the pelvis, never backwards. Returns
+    (heel, toe) positions (n,3)."""
+    n = len(X)
+    A = X[:, JI[ank]]
+    e_at, e_ah, e_ht = EDGES.index((JI[ank], JI[toe])), EDGES.index((JI[ank], JI[heel])), EDGES.index((JI[heel], JI[toe]))
+    ct, cost = _two_roots(A, rays[:, JI[toe]], L[e_at], zrel[:, JI[toe]] - zrel[:, JI[ank]])
+    F, _ = _facing(X)
+    d = normalize(ct - A[:, None])
+    unary = np.minimum(cost, 12.0) * conf[:, JI[toe], None] + \
+        W_FOOT * np.maximum(-np.sum(d * F[:, None], -1) - 0.2, 0.0) ** 2
+    k = (fps / 30.0 / 0.35) ** 2
+    st = _viterbi(unary, lambda f: k * np.sum((d[f][:, None] - d[f - 1][None]) ** 2, -1), n, 2)
+    T = ct[np.arange(n), st]
+    ch, cost_h = _two_roots(A, rays[:, JI[heel]], L[e_ah], zrel[:, JI[heel]] - zrel[:, JI[ank]])
+    fit = ((np.linalg.norm(ch - T[:, None], axis=-1) - L[e_ht]) / SIG_D) ** 2 + np.minimum(cost_h, 12.0)
+    Hh = ch[np.arange(n), np.argmin(fit, 1)]
+    return Hh, T
+
+
 def _gauss_newton(X, uv, w2d, zp, wz, L, focal, cx, cy, fps, zroot, iters=10):
     """Refine all joints of a segment together. X: (n,J,3)."""
     n, J, _ = X.shape
@@ -327,6 +351,7 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
     zroot = hip0[:, 2].copy()
     zrel = P0[:, idx, 2] - zroot[:, None]
     wz = np.ones_like(zrel)
+    wz[:, [JI[L_SH], JI[R_SH], JI[L_HIP], JI[R_HIP]]] = TORSO_WZ
     if z_extra is not None:
         ze = z_extra[:, idx]
         has = np.isfinite(ze)
@@ -375,9 +400,17 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
             zr = zrel[sl]
             zr[:, JI[mid]] = zr[:, JI[root]] + (M[:, 2] - X[:, JI[root], 2])
             zr[:, JI[end]] = zr[:, JI[mid]] + (E[:, 2] - M[:, 2])
-            if is_leg:  # the foot moves with the ankle
-                for j in ((L_HEEL, L_FOOT) if end == L_ANK else (R_HEEL, R_FOOT)):
+            if is_leg:  # the foot moves with the ankle, then gets its own towards/away choice
+                heel, toe = (L_HEEL, L_FOOT) if end == L_ANK else (R_HEEL, R_FOOT)
+                for j in (heel, toe):
                     X[:, JI[j]] += dE
+                ok_f = all(np.isfinite(L[EDGES.index(pr)]) for pr in
+                           ((JI[end], JI[toe]), (JI[end], JI[heel]), (JI[heel], JI[toe])))
+                if ok_f and FOOT_CHOICE:
+                    Hh, Tt = _foot_choice(X, rays, zrel[sl], cj[sl], L, end, heel, toe, fps)
+                    X[:, JI[heel]], X[:, JI[toe]] = Hh, Tt
+                    zr[:, JI[heel]] = zr[:, JI[end]] + (Hh[:, 2] - E[:, 2])
+                    zr[:, JI[toe]] = zr[:, JI[end]] + (Tt[:, 2] - E[:, 2])
         X = _gauss_newton(X, *args, iters=10)
         P[sl, idx] = X
         if progress:

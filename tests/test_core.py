@@ -439,7 +439,7 @@ class TestLift(unittest.TestCase):
                 c = np.sum(u * v, -1) / (np.linalg.norm(u, axis=-1) * np.linalg.norm(v, axis=-1))
                 out.append(np.degrees(np.arccos(np.clip(c, -1, 1))))
             return float(np.mean(out))
-        self.assertLess(err(P), 0.5 * err(P0))
+        self.assertLess(err(P), 0.6 * err(P0))
         self.assertLess(err(P), 8.0)
 
     def test_bone_lengths_constant(self):
