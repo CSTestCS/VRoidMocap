@@ -16,6 +16,11 @@ import sys
 import time
 import webbrowser
 
+# numpy's linear algebra on many threads is much slower for the small systems
+# solved here (camera bundle adjustment): one thread each (set before numpy loads)
+for _v in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 
 class Api:
     """Functions callable from the page as window.pywebview.api.*"""
