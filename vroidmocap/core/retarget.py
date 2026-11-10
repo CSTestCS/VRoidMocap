@@ -624,11 +624,18 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     use_sh = ~root_seen & sh_seen
     ref_cam = np.where(use_sh[:, None], (P[:, L_SH] + P[:, R_SH]) / 2, T)
     ref_av = np.where(use_sh[:, None], shc_avatar, hipc_avatar)
-    have = valid & (root_seen | sh_seen) & np.isfinite(ref_cam).all(1)
+    # (neither seen, e.g. only the legs in the picture: the solved hip position)
+    have = valid & np.isfinite(ref_cam).all(1)
     cam_raw = ref_av - scale * np.einsum("nij,nj->ni", R_w, np.nan_to_num(ref_cam))
-    cam_raw = interp_gaps(cam_raw, have) if have.any() else cam_raw
-    for (s0, e0) in runs(np.ones(N, bool), shot_of):
-        cam_raw[s0:e0] = gaussian_smooth(cam_raw[s0:e0], 2.0 * fps / 30.0, valid=have[s0:e0])
+    for (s0, e0) in runs(np.ones(N, bool), shot_of):  # gaps are bridged within a shot only
+        h0 = have[s0:e0]
+        if h0.any():
+            cam_raw[s0:e0] = interp_gaps(cam_raw[s0:e0], h0)
+            cam_raw[s0:e0] = gaussian_smooth(cam_raw[s0:e0], 2.0 * fps / 30.0, valid=h0)
+            have[s0:e0] = True
+    # shots in which the character is never seen: keep the nearest framing
+    if have.any() and not have.all():
+        cam_raw = interp_gaps(cam_raw, have)
     cam_pos = stabilize_camera(cam_raw, static, shot_of, fps)
     cam_quat = mat_to_quat(R_w @ cam.D)
     cam_vfov = np.array([cam.vfov_from_focal(fv, H) for fv in focal])
