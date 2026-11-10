@@ -71,6 +71,9 @@ def wrap(a):
 
 
 # ----------------------------------------------------------------------------- temporal filtering
+ACC_REF = np.radians(2.0)  # deviation from steady motion (per (frame at 30 fps)^2) where light smoothing takes over
+
+
 def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength=None):
     """Q: (N,B,4) local quats, conf: (N,B) 0..1. Returns filtered Q (N,B,4).
 
@@ -85,7 +88,6 @@ def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength
     nb = max(1, int(round(blend_s * fps)))
     sig_h = (0.5 + 1.5 * max(0.0, smoothing)) * fs
     sig_l = (0.25 * max(0.0, smoothing)) * fs
-    v_ref = np.radians(150.0) / fps  # rad/frame where the light filter takes over
     for b in range(B):
         mult = 1.0 if strength is None else float(strength[b])
         sh_b, sl_b = sig_h * mult, sig_l * mult
@@ -131,12 +133,17 @@ def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength
         # motion-adaptive zero-phase smoothing
         heavy = normalize(gaussian_smooth(full, sh_b, valid=w > 0.05))
         light = normalize(gaussian_smooth(full, sl_b, valid=w > 0.05)) if sl_b > 0.05 else full
-        # speed of the underlying motion (from the heavy filter: noise must not
-        # count as motion, or it would switch the smoothing off)
-        speed = np.zeros(N)
-        speed[1:] = q_angle(heavy[1:], heavy[:-1])
-        speed = gaussian_smooth(speed, 2 * fs)
-        alpha = np.clip(speed / v_ref, 0, 1)[:, None]
+        # where the underlying motion changes abruptly (a hit, the start or end
+        # of a spin) the light filter takes over; steady motion, however fast
+        # (a spin), keeps the heavy filter, which follows constant speed exactly.
+        # Measured on the heavy filter so that noise does not count as motion.
+        k = max(1, int(round(sh_b)))
+        dev = np.zeros(N)
+        if N > 2 * k:
+            mid = normalize(heavy[:-2 * k] + heavy[2 * k:])
+            dev[k:-k] = q_angle(heavy[k:-k], mid)
+        dev = gaussian_smooth(dev, 2 * fs)
+        alpha = np.clip(dev / (ACC_REF * (k / fs) ** 2), 0, 1)[:, None]
         res = normalize(heavy * (1 - alpha) + light * alpha)
         out[:, b] = res
     return out

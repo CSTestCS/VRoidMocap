@@ -100,6 +100,34 @@ its far end, pointing towards the camera or away from it. The solve
 5. **Which way is up** is taken per shot from the reconstructed legs, which
    gives the camera's tilt (high and low camera angles).
 
+### Which way the body faces (turns, side and back views)
+
+The hardest part of a turn is telling which way the chest and pelvis face,
+and detectors often swap left and right in back views. `facing.py` tracks
+the chest and the pelvis separately, frame by frame, from several clues:
+
+* how wide the shoulders / hips look compared with their real width,
+* which side of the picture the character's left is on (with a state for
+  "labels swapped", so a detector's left/right mix-up is recognised),
+* the nose sits in front of the neck (which way the head and chest turn),
+* whether a face can be seen at all (front or back),
+* bent knees and toes point forwards,
+* the pose model's own 3D guess (allowing for its typical front/back mistake).
+
+The cheapest sequence that turns smoothly is chosen over each shot. The
+result sets how much deeper one shoulder / hip is than the other in the 3D
+solve, fixes swapped left/right labels, and turns the pose model's depth the
+right way round. The **spine** then carries the twist between pelvis and
+chest, spread over spine, chest and upper chest. A single frame that
+contradicts everything around it is not used for the pose.
+
+### Head
+
+The head's turn, nod and tilt are fitted to the 68 face points of the
+whole-body model (`head.py`: the 3D layout of an anime face, fitted with
+perspective). This is only used while the face is really visible; seen from
+behind, the head holds its pose relative to the neck.
+
 ## How the motion is cleaned up
 
 * **Camera cuts are found on every frame.** A cut is a sudden one- or
@@ -110,12 +138,12 @@ its far end, pointing towards the camera or away from it. The solve
   cloned camera is locked (fixed position and rotation). The character moves
   within that fixed view: across the image it follows the video exactly, while
   depth is corrected only while the feet are free, so planted feet never slide.
-* **Spins.** During spins the pose model can swap the character's left and
-  right or flip front and back. Every frame is read four ways (as detected,
-  sides swapped, depth mirrored, both) and the sequence whose body turns
-  smoothly is chosen.
+* **Spins and back views.** See *Which way the body faces* above.
 * **Unseen bones freeze.** A bone (or the whole character) that is not seen
   holds its last seen pose, then blends into the next seen pose over 0.2 s.
+  "Seen" counts both detectors, and a joint that the whole-body model puts on
+  the edge of the picture (it does that with joints outside it) only counts as
+  seen if MediaPipe sees it too.
 * **No flips.** Single-frame spikes are rejected. Palm vs back-of-hand and
   the two possible depths of every elbow, wrist, knee and ankle are resolved
   over time. Finger joints that appear bent backwards are mirrored forward.
@@ -127,28 +155,40 @@ its far end, pointing towards the camera or away from it. The solve
   * Forearm twist stays within its natural range. Wrists, fingers, thumbs,
     spine, neck and feet stay within joint limits.
   * The skeleton is never changed; only rotations are corrected.
-* **Smoothing** is motion-adaptive and zero-phase: strong where a bone is
-  nearly still, light during fast moves.
+* **Smoothing** is zero-phase and adapts to the motion: strong where a bone
+  is still or moves steadily (a spin keeps its speed and is smoothed fully),
+  light only where the motion changes abruptly (a hit, the start or end of a
+  spin).
 
 ## Accuracy
 
-Measured against ground truth: the sample avatar is rendered with a known
-animation and known cameras (1080p, four shots: frontal, high angle with a
-turn, orbiting camera, close-up), the app captures that video, and the result
-is compared bone by bone in 3D.
+Measured against ground truth (`scripts/benchmark`): the sample avatar is
+rendered with a known animation and known cameras, the app captures that
+video, and the result is compared bone by bone in 3D.
 
-| | before | now |
+**Turning test** (dance with the whole body turned: a slow full turn, then
+side and back views and two fast spins; 1080p):
+
+| | previous version | now |
 |---|---|---|
-| limb direction error in 3D, frontal shot (mean / median) | 16.0° / 10.5° | 13.8° / 9.3° |
-| limb direction error in 3D, orbiting camera | 14.2° / 12.0° | 10.3° / 8.7° |
-| limb direction error in 3D, close-up | 30.3° / 27.0° | 22.1° / 12.6° |
-| joint position error, orbiting camera (mean) | 6.4 cm | 4.9 cm |
-| camera tilt error (frontal / high angle / orbit) | 3.5° / 17.5° / 7.1° | 2.0° / 10.1° / 6.1° |
-| frames of the high-angle turn that are tracked | 32% | 94% |
-| joint position in the picture (median, 1080p) | 12 to 15 px | 6 to 8 px |
+| chest facing error, spins (mean / frames > 45° off) | 25.6° / 18% | 9.4° / 1% |
+| pelvis facing error, spins | 21.4° / 9% | 12.0° / 0% |
+| head facing error, spins | 31.1° / 10% | 16.5° / 0% |
+| spine twist error, spins | 16.6° | 7.1° |
+| thigh twist error, spins | 22° | 12° |
+| jitter, spins (truth: 0.58) | 1.19 cm/frame² | 0.78 cm/frame² |
+| joint position error, spins / slow turn | 11.7 / 8.1 cm | 8.9 / 7.8 cm |
 
-In the picture the result lines up closely with the video; the remaining
-error is depth.
+**Earlier test** (frontal, high angle, orbiting camera, close-up):
+
+| | previous version | now |
+|---|---|---|
+| head orientation error (per shot) | 27 / 34 / 21 / 24° | 11 / 20 / 14 / 10° |
+| pelvis facing error, high angle / close-up | 17.4° / 27.4° | 10.6° / 13.7° |
+| joint position error, high angle | 14.5 cm | 11.4 cm |
+
+On the sample dance video: rotation jitter (99th percentile) 4.9 → 2.7
+°/frame², worst single-frame jump 88° → 59°.
 
 Honest limits of single-camera capture:
 * **Depth** is inferred, not measured. A limb that points only slightly
@@ -156,8 +196,13 @@ Honest limits of single-camera capture:
   (about 6% of limbs are more than 45° off in the test above).
 * **Hidden limbs** (behind the body, outside the picture) are held in their
   last seen pose.
-* **Fingers:** in a full-body shot a hand is about 40 pixels. Finger bones are
-  within roughly 30° of the truth; in close-ups they are better.
+* **Hands:** in a full-body shot a hand is about 40 pixels. Whether the palm
+  or the back of the hand faces the camera is read correctly only about 75%
+  of the time, so forearm twist and hand orientation are the least reliable
+  part. Finger bones are within roughly 30° of the truth; in close-ups they
+  are better.
+* **Upper-arm twist** of a nearly straight arm cannot be seen (only the
+  hand shows it); it follows the last bent position.
 * **Field of view** cannot be measured from a single view of a person; it is
   estimated, which affects how far away the cloned camera stands, not the pose.
 * **Proportions:** the avatar receives rotations, not positions, so an avatar
@@ -182,6 +227,8 @@ exe to a release when a `v*` tag is pushed.
 ```
 vroidmocap/core/analysis.py   pass 1: shots, tracking, identities, cameras, heights
 vroidmocap/core/capture.py    pass 2a: per-frame whole-body, body-depth and hand landmarks (parallel)
+vroidmocap/core/facing.py     pass 2b: which way chest and pelvis face (turns, back views, left/right labels)
+vroidmocap/core/head.py       pass 2b: head orientation fitted to the face points
 vroidmocap/core/lift.py       pass 2b: the 3D body solve (bone lengths, towards/away, refinement)
 vroidmocap/core/retarget.py   pass 2c: VRM rotations, root motion, foot IK, cloned camera
 vroidmocap/core/camera.py     camera geometry (focal fit, gravity, rays)

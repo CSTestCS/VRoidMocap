@@ -334,11 +334,34 @@ def _gauss_newton(X, uv, w2d, zp, wz, L, focal, cx, cy, fps, zroot, iters=10):
     return X
 
 
-def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None):
+def apply_torso_facing(zrel, wz, P0, torso):
+    """Depth of the shoulders and hips from the tracked facing angles: the
+    left-right axis is cos(psi) across the picture and sin(psi) in depth."""
+    psi_c, psi_p, r3, view = torso
+    for (a, b), psi in (((L_SH, R_SH), psi_c), ((L_HIP, R_HIP), psi_p)):
+        ok = np.isfinite(psi)
+        width = np.median(np.linalg.norm(P0[ok, a] - P0[ok, b], axis=1)) if ok.any() else 0.3
+        ax = np.cos(psi)[:, None] * r3 + np.sin(psi)[:, None] * view
+        ia, ib = JI[a], JI[b]
+        dz_t = width * ax[:, 2]
+        dz_l = zrel[:, ia] - zrel[:, ib]
+        # where the pose model's own depth agrees with the tracked facing (within
+        # ~0.35 of the width) it is the finer measurement near a frontal view
+        agree = np.abs(dz_l - dz_t) < 0.35 * width
+        dz = 0.5 * np.where(agree, 0.5 * (dz_l + dz_t), dz_t)
+        mid = (zrel[:, ia] + zrel[:, ib]) / 2
+        zrel[:, ia] = np.where(ok, mid + dz, zrel[:, ia])
+        zrel[:, ib] = np.where(ok, mid - dz, zrel[:, ib])
+        wz[ok, ia] = wz[ok, ib] = TORSO_WZ * 2
+
+
+def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None):
     """P0: (N,33,3) rough camera-space landmarks (learned depth, metric root
     distance). uv: (N,33,2) picture positions. conf: (N,33) 0..1.
     z_extra: optional (N,33) second depth opinion relative to the hip centre
     (nan = none). segments: list of (start, end) runs of valid frames.
+    torso: optional (psi_chest, psi_pelvis, r3, view) from facing.track_facing:
+    sets how much deeper the left shoulder / hip is than the right one.
     Returns (P (N,33,3) with the solved joints replaced, lengths dict)."""
     N = len(P0)
     idx = np.array(JOINTS)
@@ -359,6 +382,8 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
     for s, e in segments:
         if e - s >= 3:
             zrel[s:e] = gaussian_smooth(zrel[s:e], 1.5 * fps / 30.0)
+    if torso is not None:
+        apply_torso_facing(zrel, wz, P0, torso)
     # bone lengths and the character's distance depend on each other: alternate.
     # (the overall scale stays that of the rough input)
     z_in = zroot.copy()

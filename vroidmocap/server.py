@@ -63,6 +63,16 @@ class Job:
                 "error": self.error, "done": self.done}
 
 
+def _anim_is_current(path):
+    """An animation saved by an older solver is not used (it is solved again)."""
+    from .core.retarget import SOLVE_VERSION
+    try:
+        with np.load(path) as d:
+            return json.loads(str(d["_meta"])).get("solver") == SOLVE_VERSION
+    except Exception:
+        return False
+
+
 class AppState:
     def __init__(self):
         self.video = None
@@ -133,9 +143,11 @@ class AppState:
             for name in os.listdir(self.workdir):
                 if name.startswith("anim_c") and name.endswith(".npz"):
                     try:
-                        out.add(int(name[6:-4]))
+                        c = int(name[6:-4])
                     except ValueError:
-                        pass
+                        continue
+                    if _anim_is_current(os.path.join(self.workdir, name)):
+                        out.add(c)
         return out
 
     # ------------------------------------------------------------------ jobs
@@ -194,7 +206,7 @@ class AppState:
         if char_id in self.anims:
             return self.anims[char_id]
         p = os.path.join(self.workdir, f"anim_c{char_id}.npz")
-        if not os.path.exists(p):
+        if not os.path.exists(p) or not _anim_is_current(p):
             raise KeyError(char_id)
         d = np.load(p)
         anim = json.loads(str(d["_meta"]))

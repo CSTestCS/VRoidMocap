@@ -25,7 +25,7 @@ import os
 import numpy as np
 
 from . import camera as cam
-from . import lift
+from . import facing, head as headfit, lift
 from .analysis import world_cameras
 from .detect import (L_ANK, L_EAR, L_EL, L_EYE, L_FOOT, L_HEEL, L_HIP, L_INDEX, L_KNEE,
                      L_PINKY, L_SH, L_THUMB, L_WR, MOUTH_L, MOUTH_R, NOSE, R_ANK, R_EAR,
@@ -37,6 +37,8 @@ from .naturalize import Naturalizer, filter_rotations, hold_root
 from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
+# animations saved by an older solver are solved again (the capture is kept)
+SOLVE_VERSION = 5
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -185,9 +187,10 @@ class RigSolver:
             return cand
         return normalize(weight * cand + (1 - weight) * pb)
 
-    def solve(self, J, hands):
+    def solve(self, J, hands, head=None):
         """J: dict of world joint positions (MediaPipe names). hands: [left, right]
-        arrays (21,3) of world hand points or None. Returns {bone: 3x3 global}."""
+        arrays (21,3) of world hand points or None. head: optional 3x3 world head
+        rotation fitted to the face. Returns {bone: 3x3 global}."""
         G = {}
         mid_hip = (J["hipL"] + J["hipR"]) / 2
         mid_sh = (J["shL"] + J["shR"]) / 2
@@ -215,7 +218,7 @@ class RigSolver:
         fwd = J["nose"] - mid_ear
         up1 = normalize(mid_eye - mid_mouth)
         up2 = normalize(np.cross(normalize(fwd), ax))
-        Rh = rot_from_axes(X, Y, ax, normalize(up1 + up2))
+        Rh = rot_from_axes(X, Y, ax, normalize(up1 + up2)) if head is None else head
         relh = top.T @ Rh
         qh = mat_to_quat(relh)
         if self.s.has("neck"):
@@ -377,17 +380,6 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for f in np.where(valid)[0]:
         Rray = cam.ray_rotation(focal[f], cx, cy, *cropc[f])
         Wc[f] = world[f] @ Rray.T
-    # spins: undo left/right label swaps and front/back depth flips
-    view = normalize(np.c_[(cropc[:, 0] - cx) / focal, (cropc[:, 1] - cy) / focal, np.ones(N)])
-    swap, mirror = resolve_body_flips(Wc, lm2d, valid, shot_of, view)
-    vv = view[:, None, :]
-    Wc = np.where(mirror[:, None, None], Wc - 2 * np.sum(Wc * vv, -1, keepdims=True) * vv, Wc)
-    Wc[swap] = Wc[swap][:, LR_PERM]
-    lm2d[swap] = lm2d[swap][:, LR_PERM]
-    vis[swap] = vis[swap][:, LR_PERM]
-    for arr in (h2d, hw, hs, hc):
-        arr[swap] = arr[swap][:, ::-1]
-    hvalid = (hs >= 0.5) & valid[:, None]
     for f in np.where(valid)[0]:
         t = cam.solve_translation(Wc[f], lm2d[f], vis[f] ** 2, focal[f], cx, cy)
         if t is None:
@@ -396,12 +388,40 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             T[f] = t
     if valid.sum() < 2:
         raise RuntimeError("The selected character was not tracked well enough to animate.")
+    # which way the torso faces, frame by frame (this also settles which body
+    # side is which: detectors often swap left and right in back views)
+    wb2d, wbs = capture.get("wb2d"), capture.get("wbs")
+    uv, conf = body_keypoints(lm2d, vis, wb2d, wbs, valid, None, W, H)
+    face_score = face_visibility(wbs, N)
+    psi_c, psi_p, swap, bad = facing.track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid,
+                                                  shot_spans(valid, shot_of), fps)
+    # frames that contradict everything around them (one-frame label swaps,
+    # mis-detections): their bone rotations count as not seen (the pose holds /
+    # blends across them); the position (hip centre) is still used
+    psi_c[bad] = psi_p[bad] = np.nan
+    for arr in (Wc, lm2d, vis, uv, conf):
+        arr[swap] = arr[swap][:, LR_PERM]
+    for arr in (h2d, hw, hs, hc):
+        arr[swap] = arr[swap][:, ::-1]
+    hvalid = (hs >= 0.5) & valid[:, None]
+    # the pose model's 3D guess: where it reads the body the wrong way round
+    # (its usual mistake in back views, psi -> pi - psi, or a plain depth mirror,
+    # psi -> -psi) its depths are reversed: mirror them. Face and hand points
+    # ride along with it.
+    r3, view = facing.lateral_axes(uv, focal, cx, cy)
+    lp_c, _ = facing.learned_psi(Wc, view, r3[:, :2])
+    pc0 = np.nan_to_num(psi_c)
+    mirror = valid & (np.cos(np.pi - lp_c - pc0) > np.cos(lp_c - pc0))
+    vv = view[:, None, :]
+    Wc = np.where(mirror[:, None, None], Wc - 2 * np.sum(Wc * vv, -1, keepdims=True) * vv, Wc)
+    dbg("psi", np.stack([psi_c, psi_p], 1))
+    dbg("swap", swap)
     # ---- 2. body in 3D: bone lengths + picture positions + learned depth, solved over time
-    uv, conf = body_keypoints(lm2d, vis, capture.get("wb2d"), capture.get("wbs"), valid, swap, W, H)
+    body_conf = conf.copy()
     P0 = np.full((N, 33, 3), np.nan)
     P0[valid] = Wc[valid] + T[valid][:, None]
     segs = runs(valid, shot_of)
-    P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps,
+    P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps, torso=(psi_c, psi_p, r3, view),
                              progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
     P[~valid] = np.nan
     T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
@@ -425,6 +445,19 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     static = camera_static_mask(npz["bg_motion"] if "bg_motion" in npz.files else None,
                                 npz["cam_q"].astype(np.float64), shot_of, fps)
     R_w = hold_static_rotation(R_w, static, shot_of)
+
+    # head: fitted to the face points (turn, nod, tilt), in world space
+    Rface, face_q = headfit.head_from_face(wb2d, wbs, focal, cx, cy, valid)
+    # a face "seen" on the back of the head is the detector guessing: only trust
+    # the fit while the chest is not turned away and the head is turned at most
+    # ~75 degrees from the chest
+    fz = Rface[:, :, 2]
+    yaw_h = np.arctan2(np.sum(fz * r3, 1), -np.sum(fz * view, 1))
+    turned_away = ~np.isfinite(psi_c) | (np.cos(np.nan_to_num(psi_c)) < np.cos(np.radians(110)))
+    neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(75))
+    face_q = np.where(turned_away | ~neck_ok, 0.0, face_q)
+    head_w = np.einsum("nij,njk->nik", R_w, Rface)
+    dbg("face_q", face_q)
 
     Hc = np.zeros((N, 2, 21, 3))
     for side in (0, 1):
@@ -507,7 +540,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 hands.append(Phw[f, side] + J["wrL" if side == 0 else "wrR"])
             else:
                 hands.append(None)
-        G = solver.solve(J, hands)
+        G = solver.solve(J, hands, head_w[f] if face_q[f] > 0.15 else None)
         L, _ = solver.locals_from_globals(G)
         for b, m in L.items():
             Q[f, bidx[b]] = mat_to_quat(m)
@@ -530,7 +563,15 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("Q_raw", Q)
     # ---- 5. temporal: per-bone confidence -> hold unseen bones, reject spikes, smooth
     progress(0.55, "Filtering (hold unseen bones, remove spikes, smooth)")
-    conf = bone_confidence(skel, vis, hs, valid, hvalid)
+    # seen / not seen per bone: both detectors count (MediaPipe alone calls many
+    # joints "not visible" in side and back views that the whole-body model sees);
+    # joints outside the picture stay unseen
+    conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
+    if np.any(face_q > 0) and skel.has("head"):
+        # the head counts as seen only where the face could be fitted; elsewhere
+        # (seen from behind, face hidden) it holds its pose relative to the neck
+        conf[:, skel.bones.index("head")] = np.where(face_q > 0.15, 0.5 + 0.5 * face_q, 0.0)
+    conf[bad] = 0.0
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)
     strength = np.array([2.0 if (b.endswith("Hand") or any(f in b for f in FINGERS)) else 1.0 for b in skel.bones])
@@ -582,6 +623,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         "cam_vfov": cam_vfov.astype(np.float32), "shot_of": shot_of.astype(np.int32),
         "lm2d": lm2d.astype(np.float32), "vis": vis.astype(np.float32),
         "h2d": h2d.astype(np.float32), "hs": hs.astype(np.float32), "scale": scale,
+        "solver": SOLVE_VERSION,
     }
     return anim
 
@@ -644,8 +686,23 @@ def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H):
         inside = (p[:, 0] > -margin) & (p[:, 0] < W + margin) & (p[:, 1] > -margin) & (p[:, 1] < H + margin)
         use = valid & inside & (wbs[:, w] > 0.35)
         uv[use, m] = p[use]
-        conf[use, m] = np.clip(wbs[use, w] / 0.6, 0.3, 1.0)
+        c = np.clip(wbs[:, w] / 0.6, 0.3, 1.0)
+        # a joint outside the picture is put on its edge by the whole-body model
+        # (with a good score): near the edge only trust it as far as MediaPipe
+        # also sees the joint
+        edge = 0.03 * max(W, H)
+        near = (p[:, 0] < edge) | (p[:, 0] > W - edge) | (p[:, 1] < edge) | (p[:, 1] > H - edge)
+        c = np.where(near, np.minimum(c, np.clip((vis[:, m] - 0.3) / 0.3, 0, 1)), c)
+        conf[use, m] = c[use]
     return uv, conf
+
+
+def face_visibility(wbs, N):
+    """How clearly a face is seen per frame (whole-body model face points), nan if unknown."""
+    if wbs is None or not np.any(wbs):
+        return np.full(N, np.nan)
+    fs = np.asarray(wbs, np.float64)[:, 23:91].mean(1)
+    return np.where(np.asarray(wbs).any(1), fs, np.nan)
 
 
 def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):
@@ -702,80 +759,6 @@ LR_PAIRS = [(1, 4), (2, 5), (3, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16
 LR_PERM = np.arange(33)
 for _a, _b in LR_PAIRS:
     LR_PERM[_a], LR_PERM[_b] = _b, _a
-
-
-def _torso_basis(W):
-    """(n,33,3) -> (n,3,3) torso frame (left axis, up, forward) in camera coords."""
-    x = (W[:, L_HIP] - W[:, R_HIP]) + (W[:, L_SH] - W[:, R_SH])
-    up = (W[:, L_SH] + W[:, R_SH]) / 2 - (W[:, L_HIP] + W[:, R_HIP]) / 2
-    x = normalize(x)
-    up = normalize(up - x * np.sum(up * x, -1, keepdims=True))
-    return np.stack([x, up, np.cross(x, up)], -1)
-
-
-DEPTH_CHAINS = [(L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR),
-                (L_HIP, L_KNEE), (L_KNEE, L_ANK), (R_HIP, R_KNEE), (R_KNEE, R_ANK)]
-
-
-def resolve_depth_ambiguity(P, Ph, lm2d, vis, h2d, hvalid, valid, shot_of, focal, cx, cy, blen):
-    P = P.copy()
-    Ph = Ph.copy()
-    N = len(P)
-    for (p, c) in DEPTH_CHAINS:
-        L = blen.get((p, c))
-        if L is None:
-            continue
-        cand = np.full((N, 2, 3), np.nan)
-        hint = np.zeros((N, 2))
-        for f in np.where(valid)[0]:
-            if not (np.isfinite(P[f, p]).all() and np.isfinite(P[f, c]).all()):
-                continue
-            uv = lm2d[f, c]
-            if c in (L_WR, R_WR) and hvalid[f, 0 if c == L_WR else 1]:
-                uv = h2d[f, 0 if c == L_WR else 1, 0]
-            r = normalize(np.array([(uv[0] - cx) / focal[f], (uv[1] - cy) / focal[f], 1.0]))
-            bq = float(np.dot(r, P[f, p]))
-            disc = bq * bq - (float(np.dot(P[f, p], P[f, p])) - L * L)
-            t0 = float(np.dot(P[f, c], r))
-            if disc <= 0 or vis[f, c] < 0.5:
-                cand[f, 0] = cand[f, 1] = P[f, c]
-                continue
-            sq = np.sqrt(disc)
-            for k, t in enumerate((bq - sq, bq + sq)):
-                q = r * t
-                cand[f, k] = q
-                hint[f, k] = abs(t - t0) / L
-        for (a, b) in runs(valid & np.isfinite(cand[:, 0, 0]), shot_of):
-            if b - a < 2:
-                continue
-            d = normalize(cand[a:b] - P[a:b, p][:, None, :])  # (n,2,3) bone directions
-            n = b - a
-            cost = 0.6 * hint[a]
-            back = np.zeros((n, 2), int)
-            for j in range(1, n):
-                ang = np.arccos(np.clip(np.einsum("kx,mx->km", d[j], d[j - 1]), -1, 1))  # (k,m)
-                c2 = cost[None, :] + 2.0 * ang
-                back[j] = np.argmin(c2, 1)
-                cost = c2[np.arange(2), back[j]] + 0.6 * hint[a + j]
-            st = np.zeros(n, int)
-            st[-1] = int(np.argmin(cost))
-            for j in range(n - 1, 0, -1):
-                st[j - 1] = back[j, st[j]]
-            new = cand[a:b][np.arange(n), st]
-            delta = new - P[a:b, c]
-            P[a:b, c] = new
-            # everything below that joint moves with it
-            below = {L_EL: [L_WR, L_INDEX, L_PINKY, L_THUMB], L_WR: [L_INDEX, L_PINKY, L_THUMB],
-                     R_EL: [R_WR, R_INDEX, R_PINKY, R_THUMB], R_WR: [R_INDEX, R_PINKY, R_THUMB],
-                     L_KNEE: [L_ANK, L_HEEL, L_FOOT], L_ANK: [L_HEEL, L_FOOT],
-                     R_KNEE: [R_ANK, R_HEEL, R_FOOT], R_ANK: [R_HEEL, R_FOOT]}.get(c, [])
-            for j2 in below:
-                P[a:b, j2] += delta
-            if c in (L_EL, L_WR):
-                Ph[a:b, 0] += delta[:, None, :]
-            if c in (R_EL, R_WR):
-                Ph[a:b, 1] += delta[:, None, :]
-    return P, Ph
 
 
 def camera_static_mask(bg_motion, cam_q, shot_of, fps, thr=0.05, min_s=0.4):
@@ -883,52 +866,6 @@ def stabilize_camera(cam_pos, static, shot_of, fps):
     return out
 
 
-def resolve_body_flips(Wc, lm2d, valid, shot_of, view):
-    """Spins confuse the pose model: it swaps the left/right labels or mirrors
-    the body in depth (front <-> back). For every frame consider 4 readings
-    (as detected / sides swapped / depth mirrored / both) and pick, per shot,
-    the sequence whose torso turns smoothly (Viterbi). Returns (swap, mirror)
-    boolean arrays."""
-    N = len(Wc)
-    swap = np.zeros(N, bool)
-    mirror = np.zeros(N, bool)
-    v = view[:, None, :]
-    Wm = Wc - 2 * np.sum(Wc * v, -1, keepdims=True) * v
-    hyps = [(0, 0), (1, 0), (0, 1), (1, 1)]
-    B = [_torso_basis(W) for W in (Wc, Wc[:, LR_PERM], Wm, Wm[:, LR_PERM])]
-    L2 = [lm2d, lm2d[:, LR_PERM], lm2d, lm2d[:, LR_PERM]]
-    prior = np.array([0.0, 0.8, 0.8, 1.4])
-    hgt = np.maximum(np.ptp(lm2d[:, :, 1], axis=1), 1.0)
-    sided = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
-    for (s0, e0) in runs(valid, shot_of):
-        idx = np.arange(s0, e0)
-        if len(idx) < 2:
-            continue
-        cost = prior.copy()
-        back = np.zeros((len(idx), 4), int)
-        for j in range(1, len(idx)):
-            f, g = idx[j], idx[j - 1]
-            new = np.zeros(4)
-            for k in range(4):
-                tr = np.zeros(4)
-                for m in range(4):
-                    R = B[m][g].T @ B[k][f]
-                    ang = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
-                    jump = np.mean(np.linalg.norm(L2[k][f, sided] - L2[m][g, sided], axis=1)) / hgt[f]
-                    tr[m] = 2.0 * ang + 6.0 * jump
-                c2 = cost + tr
-                back[j, k] = int(np.argmin(c2))
-                new[k] = c2[back[j, k]] + prior[k] * 0.05
-            cost = new
-        st = np.zeros(len(idx), int)
-        st[-1] = int(np.argmin(cost))
-        for j in range(len(idx) - 1, 0, -1):
-            st[j - 1] = back[j, st[j]]
-        for j, k in enumerate(st):
-            swap[idx[j]], mirror[idx[j]] = hyps[k]
-    return swap, mirror
-
-
 BONE_LANDMARKS = {
     "hips": [L_HIP, R_HIP, L_SH, R_SH], "spine": [L_HIP, R_HIP, L_SH, R_SH], "chest": [L_HIP, R_HIP, L_SH, R_SH],
     "upperChest": [L_HIP, R_HIP, L_SH, R_SH], "neck": [NOSE, L_EAR, R_EAR, L_SH, R_SH], "head": [NOSE, L_EAR, R_EAR],
@@ -957,6 +894,16 @@ def bone_confidence(skel, vis, hs, valid, hvalid):
             c = np.ones(N)  # shoulders / eyes / jaw: never driven, stay at rest
         conf[:, i] = np.where(valid, c, 0.0)
     return conf
+
+
+def shot_spans(valid, shot_of):
+    """Per shot: from its first to its last valid frame (gaps inside included)."""
+    out = []
+    for (a, b) in runs(np.ones(len(valid), bool), shot_of):
+        idx = np.where(valid[a:b])[0]
+        if len(idx):
+            out.append((a + idx[0], a + idx[-1] + 1))
+    return out
 
 
 def runs(mask, shot_of):

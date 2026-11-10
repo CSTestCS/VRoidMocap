@@ -448,3 +448,66 @@ class TestLift(unittest.TestCase):
         P, L = lift.fuse_body(P0, uv, np.ones((n, 33)), f, 960, 540, [(0, n)], 30.0)
         d = np.linalg.norm(P[:, 13] - P[:, 11], axis=-1)
         self.assertLess(np.std(d), 0.01)
+
+
+class Facing(unittest.TestCase):
+    """A torso turning a full circle: the facing angle and swapped left/right
+    labels must be recovered from the picture alone."""
+
+    def _scene(self, n=240, swap_from=90, swap_to=150):
+        from vroidmocap.core import detect as D
+        psi = np.radians(np.linspace(0, 360, n, endpoint=False))
+        f, cx, cy, Z = 1500.0, 960.0, 540.0, 3.0
+        body = {  # x = character's left, y = up, z = forward (metres, hip centre origin)
+            D.L_SH: [0.18, 0.5, 0], D.R_SH: [-0.18, 0.5, 0], D.L_HIP: [0.1, 0, 0], D.R_HIP: [-0.1, 0, 0],
+            D.NOSE: [0, 0.68, 0.1], D.L_KNEE: [0.1, -0.42, 0.08], D.R_KNEE: [-0.1, -0.42, 0.08],
+            D.L_ANK: [0.1, -0.82, 0], D.R_ANK: [-0.1, -0.82, 0], D.L_HEEL: [0.1, -0.86, -0.05],
+            D.R_HEEL: [-0.1, -0.86, -0.05], D.L_FOOT: [0.1, -0.88, 0.13], D.R_FOOT: [-0.1, -0.88, 0.13]}
+        uv = np.zeros((n, 33, 2))
+        Wc = np.zeros((n, 33, 3))
+        for k, p in enumerate(psi):
+            # psi = 0 faces the camera: character forward = -z (cv camera), left = +x
+            c, s = np.cos(p), np.sin(p)
+            for j, (x, y, z) in body.items():
+                fwd = np.array([s, 0, -c])
+                left = np.array([c, 0, s])
+                P = x * left + np.array([0, -y, 0]) + z * fwd
+                Wc[k, j] = P
+                uv[k, j] = [cx + f * P[0] / (Z + P[2]), cy + f * P[1] / (Z + P[2])]
+        conf = np.ones((n, 33))
+        face = np.clip(np.cos(psi) + 0.5, 0, 1)  # face seen from the front only
+        # the pose model's 3D guess is mirrored front/back half the time
+        Wm = Wc.copy()
+        Wm[::2, :, 2] *= -1
+        # labels swapped for a stretch (as detectors do in back views)
+        from vroidmocap.core.retarget import LR_PERM
+        sw = np.zeros(n, bool)
+        sw[swap_from:swap_to] = True
+        uv[sw] = uv[sw][:, LR_PERM]
+        Wm[sw] = Wm[sw][:, LR_PERM]
+        T = np.tile([0, 0, Z], (n, 1))
+        return psi, sw, uv, conf, face, Wm, T, np.full(n, f), cx, cy
+
+    def test_full_turn_and_swapped_labels(self):
+        from vroidmocap.core import facing
+        psi, sw, uv, conf, face, Wc, T, f, cx, cy = self._scene()
+        n = len(psi)
+        pc, pp, swap, bad = facing.track_facing(uv, conf, face, Wc, T, f, cx, cy, np.ones(n, bool), [(0, n)], 30.0)
+        err_c = np.degrees(np.abs(np.angle(np.exp(1j * (pc - psi)))))
+        err_p = np.degrees(np.abs(np.angle(np.exp(1j * (pp - psi)))))
+        self.assertLess(np.median(err_c), 10)
+        self.assertLess(np.median(err_p), 10)
+        self.assertLess(np.mean(err_c > 45), 0.05)
+        self.assertGreater(np.mean(swap == sw), 0.95)
+
+    def test_single_frame_swap_is_dropped(self):
+        from vroidmocap.core import facing
+        from vroidmocap.core.retarget import LR_PERM
+        psi, sw, uv, conf, face, Wc, T, f, cx, cy = self._scene(swap_from=0, swap_to=0)
+        uv[40] = uv[40][LR_PERM]
+        Wc[40] = Wc[40][LR_PERM]
+        n = len(psi)
+        pc, pp, swap, bad = facing.track_facing(uv, conf, face, Wc, T, f, cx, cy, np.ones(n, bool), [(0, n)], 30.0)
+        self.assertFalse(swap[40])
+        self.assertTrue(bad[40])
+        self.assertLess(bad.sum(), 5)

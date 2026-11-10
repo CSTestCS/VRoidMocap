@@ -17,6 +17,13 @@ ffmpeg -framerate 30 -i frames/f_%05d.jpg -c:v libx264 -crf 14 -pix_fmt yuv420p 
 python eval_gt.py <work folder> gt.json avatar.vrm
 ```
 
+`eval_detail.py` prints, per shot and bone, where each bone points (swing)
+and which way it faces (twist about its own length), the facing error of
+pelvis / chest / head about the vertical, and jitter against the truth.
+`make_turn_gt.py` makes the turning test (whole body turned: a slow full
+turn, side and back views, fast spins); render it with `gt.html` pointed at
+`gt_anim_turn.json`.
+
 `eval_gt.py` prints joint position error (cm), limb direction error (degrees,
 only limbs inside the picture), bone orientation error, finger error, camera
 tilt and field-of-view error, per shot.
