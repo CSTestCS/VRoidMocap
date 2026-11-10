@@ -511,3 +511,40 @@ class Facing(unittest.TestCase):
         self.assertFalse(swap[40])
         self.assertTrue(bad[40])
         self.assertLess(bad.sum(), 5)
+
+
+class HoldUnseen(unittest.TestCase):
+    """A bone that is not seen keeps its previous pose exactly; before it is
+    first seen it has its first seen pose; when seen again it moves on from the
+    held pose without a jump."""
+
+    def test_hold_and_resume(self):
+        from vroidmocap.core.retarget import hold_unseen
+        from vroidmocap.core.naturalize import q_angle
+        N = 60
+        ang = np.radians(np.linspace(0, 120, N))
+        Q = np.zeros((N, 1, 4))
+        Q[:, 0, 2], Q[:, 0, 3] = np.sin(ang / 2), np.cos(ang / 2)
+        seen = np.ones((N, 1), bool)
+        seen[:10] = False
+        seen[30:40] = False
+        out = hold_unseen(Q, seen, 30.0, np.array([[0, 0, 0, 1.0]]))
+        # before first sight: the first seen pose
+        self.assertTrue(np.allclose(out[:10, 0], Q[10, 0]))
+        # unseen: exactly the last pose
+        self.assertTrue(np.allclose(out[30:40, 0], out[29, 0]))
+        # no frame-to-frame step larger than the motion itself plus the catch-up
+        steps = np.degrees(q_angle(out[1:, 0], out[:-1, 0]))
+        self.assertLess(steps.max(), 12.0)
+        # caught up within 0.2 s
+        self.assertLess(np.degrees(q_angle(out[47:, 0], Q[47:, 0])).max(), 0.5)
+
+    def test_never_seen_is_not_tpose(self):
+        from vroidmocap.core.retarget import hold_unseen, neutral_pose
+        skel = synthetic_skeleton()
+        N = 5
+        Q = np.tile([0, 0, 0, 1.0], (N, len(skel.bones), 1))
+        seen = np.ones((N, len(skel.bones)), bool)
+        seen[:, skel.bones.index("leftUpperArm")] = False
+        out = hold_unseen(Q, seen, 30.0, neutral_pose(skel), skel)
+        self.assertFalse(np.allclose(out[:, skel.bones.index("leftUpperArm")], [0, 0, 0, 1]))

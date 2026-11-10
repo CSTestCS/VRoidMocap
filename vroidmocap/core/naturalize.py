@@ -346,8 +346,15 @@ class Naturalizer:
             sw_h, th_ = remove_twist(qh, ah)
             sw_a, ta = remove_twist(qa, aa)
             total = wrap(ta + th_ * float(np.sign(ah @ aa) or 1))  # all twist goes to the forearm
-            w = np.ones(N_) if conf is None else np.clip(conf[:, ih], 0.03, 1.0)
-            total = circular_smooth(total, w, 0.12 * fps)
+            if conf is not None:
+                # while the hand is not seen its twist is not known: keep the
+                # last seen twist (before the first sighting: the first one)
+                seen_h = conf[:, ih] >= 0.5
+                if seen_h.any():
+                    last = np.maximum.accumulate(np.where(seen_h, np.arange(N_), -1))
+                    first = int(np.argmax(seen_h))
+                    total = total[np.where(last >= 0, last, first)]
+            total = circular_smooth(total, np.ones(N_), 0.12 * fps)
             sup = -1.0 if side == "left" else 1.0  # + = supination (towards palm up)
             tt = clamp_continuous(sup * total, _deg(-100), _deg(180))
             tt = circular_smooth(tt, np.ones(N_), 0.05 * fps, iters=1, outlier=np.pi)
@@ -468,7 +475,9 @@ class Naturalizer:
             # nearly straight: the bend direction is a tiny, noisy vector -> keep
             # the previous frame's bend direction (blended by how bent the elbow is)
             bend = np.arccos(np.clip((fore @ en) / max(np.linalg.norm(fore), 1e-9), -1, 1))
-            wb = float(np.clip((bend - _deg(20)) / _deg(30), 0, 1)) if k > 0 else 1.0
+            # (also when folded almost flat: the bend direction is just as unclear)
+            wb = float(np.clip((bend - _deg(20)) / _deg(30), 0, 1) *
+                       np.clip((_deg(175) - bend) / _deg(20), 0, 1)) if k > 0 else 1.0
             prev_b = rot_prev @ b_rest
             prev_b = prev_b - en * (prev_b @ en)
             if np.linalg.norm(bdir) > 1e-9 and np.linalg.norm(prev_b) > 1e-9:
@@ -493,7 +502,7 @@ class Naturalizer:
 _CIRCLE = np.radians(np.arange(0, 360, 5.0))
 
 
-def _natural_elbow(u, dn, x, h, w, l1, lim=np.radians(110)):
+def _natural_elbow(u, dn, x, h, w, l1, lim=np.radians(110), max_move=np.radians(35)):
     """Among the elbow positions on the IK circle (all keep the wrist exactly in
     place), pick the one nearest to `u` whose bend direction is anatomically
     possible: the upper arm turned at most `lim` about its own axis from the
@@ -520,7 +529,11 @@ def _natural_elbow(u, dn, x, h, w, l1, lim=np.radians(110)):
     if ok[0] or not ok.any():
         return u
     i = np.where(ok)[0]
-    best = i[np.argmin(np.abs(np.angle(np.exp(1j * _CIRCLE[i]))))]
+    off = np.abs(np.angle(np.exp(1j * _CIRCLE[i])))
+    best = i[np.argmin(off)]
+    if off.min() > max_move:
+        # what was seen wins: the limit may nudge the elbow, never relocate it
+        return u
     return np.cos(_CIRCLE[best]) * p + np.sin(_CIRCLE[best]) * q
 
 

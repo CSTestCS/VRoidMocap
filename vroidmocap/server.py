@@ -183,9 +183,11 @@ class AppState:
 
         def run(progress, cancel):
             cap_path = os.path.join(self.workdir, f"capture_c{char_id}.npz")
-            if os.path.exists(cap_path):
-                cap = dict(np.load(cap_path))
-            else:
+            from .core.capture import CAPTURE_VERSION
+            cap = dict(np.load(cap_path)) if os.path.exists(cap_path) else None
+            if cap is not None and int(cap.get("version", 0)) != CAPTURE_VERSION:
+                cap = None  # made by an older capture: run it again
+            if cap is None:
                 cap = capture(self.video, self.workdir, char_id,
                               lambda f, m: progress(f * 0.85, m), cancel)
                 np.savez_compressed(cap_path, **cap)

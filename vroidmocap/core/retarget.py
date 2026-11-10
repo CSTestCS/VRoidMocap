@@ -33,12 +33,12 @@ from .detect import (L_ANK, L_EAR, L_EL, L_EYE, L_FOOT, L_HEEL, L_HIP, L_INDEX, 
                      R_THUMB, R_WR)
 from .mathutil import (gaussian_smooth, interp_gaps, mat_to_quat, normalize, quat_continuity,
                        quat_to_mat, rot_between, rot_from_axes, slerp)
-from .naturalize import Naturalizer, filter_rotations, hold_root
+from .naturalize import Naturalizer, filter_rotations
 from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 5
+SOLVE_VERSION = 6
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -391,7 +391,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # which way the torso faces, frame by frame (this also settles which body
     # side is which: detectors often swap left and right in back views)
     wb2d, wbs = capture.get("wb2d"), capture.get("wbs")
-    uv, conf = body_keypoints(lm2d, vis, wb2d, wbs, valid, None, W, H)
+    uv, conf, wb_sync = body_keypoints(lm2d, vis, wb2d, wbs, valid, None, W, H, return_wb=True)
     face_score = face_visibility(wbs, N)
     psi_c, psi_p, swap, bad = facing.track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid,
                                                   shot_spans(valid, shot_of), fps)
@@ -403,6 +403,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         arr[swap] = arr[swap][:, LR_PERM]
     for arr in (h2d, hw, hs, hc):
         arr[swap] = arr[swap][:, ::-1]
+    if wb_sync is not None:
+        from .detect import WB_SWAP
+        for arr in wb_sync:
+            arr[swap] = arr[swap][:, WB_SWAP]
     hvalid = (hs >= 0.5) & valid[:, None]
     # the pose model's 3D guess: where it reads the body the wrong way round
     # (its usual mistake in back views, psi -> pi - psi, or a plain depth mirror,
@@ -511,8 +515,9 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for side, wi, ei in ((0, L_WR, L_EL), (1, R_WR, R_EL)):
         sh_i = L_SH if side == 0 else R_SH
         view = normalize(np.einsum("nij,nj->ni", R_w, np.nan_to_num(P[:, wi])))
+        wind = hand_winding(h2d[:, side], hvalid[:, side], wb_sync, side, uv[:, wi])
         Phw[:, side] = resolve_hand_mirroring(Phw[:, side], hvalid[:, side], view,
-                                              Pw[:, sh_i], Pw[:, ei], Pw[:, wi], 1.0 if side == 1 else -1.0)
+                                              Pw[:, sh_i], Pw[:, ei], Pw[:, wi], 1.0 if side == 1 else -1.0, wind)
 
     # ---- 4. rotations
     solver = RigSolver(skel)
@@ -563,15 +568,19 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("Q_raw", Q)
     # ---- 5. temporal: per-bone confidence -> hold unseen bones, reject spikes, smooth
     progress(0.55, "Filtering (hold unseen bones, remove spikes, smooth)")
-    # seen / not seen per bone: both detectors count (MediaPipe alone calls many
-    # joints "not visible" in side and back views that the whole-body model sees);
-    # joints outside the picture stay unseen
+    # seen / not seen per bone. A bone is animated only while all the joints
+    # that define it are clearly inside the picture and detected (both
+    # detectors count; brief glimpses do not). Everything else keeps its pose.
+    js = joint_seen(lm2d, np.maximum(body_conf, np.clip((vis - 0.3) / 0.3, 0, 1)), valid & ~bad, W, H, fps, shot_of)
+    face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
+    seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of)
+    root_seen = _min_run(js[:, L_HIP] & js[:, R_HIP], fps, shot_of)
+    feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
     conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
-    if np.any(face_q > 0) and skel.has("head"):
-        # the head counts as seen only where the face could be fitted; elsewhere
-        # (seen from behind, face hidden) it holds its pose relative to the neck
-        conf[:, skel.bones.index("head")] = np.where(face_q > 0.15, 0.5 + 0.5 * face_q, 0.0)
-    conf[bad] = 0.0
+    if face_seen is not None and skel.has("head"):
+        conf[:, skel.bones.index("head")] = np.where(face_seen, 0.5 + 0.5 * face_q, 0.0)
+    conf = np.where(seen, np.maximum(conf, 0.55), 0.0)
+    dbg("seen", seen)
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)
     strength = np.array([2.0 if (b.endswith("Hand") or any(f in b for f in FINGERS)) else 1.0 for b in skel.bones])
@@ -589,28 +598,38 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # actor root in world assuming a camera that only rotates within a shot
     root_actor = np.einsum("nij,nj->ni", R_w, np.nan_to_num(T))
     root_actor = interp_gaps(root_actor, valid)
-    root, contacts = root_motion(skel, Q, root_actor * scale, valid, shot_of, fps, Pw, scale)
-    root = anchor_root_to_camera(root, Q, skel, R_w, T, valid, static, shot_of, scale, fps, contacts)
-    root = hold_root(root, valid, fps)
+    root, contacts = root_motion(skel, Q, root_actor * scale, valid & root_seen, shot_of, fps, Pw, scale,
+                                 feet_seen=feet_seen)
+    root = anchor_root_to_camera(root, Q, skel, R_w, T, valid & root_seen, static, shot_of, scale, fps, contacts)
+    root = hold_unseen_root(root, valid & root_seen, fps)
     progress(0.8, "Joint limits and limb IK")
     Q = nat.apply(Q, root, fps, conf)
     dbg("Q_nat", Q)
     if foot_lock:  # pins planted feet (two-bone IK)
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
+    # every bone moves on only from its own previous pose: unseen bones keep it
+    # exactly, and pick the motion up again smoothly when they are seen again
+    Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
+    dbg("Q_final", Q)
 
-    # ---- 7. cloned camera relative to the avatar
-    Ts = T.copy()
-    Ts = interp_gaps(np.nan_to_num(Ts), valid)
-    for (s, e) in runs(np.ones(N, bool), shot_of):
-        Ts[s:e] = gaussian_smooth(Ts[s:e], 2.0 * fps / 30.0, valid=valid[s:e])
-    # T is the camera->hip-joint-centre vector; place the camera so the avatar's
-    # hip-joint centre (not the hips bone) sits exactly where the actor's does
-    hi = skel.bones.index("hips")
-    Rh = quat_to_mat(Q[:, hi])
-    off = (skel.rest_pos["leftUpperLeg"] + skel.rest_pos["rightUpperLeg"]) / 2 - skel.rest_pos["hips"]
-    hipc_avatar = root + np.einsum("nij,j->ni", Rh, off)
-    cam_pos = stabilize_camera(hipc_avatar - scale * np.einsum("nij,nj->ni", R_w, Ts), static, shot_of, fps)
+    # ---- 7. cloned camera relative to the avatar: the actor's hip-joint centre
+    # must land where the avatar's is (or, while the hips are out of the
+    # picture, the shoulder centre: a reference that is actually seen)
+    posA, _ = avatar_fk(skel, Q, root)
+    bix = {b_: i for i, b_ in enumerate(skel.bones)}
+    hipc_avatar = (posA[:, bix["leftUpperLeg"]] + posA[:, bix["rightUpperLeg"]]) / 2
+    shc_avatar = (posA[:, bix["leftUpperArm"]] + posA[:, bix["rightUpperArm"]]) / 2
+    sh_seen = _min_run(js[:, L_SH] & js[:, R_SH], fps, shot_of)
+    use_sh = ~root_seen & sh_seen
+    ref_cam = np.where(use_sh[:, None], (P[:, L_SH] + P[:, R_SH]) / 2, T)
+    ref_av = np.where(use_sh[:, None], shc_avatar, hipc_avatar)
+    have = valid & (root_seen | sh_seen) & np.isfinite(ref_cam).all(1)
+    cam_raw = ref_av - scale * np.einsum("nij,nj->ni", R_w, np.nan_to_num(ref_cam))
+    cam_raw = interp_gaps(cam_raw, have) if have.any() else cam_raw
+    for (s0, e0) in runs(np.ones(N, bool), shot_of):
+        cam_raw[s0:e0] = gaussian_smooth(cam_raw[s0:e0], 2.0 * fps / 30.0, valid=have[s0:e0])
+    cam_pos = stabilize_camera(cam_raw, static, shot_of, fps)
     cam_quat = mat_to_quat(R_w @ cam.D)
     cam_vfov = np.array([cam.vfov_from_focal(fv, H) for fv in focal])
 
@@ -659,7 +678,7 @@ def refine_gravity(P, vis, R_rel, shot_of, shots, valid):
         sh["align"] = cam.align_from_up(up_ref)
 
 
-def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H):
+def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H, return_wb=False):
     """Picture positions of the body joints: the whole-body model where it is
     confident (it is the more precise one), the MediaPipe landmarks otherwise.
     The whole-body model's left/right labels are matched to the (already
@@ -668,7 +687,7 @@ def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H):
     uv = lm2d.copy()
     conf = np.clip((vis - 0.3) / 0.3, 0, 1)
     if wb2d is None or not np.any(wbs):
-        return uv, conf
+        return (uv, conf, None) if return_wb else (uv, conf)
     wb2d = wb2d.astype(np.float64).copy()
     wbs = wbs.astype(np.float64).copy()
     mp_i = np.array([m for m in WB_TO_MP if 11 <= m <= 28])
@@ -694,7 +713,7 @@ def body_keypoints(lm2d, vis, wb2d, wbs, valid, swap, W, H):
         near = (p[:, 0] < edge) | (p[:, 0] > W - edge) | (p[:, 1] < edge) | (p[:, 1] > H - edge)
         c = np.where(near, np.minimum(c, np.clip((vis[:, m] - 0.3) / 0.3, 0, 1)), c)
         conf[use, m] = c[use]
-    return uv, conf
+    return (uv, conf, (wb2d, wbs)) if return_wb else (uv, conf)
 
 
 def face_visibility(wbs, N):
@@ -705,7 +724,34 @@ def face_visibility(wbs, N):
     return np.where(np.asarray(wbs).any(1), fs, np.nan)
 
 
-def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):
+W_WIND = 3.0
+
+
+def hand_winding(h2d, hok, wb, side, wrist_uv):
+    """Whether the whole-body model sees the hand the same way round as the
+    hand model (thumb side vs little-finger side in the picture). (N,) in
+    -1..1: + = both agree (the hand model's reading is supported), - = they
+    disagree (its mirror image is supported), 0 = unknown. A depth-mirrored hand
+    looks the same in the picture, so this second opinion is the only direct
+    evidence for which of the two it is."""
+    def wnd(p):
+        a, b = p[:, 5] - p[:, 0], p[:, 17] - p[:, 0]
+        sz = np.sum((p[:, 9] - p[:, 0]) ** 2, 1) + 1e-6
+        return (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]) / sz
+    N = len(h2d)
+    if wb is None:
+        return np.zeros(N)
+    w_mp = np.where(hok, np.clip(wnd(h2d) / 0.3, -1, 1), 0.0)
+    k0 = 91 if side == 0 else 112
+    p = wb[0][:, k0:k0 + 21]
+    sc = wb[1][:, k0:k0 + 21].mean(1)
+    span = np.ptp(p, axis=1).max(1)
+    near = np.linalg.norm(p[:, 0] - wrist_uv, axis=1) < 0.6 * np.maximum(span, 10)
+    w_wb = np.where((sc > 0.4) & near, np.clip(wnd(p) / 0.3, -1, 1), 0.0)
+    return np.sign(w_mp) * np.sign(w_wb) * np.minimum(np.abs(w_mp), np.abs(w_wb))
+
+
+def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn, wind=None):
     """H: (N,21,3) hand points relative to the wrist (world). Returns H with some
     frames mirrored in depth, chosen by a 2-state Viterbi over the clip."""
     N = len(H)
@@ -731,6 +777,10 @@ def resolve_hand_mirroring(H, ok, view, S, E, Wr, sgn):
         w = np.clip((bend - np.radians(15)) / np.radians(25), 0, 1)
         unary[:, k] = w * np.clip(-0.17 - c, 0, None) * 4.0
     unary[:, 1] += 0.35  # the detector is usually right
+    if wind is not None:
+        # second opinion of the whole-body model (see hand_winding)
+        unary[:, 0] += W_WIND * np.maximum(0, -wind[idx])
+        unary[:, 1] += W_WIND * np.maximum(0, wind[idx])
     # transition: change of the palm direction between consecutive seen frames
     cost = unary[0].copy()
     back = np.zeros((len(idx), 2), int)
@@ -880,6 +930,141 @@ for _s, _S in (("left", "L"), ("right", "R")):
     })
 
 
+def _min_run(mask, fps, shot_of, min_s=0.15):
+    """Drop True-runs shorter than min_s seconds (brief glimpses)."""
+    out = mask.copy()
+    k = max(3, int(round(min_s * fps)))
+    for (a, b) in runs(mask, shot_of):
+        if b - a < k:
+            out[a:b] = False
+    return out
+
+
+def joint_seen(uv, conf, valid, W, H, fps, shot_of):
+    """(N,33) joint clearly inside the picture (not on its edge) and detected."""
+    m = 0.015 * max(W, H)
+    inside = (uv[..., 0] > m) & (uv[..., 0] < W - m) & (uv[..., 1] > m) & (uv[..., 1] < H - m)
+    s = inside & (conf >= 0.5) & valid[:, None]
+    return np.stack([_min_run(s[:, j], fps, shot_of) for j in range(s.shape[1])], 1)
+
+
+def bone_seen(skel, js, hvalid, face_seen, fps, shot_of):
+    """(N,B): every joint defining the bone is seen. Bones the solver never
+    drives (shoulders, eyes, jaw...) count as seen (they stay as they are)."""
+    N = len(js)
+    out = np.ones((N, len(skel.bones)), bool)
+    head = face_seen if face_seen is not None else js[:, NOSE] & (js[:, L_EAR] | js[:, R_EAR])
+    for i, b in enumerate(skel.bones):
+        side = 0 if b.startswith("left") else 1
+        wr = L_WR if side == 0 else R_WR
+        if b.endswith("Hand") or any(f in b for f in FINGERS):
+            m = hvalid[:, side] & js[:, wr]
+        elif b == "head":
+            m = head
+        elif b == "neck":
+            m = js[:, L_SH] & js[:, R_SH] & head
+        elif b in BONE_LANDMARKS:
+            m = js[:, BONE_LANDMARKS[b]].all(1)
+        else:
+            continue
+        out[:, i] = _min_run(m, fps, shot_of)
+    return out
+
+
+def neutral_pose(skel):
+    """Local rotations for bones never seen in the whole clip: relaxed standing
+    (arms down at the sides) rather than the T-pose."""
+    q = np.zeros((len(skel.bones), 4))
+    q[:, 3] = 1.0
+    for side, sg in (("left", -1.0), ("right", 1.0)):
+        b = side + "UpperArm"
+        if skel.has(b):
+            a = np.radians(70) * sg
+            q[skel.bones.index(b)] = [0, 0, np.sin(a / 2), np.cos(a / 2)]
+    return q
+
+
+def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
+    """Per bone: while not seen, keep the previous frame's rotation exactly;
+    when seen again, move from that held pose to the observed one over
+    blend_s. Before a bone is first seen it has its first seen pose; a bone
+    never seen keeps the neutral pose. With skel, a seen bone under a held
+    parent keeps the direction it was observed in (its rotation relative to
+    the held parent is recomputed)."""
+    from .naturalize import slerp_many
+    N, B = Q.shape[:2]
+    Q = normalize(Q)
+    out = Q.copy()
+    nb = max(1, int(round(blend_s * fps)))
+    if skel is not None:
+        R = quat_to_mat(Q.reshape(-1, 4)).reshape(N, B, 3, 3)
+        G_sol = np.zeros_like(R)
+        G_out = np.zeros_like(R)
+        idx = {x: i for i, x in enumerate(skel.bones)}
+        order = list(range(B))  # skel.bones is parent-first
+        driven = [b in BONE_LANDMARKS or b in ("head", "neck") or b.endswith("Hand") or any(f in b for f in FINGERS)
+                  for b in skel.bones]
+    else:
+        order = list(range(B))
+    for b in order:
+        target = Q[:, b]
+        if skel is not None:
+            p = skel.parent[skel.bones[b]]
+            if p is None:
+                G_sol[:, b] = R[:, b]
+            else:
+                pi = idx[p]
+                G_sol[:, b] = G_sol[:, pi] @ R[:, b]
+                if driven[b]:
+                    # observed direction in the world, relative to the parent as it is output
+                    target = mat_to_quat(np.einsum("nji,njk->nik", G_out[:, pi], G_sol[:, b]))
+        sb = seen[:, b]
+        if not sb.any():
+            col = np.tile(neutral[b], (N, 1))
+        else:
+            col = target.copy()
+            if not sb.all():
+                first = int(np.argmax(sb))
+                col[:first] = target[first]
+                since = nb  # frames since the bone was seen again
+                for f in range(first + 1, N):
+                    if not sb[f]:
+                        col[f] = col[f - 1]
+                        since = 0
+                    elif since < nb:
+                        since += 1
+                        t = since / nb
+                        t = t * t * (3 - 2 * t)
+                        col[f] = slerp_many(col[f - 1], target[f], np.array([t]))[0]
+        out[:, b] = normalize(col)
+        if skel is not None:
+            p = skel.parent[skel.bones[b]]
+            Lb = quat_to_mat(out[:, b])
+            G_out[:, b] = Lb if p is None else G_out[:, idx[p]] @ Lb
+    return normalize(out)
+
+
+def hold_unseen_root(root, seen, fps, blend_s=0.25):
+    """Root position: held while the hips are not seen, then eased back."""
+    out = root.copy()
+    if not seen.any():
+        return out
+    nb = max(1, int(round(blend_s * fps)))
+    first = int(np.argmax(seen))
+    out[:first] = root[first]
+    since = nb
+    for f in range(first + 1, len(root)):
+        if not seen[f]:
+            out[f] = out[f - 1]
+            since = 0
+        elif since < nb:
+            since += 1
+            t = since / nb
+            t = t * t * (3 - 2 * t)
+            out[f] = out[f - 1] + t * (root[f] - out[f - 1])
+    return out
+
+
 def bone_confidence(skel, vis, hs, valid, hvalid):
     """(N,B) confidence that each bone's rotation was actually observed."""
     N = len(vis)
@@ -993,7 +1178,7 @@ def fill_and_smooth_quats(q, valid, sigma, max_gap):
     return q
 
 
-def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale):
+def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale, feet_seen=None):
     """Root (hips) trajectory for the avatar.
 
     Horizontal motion is integrated from planted feet on the avatar's own
@@ -1031,6 +1216,8 @@ def root_motion(skel, Q, root_guess, valid, shot_of, fps, Pw, scale):
     vel = np.zeros((N, 2))
     vel[1:] = np.linalg.norm(np.diff(feet[:, :, :, [0, 2]].mean(2), axis=0), axis=-1) * fps
     contact = (rel < 0.03) & (height_abs < 0.10) | (rel < 0.015) & (height_abs < 0.2)
+    if feet_seen is not None:  # a foot outside the picture is not known to be planted
+        contact &= feet_seen
     # hysteresis / debounce: remove 1-2 frame flickers
     k = max(1, int(round(0.05 * fps)))
     for s in (0, 1):

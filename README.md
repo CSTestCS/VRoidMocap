@@ -139,17 +139,34 @@ behind, the head holds its pose relative to the neck.
   within that fixed view: across the image it follows the video exactly, while
   depth is corrected only while the feet are free, so planted feet never slide.
 * **Spins and back views.** See *Which way the body faces* above.
-* **Unseen bones freeze.** A bone (or the whole character) that is not seen
-  holds its last seen pose, then blends into the next seen pose over 0.2 s.
-  "Seen" counts both detectors, and a joint that the whole-body model puts on
-  the edge of the picture (it does that with joints outside it) only counts as
-  seen if MediaPipe sees it too.
+* **Only what is seen is animated; everything else keeps its pose.** A bone
+  moves only while all the joints that define it are clearly inside the
+  picture and detected (by either detector; a joint the whole-body model puts
+  on the edge of the picture needs MediaPipe to see it too, and glimpses
+  shorter than 0.15 s do not count). Otherwise it keeps exactly the pose it
+  had in the previous frame, and when it is seen again it moves on from that
+  pose (eased over 0.2 s), never from a T-pose or any default. So:
+  * the character out of the shot: nothing moves (the root holds too),
+  * only partly in the shot: only the visible part moves (legs out of the
+    picture stay as they were, the torso holds while the shoulders are cut
+    off, a hand that is not detected keeps its pose and its forearm twist),
+  * before the character first appears, the avatar already stands in the
+    first reliable pose; a bone never seen at all stays relaxed (arms down).
+  A visible bone whose parent is held keeps the direction it is seen in.
+  Frames whose detection contradicts everything around them count as not
+  seen.
+* **Tracking box.** In back views the tracker can lose the body and follow
+  only the head; the detectors then "find" a tiny, contorted person in that
+  box. Within a shot the box may not collapse below 60% of the body size
+  seen around it; a collapsed box is extended from the head to full size.
 * **No flips.** Single-frame spikes are rejected. Palm vs back-of-hand and
   the two possible depths of every elbow, wrist, knee and ankle are resolved
   over time. Finger joints that appear bent backwards are mirrored forward.
 * **Natural joints (IK + limits).**
   * Elbows: hinge IK that keeps the wrist where it is. The elbow sits where it
-    was seen, and the upper arm never turns past its natural range.
+    was seen; the joint limit may nudge it (at most 35 degrees around the
+    shoulder-wrist line) but never relocate it away from what the video shows.
+    Nearly straight or fully folded arms keep their previous twist.
   * Thighs never twist. They only swing to point at the knee; any twist the
     leg needs happens at the knee (±45°).
   * Forearm twist stays within its natural range. Wrists, fingers, thumbs,
@@ -194,8 +211,6 @@ Honest limits of single-camera capture:
 * **Depth** is inferred, not measured. A limb that points only slightly
   towards or away from the camera can be reconstructed on the wrong side
   (about 6% of limbs are more than 45° off in the test above).
-* **Hidden limbs** (behind the body, outside the picture) are held in their
-  last seen pose.
 * **Hands:** in a full-body shot a hand is about 40 pixels. Whether the palm
   or the back of the hand faces the camera is read correctly only about 75%
   of the time, so forearm twist and hand orientation are the least reliable

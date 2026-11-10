@@ -61,6 +61,31 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
+CAPTURE_VERSION = 2
+
+
+def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
+    """In back views the tracker can lose the body and keep following only the
+    head: its box collapses to head size, and the detectors then find a tiny,
+    contorted "person" inside it. Within a shot a body does not shrink that
+    fast: a box much smaller than the body size seen around it (the 85th
+    percentile over +-win_s) is extended from the head down to the full body
+    size."""
+    out = boxes.copy()
+    k = max(1, int(round(win_s * fps)))
+    for (s, e) in segs:
+        h = boxes[s:e, 3] - boxes[s:e, 1]
+        w = boxes[s:e, 2] - boxes[s:e, 0]
+        for i in range(e - s):
+            ref = np.percentile(h[max(0, i - k):i + k + 1], 85)
+            if h[i] < ratio * ref:
+                cx = (boxes[s + i, 0] + boxes[s + i, 2]) / 2
+                ww = max(w[i], 0.45 * ref)
+                top = boxes[s + i, 1]
+                out[s + i] = [cx - ww / 2, top, cx + ww / 2, top + ref]
+    return out
+
+
 def _hand_attempts(lm2d, side):
     wr, el = (L_WR, L_EL) if side == 0 else (R_WR, R_EL)
     tips = [L_INDEX, L_PINKY, L_THUMB] if side == 0 else [R_INDEX, R_PINKY, R_THUMB]
@@ -202,12 +227,13 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     cancel = cancel or (lambda: False)
     A, boxes, segs = character_boxes(workdir, char_id)
     N, fps = A["frames"], A["fps"]
+    boxes = stabilize_boxes(boxes, segs, fps)
     cdir = os.path.join(workdir, f"capture_c{char_id}")
     os.makedirs(cdir, exist_ok=True)
     from .detect import ensure_model
     progress(0.0, "Getting the whole-body model (one-time download, 370 MB)")
     wb_path = ensure_model("wholebody", lambda f: progress(0.0, f"Downloading the whole-body model: {f * 100:.0f}%"))
-    tag = "w" if wb_path else "m"
+    tag = (f"w{CAPTURE_VERSION}" if wb_path else f"m{CAPTURE_VERSION}")
     jobs = []
     for (s, e) in segs:
         for cs in range(s, e, CHUNK):
@@ -246,6 +272,7 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         for k in out:
             out[k][j[1]:j[2]] = d[k]
     out["tracked"] = ~np.isnan(boxes[:, 0])
+    out["version"] = np.array(CAPTURE_VERSION)
     fill_wholebody_gaps(out["wb2d"], out["wbs"], [(j[1], j[2]) for j in jobs])
     return out
 
