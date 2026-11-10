@@ -15,7 +15,9 @@ A Windows app that turns a video into a motion-capture animation for your own
      with the focal length fitted per shot.
 2. **Motion capture** (per character). Pick a character and a second, high
    accuracy pass runs on just that person:
-   * a whole-body keypoint model (RTMW) finds every joint in the picture,
+   * a whole-body keypoint model (RTMW) finds every joint in the picture
+     (run at about 30 fps and interpolated for faster videos; this is the slow
+     part: expect roughly 5 to 10 minutes per minute of video on a 4-core CPU),
    * the MediaPipe body model adds a rough depth for every joint, and the hand
      model tracks both hands on crops around the wrists,
    * the **3D solve** combines them over the whole shot (see below) into joint
