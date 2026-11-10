@@ -686,6 +686,11 @@ def refine_gravity(P, vis, R_rel, shot_of, shots, valid):
             continue
         if np.degrees(np.arccos(np.clip(-up_ref[1], -1, 1))) > 70:
             continue
+        # a refinement, not a replacement: partial bodies at the picture edge can
+        # skew it, so it may move "up" by at most 30 degrees from the analysis
+        up0 = sh["align"].T @ np.array([0, 1.0, 0])  # world up, in the camera
+        if np.degrees(np.arccos(np.clip(np.dot(up_ref, up0), -1, 1))) > 30:
+            continue
         sh["align"] = cam.align_from_up(up_ref)
 
 
