@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 9
+SOLVE_VERSION = 10
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -626,7 +626,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     hidden = hidden if hidden is not None else np.zeros((N, 33), bool)
     hidden = hidden | cut_off_joints(uv, P, blen, focal, cx, cy, W, H)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
-                    weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)))
+                    weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)),
+                    both=(raw >= 0.45) & (vis >= 0.25))
     dbg("js", js)
     dbg("raw", raw)
     dbg("uvs", lm2d)
@@ -677,9 +678,9 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     root0 = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     Q = nat.apply(Q, root0, fps, conf)
     dbg("Q_nat", Q)
-    # every bone moves on only from its own previous pose: unseen bones keep it
-    # exactly, and pick the motion up again smoothly when they are seen again;
-    # before a bone is first seen it is in the A pose
+    # keyframes only where a bone is seen: in between, smooth in-between motion
+    # from its last seen pose to its next; before a bone is first seen it is in
+    # the A pose
     Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
     root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
@@ -1119,19 +1120,53 @@ def place_root(skel, Q, Xw, js_ok, scale, fps, shot_of, tau_s=0.3):
     seen = np.where(typ >= 0)[0]
     if not len(seen):
         return root
-    first = seen[0]
+    first, last = seen[0], seen[-1]
     root[:first + 1] = cand[first]
     decay = float(np.exp(-1.0 / max(tau_s * fps, 1e-6)))
     o = np.zeros(3)
-    for f in range(first + 1, N):
-        if typ[f] < 0:
-            root[f] = root[f - 1]
-            continue
-        if typ[f] != typ[f - 1]:
-            o = root[f - 1] - cand[f]
-        else:
+    prev = first
+    for f in seen[1:]:
+        if f == prev + 1 and typ[f] != typ[prev]:
+            o = root[prev] - cand[f]   # another reference part: no jump
+        elif f == prev + 1:
             o = o * decay
+        else:
+            o = np.zeros(3)            # after a gap: where it is seen now
         root[f] = cand[f] + o
+        prev = f
+    # a person does not move faster than running pace: a reference part that
+    # jumps (a mis-detection) is caught up with over the following frames
+    vmax = 6.0 * scale / fps
+    for i in range(1, len(seen)):
+        f, g = seen[i - 1], seen[i]
+        if g != f + 1 or shot_of[g] != shot_of[f]:
+            continue
+        d = root[g] - root[f]
+        n_ = np.linalg.norm(d)
+        if n_ > vmax:
+            root[g] = root[f] + d / n_ * vmax
+    # nothing of the character seen: in-between motion from where it was last
+    # seen to where it is seen next (after the last sighting it stays)
+    root[last + 1:] = root[last]
+    for i in range(len(seen) - 1):
+        a, b = seen[i], seen[i + 1]
+        if b - a <= 1:
+            continue
+        L = b - a
+        va = root[a] - root[a - 1] if a - 1 >= first and typ[a - 1] >= 0 else np.zeros(3)
+        vb = root[b + 1] - root[b] if b + 1 <= last and typ[b + 1] >= 0 else np.zeros(3)
+        k = float(np.clip(0.15 * fps / L, 0.0, 1.0))
+        t = ((np.arange(a + 1, b) - a) / L)[:, None]
+        root[a + 1:b] = ((2 * t ** 3 - 3 * t ** 2 + 1) * root[a] + (t ** 3 - 2 * t ** 2 + t) * va * L * k +
+                         (-2 * t ** 3 + 3 * t ** 2) * root[b] + (t ** 3 - t ** 2) * vb * L * k)
+    # (and the in-between motion keeps to that pace too, within a shot)
+    for f in range(first + 1, N):
+        if shot_of[f] != shot_of[f - 1]:
+            continue
+        d = root[f] - root[f - 1]
+        n_ = np.linalg.norm(d)
+        if n_ > vmax:
+            root[f] = root[f - 1] + d / n_ * vmax
     return root
 
 
@@ -1214,7 +1249,7 @@ def _min_run(mask, fps, shot_of, min_s=0.15):
     return out
 
 
-def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None):
+def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None, both=None):
     """(N,33) joint clearly inside the picture (not on its edge), detected, and
     not behind something (hidden: see occluded_joints).
     With `weak` (a lower bar), context from both directions: a stretch of weak
@@ -1228,6 +1263,8 @@ def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None):
     if hidden is not None:
         ok &= ~hidden
     s = ok & (conf >= 0.5)
+    if both is not None:  # both models fairly sure (skirt, hair over a visible leg)
+        s |= ok & both
     if weak is not None:
         w = ok & (weak | s)
         for j in range(s.shape[1]):
@@ -1274,7 +1311,7 @@ LIMB_PAIRS = [(L_HIP, L_KNEE), (L_KNEE, L_ANK), (R_HIP, R_KNEE), (R_KNEE, R_ANK)
               (L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR)]
 
 
-def cut_off_joints(uv, P, blen, focal, cx, cy, W, H, edge_frac=0.15, short=0.55):
+def cut_off_joints(uv, P, blen, focal, cx, cy, W, H, edge_frac=0.15, short=0.7):
     """(N,33) joints of a limb that leaves the picture. Close to the camera the
     detectors squeeze a limb that runs out of the picture into it: the end
     joint is put near the edge, and the limb looks far shorter than a bone of
@@ -1352,14 +1389,85 @@ def neutral_pose(skel):
     return q
 
 
-def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
-    """Per bone: while not seen, keep the previous frame's rotation exactly;
-    when seen again, move from that held pose to the observed one over
-    blend_s. Until a bone is first seen it is in the neutral (A) pose, and it
-    eases from there into its first seen pose. With skel, a seen bone under a held
-    parent keeps the direction it was observed in (its rotation relative to
-    the held parent is recomputed)."""
+def _qmul(a, b):
+    x1, y1, z1, w1 = np.moveaxis(a, -1, 0)
+    x2, y2, z2, w2 = np.moveaxis(b, -1, 0)
+    return np.stack([w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2, w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                     w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2, w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2], -1)
+
+
+def _qinv(q):
+    return q * np.array([-1, -1, -1, 1.0])
+
+
+def _qlog(q):
+    """unit quaternion -> rotation vector (shortest way)."""
+    q = q * np.sign(q[..., 3:4] + 1e-12)
+    v = q[..., :3]
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    ang = 2 * np.arctan2(n, q[..., 3:4])
+    return np.where(n > 1e-12, v / np.maximum(n, 1e-12) * ang, 2 * v)
+
+
+def _qexp(r):
+    a = np.linalg.norm(r, axis=-1, keepdims=True)
+    ax = np.where(a > 1e-12, r / np.maximum(a, 1e-12), 0.0)
+    return np.concatenate([ax * np.sin(a / 2), np.cos(a / 2)], -1)
+
+
+def keyframe_fill(target, sb, fps, neutral, nb):
+    """One bone over the clip: keyframes only where it is seen, in-between
+    motion everywhere else. Gaps between two sightings are filled with a smooth
+    curve (Hermite in rotation space) that leaves the last seen pose and
+    arrives at the next one with the speeds the bone had there (the speeds
+    count less the longer the gap). Before the bone is first seen it is in the
+    A pose (neutral) and eases into the first seen pose over nb frames; after
+    the last sighting it keeps that pose."""
     from .naturalize import slerp_many
+    N = len(target)
+    col = target.copy()
+    on = np.where(sb)[0]
+    first, last = on[0], on[-1]
+    col[last + 1:] = target[last]
+    f = first
+    while f < last:
+        if sb[f + 1]:
+            f += 1
+            continue
+        a = f
+        b = a + 1
+        while not sb[b]:
+            b += 1
+        L = b - a
+        qa, qb = target[a], target[b]
+        r = _qlog(_qmul(_qinv(qa), qb))
+        wa = _qlog(_qmul(_qinv(target[a - 1]), qa)) if a >= 1 and sb[a - 1] else np.zeros(3)
+        wb = _qlog(_qmul(_qinv(qb), target[b + 1])) if b + 1 < N and sb[b + 1] else np.zeros(3)
+        k = float(np.clip(0.6 * fps / L, 0.0, 1.0))
+        t = (np.arange(a + 1, b) - a) / L
+        h10, h01, h11 = t ** 3 - 2 * t ** 2 + t, -2 * t ** 3 + 3 * t ** 2, t ** 3 - t ** 2
+        pth = h10[:, None] * (wa * L * k) + h01[:, None] * r + h11[:, None] * (wb * L * k)
+        col[a + 1:b] = _qmul(np.broadcast_to(qa, (L - 1, 4)), _qexp(pth))
+        f = b
+    if first > 0:
+        col[:first] = neutral
+        for k_ in range(nb):
+            g = first + k_
+            if g >= N:
+                break
+            tt = (k_ + 1) / nb
+            tt = tt * tt * (3 - 2 * tt)
+            col[g] = slerp_many(neutral, col[g], np.array([tt]))[0]
+    return col
+
+
+def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
+    """Per bone: keyframes only where the bone is seen; in-between motion
+    where it is not (see keyframe_fill). Until a bone is first seen it is in
+    the neutral (A) pose, and it eases from there into its first seen pose.
+    With skel, a seen bone under a parent that is not seen keeps the direction
+    it was observed in (its rotation relative to the output parent is
+    recomputed)."""
     N, B = Q.shape[:2]
     Q = normalize(Q)
     out = Q.copy()
@@ -1390,20 +1498,7 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
         if not sb.any():
             col = np.tile(neutral[b], (N, 1))
         else:
-            col = target.copy()
-            if not sb.all():
-                first = int(np.argmax(sb))
-                col[:first] = neutral[b]
-                since = nb if first == 0 else 0  # frames since the bone was seen (again)
-                for f in range(max(first, 1), N):
-                    if not sb[f]:
-                        col[f] = col[f - 1]
-                        since = 0
-                    elif since < nb:
-                        since += 1
-                        t = since / nb
-                        t = t * t * (3 - 2 * t)
-                        col[f] = slerp_many(col[f - 1], target[f], np.array([t]))[0]
+            col = keyframe_fill(normalize(target), sb, fps, neutral[b], nb)
         out[:, b] = normalize(col)
         if skel is not None:
             p = skel.parent[skel.bones[b]]

@@ -510,7 +510,7 @@ class Facing(unittest.TestCase):
         self.assertLess(bad.sum(), 5)
 
 
-class HoldUnseen(unittest.TestCase):
+class KeyframesWhereSeen(unittest.TestCase):
     """A bone that is not seen keeps its previous pose exactly; before it is
     first seen it has its first seen pose; when seen again it moves on from the
     held pose without a jump."""
@@ -529,8 +529,9 @@ class HoldUnseen(unittest.TestCase):
         # before first sight: the neutral (A) pose, then easing into the motion
         self.assertTrue(np.allclose(out[:10, 0], [0, 0, 0, 1]))
         self.assertLess(np.degrees(q_angle(out[17:30, 0], Q[17:30, 0])).max(), 0.5)
-        # unseen: exactly the last pose
-        self.assertTrue(np.allclose(out[30:40, 0], out[29, 0]))
+        # unseen: no keyframes there; the in-between motion carries on smoothly
+        # from the last seen pose to the next (here: along the steady turn)
+        self.assertLess(np.degrees(q_angle(out[30:40, 0], Q[30:40, 0])).max(), 3.0)
         # no frame-to-frame step larger than the motion itself plus the catch-up
         steps = np.degrees(q_angle(out[11:, 0], out[10:-1, 0]))
         self.assertLess(steps.max(), 12.0)

@@ -190,24 +190,28 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
 * **A still camera stays still** (see *The camera*): it is exactly still
   wherever the background is.
 * **Spins and back views.** See *Which way the body faces* above.
-* **Only what is seen is animated; everything else keeps its pose.** A bone
+* **Only what is seen is keyframed.** A bone
   moves only while all the joints that define it are clearly inside the
   picture, detected (the whole-body model sure of it or MediaPipe calling it
   visible) and not behind something (the person mask says the pixel is not
   the person and the pose model agrees). A joint the whole-body model puts on
   the edge of the picture needs MediaPipe to see it too, and glimpses shorter
-  than 0.15 s do not count. Otherwise the bone keeps exactly the pose it had
-  in the previous frame, and when it is seen again it moves on from that pose
-  (eased over 0.2 s). So:
-  * the character out of the shot: nothing moves; it stays where it was,
-  * only partly in the shot, walking behind something, closer to the camera,
-    zoomed or cut in: only the visible part moves (legs out of the picture or
-    behind an object stay as they were, a hand that is not detected keeps its
-    pose and its forearm twist); the character's position follows whatever
-    part of it is seen (hips, shoulders, eyes, a knee, a foot, a hand),
+  than 0.15 s do not count. A joint also counts when both models are fairly
+  sure of it (a leg under a skirt or behind hair), and a weak detection that
+  runs into a clear sighting, before or after, counts too.
+* **Keyframes only where seen.** A bone gets keyframes only while it is seen.
+  Where it is not (out of the picture, behind something, cut off by a zoom or
+  a cut), it gets no keyframes: the motion in between is a smooth curve from
+  its last seen pose to its next seen pose, leaving and arriving with the
+  speed it had there. The character's position works the same way. So:
+  * the character out of the shot: it moves smoothly from where it left to
+    where it comes back; after the last sighting it stays,
+  * only partly in the shot: the visible part follows the video, the rest
+    moves in between its sightings; the position follows whatever part is
+    seen (hips, shoulders, eyes, a knee, a foot, a hand),
   * until a bone is first seen it is in the **A pose** (arms 45 degrees down),
-    and it starts moving only once it is actually in the picture.
-  A visible bone whose parent is held keeps the direction it is seen in.
+    and it eases into its first seen pose once it is in the picture.
+  A visible bone whose parent is not seen keeps the direction it is seen in.
   Frames whose detection contradicts everything around them count as not
   seen.
 * **Context from both directions.** The person tracker needs most of a body
