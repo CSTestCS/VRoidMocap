@@ -20,6 +20,7 @@
     <button data-step="setup" class="active">1 · Files</button>
     <button data-step="analysis" disabled>2 · Analysis</button>
     <button data-step="viewer" disabled>3 · Animation</button>
+    <button data-step="keys" disabled title="Keyframe the fingers and the face on top of the animation">4 · Fingers &amp; face</button>
   </nav>
   <div id="jobbar" hidden>
     <div class="jobmsg" id="jobmsg"></div>
@@ -123,6 +124,28 @@
           <canvas id="lmCanvas"></canvas>
         </div>
       </div>
+      <aside id="keyPanel" class="keypanel" hidden>
+        <div class="kp-top">
+          <div class="seg" id="kpTabs">
+            <button data-tab="hands" class="active">Fingers</button>
+            <button data-tab="face">Expressions</button>
+          </div>
+          <span class="muted small" id="kpCount"></span>
+        </div>
+        <div class="kp-tools">
+          <button id="kpPrev" class="ghost small" title="Previous key (Shift+←)">◀ key</button>
+          <button id="kpNext" class="ghost small" title="Next key (Shift+→)">key ▶</button>
+          <button id="kpKeyAll" class="small" title="Key every channel of this tab at this frame (K)">◆ Key all here</button>
+          <button id="kpDelHere" class="ghost small" title="Delete this tab's keys at this frame">Delete keys here</button>
+        </div>
+        <div id="kpHands" class="kp-body"></div>
+        <div id="kpFace" class="kp-body" hidden>
+          <input id="kpFilter" class="kp-filter" placeholder="Filter expressions…">
+          <div id="kpExprList"></div>
+        </div>
+        <p class="muted small kp-help">Scrub or step to a frame and move a slider: that sets a key there (◆). Between keys the value moves smoothly; before the first key and after the last it holds. Curl −10 bends a finger slightly back, 0 is straight, 100 is a fist; splay 0 is the model's own spread, 10 is wide. Keys are saved with the project and go into the export.</p>
+        <div class="kp-tools"><button id="kpClear" class="ghost small">Clear this tab's keys…</button></div>
+      </aside>
     </div>
     <div class="transport">
       <button id="playBtn" class="icon" title="Play / pause (space)">▶</button>

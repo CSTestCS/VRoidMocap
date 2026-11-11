@@ -728,6 +728,111 @@ class BoneTrackers(unittest.TestCase):
         self.assertFalse(inf2[0, L_KNEE])
 
 
+class BonesFromSegments(unittest.TestCase):
+    def test_shin_from_knee_and_tracker_when_the_foot_is_below_the_picture(self):
+        from vroidmocap.core.detect import L_ANK, L_KNEE
+        from vroidmocap.core.retarget import bones_from_segments
+        N, W, H = 1, 1920, 1080
+        uv = np.zeros((N, 33, 2)); conf = np.zeros((N, 33)); seen0 = np.zeros((N, 33), bool)
+        uv[0, L_KNEE] = [900, 800]; seen0[0, L_KNEE] = True      # knee seen
+        uv[0, L_ANK] = [905, 1078]; conf[0, L_ANK] = 0.7          # the detector puts the ankle on the edge
+        markers = np.full((N, 8, 3, 2), np.nan)
+        markers[0, 5, 0] = [910, 900]                             # the shin's first tracker (25%) is seen
+        wb2d = np.zeros((N, 133, 2)); wb2d[0, 13] = uv[0, L_KNEE]  # (the whole-body knee is the left one)
+        L2d = np.full((N, 8), 400.0); dz = np.zeros((N, 8))
+        uv2, conf2, known, placed = bones_from_segments(uv, conf, seen0, markers, (0.25, 0.5, 0.75),
+                                                        np.ones(N, bool), W, H, wb2d, L2d, dz)
+        self.assertTrue(known[0, 5])                               # the shin is known
+        self.assertTrue(placed[0, L_ANK])
+        d = uv2[0, L_ANK] - uv[0, L_KNEE]
+        self.assertAlmostEqual(np.linalg.norm(d), 400.0, delta=4.0)  # its full length, past the edge
+        self.assertGreater(uv2[0, L_ANK, 1], H)
+        u = d / np.linalg.norm(d); v = np.array([10, 100.0]) / np.linalg.norm([10, 100.0])
+        self.assertGreater(np.dot(u, v), 0.999)                    # along the knee -> tracker line
+
+    def test_an_arm_behind_the_body_is_left_alone(self):
+        from vroidmocap.core.detect import L_EL, L_WR
+        from vroidmocap.core.retarget import bones_from_segments
+        N = 1
+        uv = np.zeros((N, 33, 2)); conf = np.zeros((N, 33)); seen0 = np.zeros((N, 33), bool)
+        uv[0, L_EL] = [900, 500]; seen0[0, L_EL] = True
+        markers = np.full((N, 8, 3, 2), np.nan); markers[0, 1, 0] = [920, 560]
+        wb2d = np.zeros((N, 133, 2)); wb2d[0, 7] = uv[0, L_EL]
+        _, _, known, _ = bones_from_segments(uv, conf, seen0, markers, (0.25, 0.5, 0.75), np.ones(N, bool),
+                                             1920, 1080, wb2d, np.full((N, 8), 200.0), np.zeros((N, 8)))
+        self.assertFalse(known[0, 1])  # wrist in the picture, nothing in front of it: the trackers may be on the chest
+
+
+class HandKeys(unittest.TestCase):
+    def test_curves_hold_and_do_not_overshoot(self):
+        from vroidmocap.core.keys import evaluate
+        k = [[0.0, 0.0], [1.0, 100.0], [2.0, 100.0], [3.0, 20.0]]
+        t = np.linspace(-1, 4, 501)
+        v = evaluate(k, t)
+        self.assertTrue(np.all(v >= -1e-9) and np.all(v <= 100 + 1e-9))
+        self.assertAlmostEqual(evaluate(k, [-1.0])[0], 0.0)
+        self.assertAlmostEqual(evaluate(k, [1.5])[0], 100.0)      # flat between equal keys
+        self.assertAlmostEqual(evaluate(k, [9.0])[0], 20.0)       # holds after the last key
+        self.assertEqual(evaluate([], [0.5], 15.0)[0], 15.0)       # no keys: the default
+
+    def test_clean_keys_clamps_and_sorts(self):
+        from vroidmocap.core.keys import clean_keys
+        c = clean_keys({"leftIndex.curl": [[2, 500], [1, -50], ["x", 1]], "expr.happy": [[0, 30]], "bad": 3})
+        self.assertEqual(c["leftIndex.curl"], [[1.0, -10.0], [2.0, 100.0]])
+        self.assertEqual(c["expr.happy"], [[0.0, 30.0]])
+        self.assertNotIn("bad", c)
+
+    def test_fist_curls_towards_the_palm_and_splay_spreads(self):
+        from vroidmocap.core.keys import bake_fingers
+        skel = synthetic_skeleton()
+        B = len(skel.bones)
+        bi = {b: i for i, b in enumerate(skel.bones)}
+        anim = {"bones": skel.bones, "quats": np.tile([0, 0, 0, 1.0], (3, B, 1)), "fps": 1.0, "frames": 3}
+        ch = {}
+        for side in ("left", "right"):
+            for f in FINGERS:
+                ch[f"{side}{f}.curl"] = [[0, 0], [1, 100], [2, 0]]
+                ch[f"{side}{f}.splay"] = [[0, 0], [1, 0], [2, 10]]
+        Q = bake_fingers(skel, anim, ch)
+        pos, _ = avatar_fk(skel, Q.astype(float), np.zeros((3, 3)))
+        for side in ("left", "right"):
+            h = pos[:, bi[side + "Hand"]]
+            tip = pos[:, bi[side + "IndexDistal"]]
+            self.assertLess(tip[1, 1] - h[1, 1], tip[0, 1] - h[0, 1] - 0.01)  # fist: down, to the palm side
+            def d(k, f):
+                v = pos[k, bi[side + f + "Intermediate"]] - pos[k, bi[side + f + "Proximal"]]
+                return v / np.linalg.norm(v)
+            spread0 = np.degrees(np.arccos(np.clip(np.dot(d(0, "Index"), d(0, "Little")), -1, 1)))
+            spread2 = np.degrees(np.arccos(np.clip(np.dot(d(2, "Index"), d(2, "Little")), -1, 1)))
+            self.assertGreater(spread2, spread0 + 20)
+
+
+class BlendShapeExport(unittest.TestCase):
+    def test_blend_shape_channels_are_written_and_animated(self):
+        from vroidmocap.core.fbx_writer import write_fbx
+        N = 5
+        nodes = [{"name": "root", "parent": None, "kind": "LimbNode", "rest_t": np.zeros(3), "rest_r": np.zeros(3),
+                  "anim_t": None, "anim_r": np.zeros((N, 3))}]
+        model = {"meshes": [{"name": "Face", "vertices": np.eye(3) * 10, "normals": None, "uvs": None,
+                             "tris": np.array([[0, 1, 2]]), "tri_mat": np.array([0]), "materials": [0],
+                             "parent": None, "skin": None,
+                             "shapes": [{"name": "Smile", "index": np.array([1]), "delta": np.array([[0, 1.0, 0]]),
+                                         "keys": [(0, 0)]}]}],
+                 "materials": [{"name": "m", "color": [1, 1, 1, 1], "texture": None}], "textures": [],
+                 "shape_anim": {(0, 0): np.linspace(0, 1, N)}}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.fbx")
+            write_fbx(p, nodes, N, 30.0, model=model)
+            tree = read_fbx_tree(p)
+        objects = next(n for n in tree if n[0] == "Objects")
+        kinds = [(n[0], n[1][-1].decode() if n[1] and isinstance(n[1][-1], bytes) else None) for n in objects[2]]
+        self.assertIn(("Deformer", "BlendShape"), kinds)
+        self.assertIn(("Deformer", "BlendShapeChannel"), kinds)
+        self.assertIn(("Geometry", "Shape"), kinds)
+        conns = next(n for n in tree if n[0] == "Connections")
+        self.assertTrue(any(c[1][0] == b"OP" and c[1][-1] == b"DeformPercent" for c in conns[2]))
+
+
 if __name__ == "__main__":
     unittest.main()
 

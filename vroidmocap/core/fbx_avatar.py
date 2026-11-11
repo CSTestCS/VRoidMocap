@@ -621,6 +621,14 @@ class FbxAvatar:
             Rc = np.einsum("ji,njk->nik", self.A, cq) @ to_fbx_cam
             aw.camera({"pos": (cp / self.unit) @ self.A, "rot_deg": mats_to_euler(Rc),
                        "vfov": np.asarray(anim["cam_vfov"], np.float64), "aspect": anim["width"] / anim["height"]})
+        if include_model and anim.get("expr_names") and "expr_w" in anim:
+            # hand-set blend shapes: the file's own blend shape channels, animated
+            ew = np.asarray(anim["expr_w"], np.float64)
+            for e in objs.children:
+                if e.name == b"Deformer" and len(e.props) > 2 and e.props[2][1] == b"BlendShapeChannel":
+                    nm = object_name(e)
+                    if nm in anim["expr_names"]:
+                        aw.scalar(int(e.props[0][1]), "DeformPercent", ew[:, anim["expr_names"].index(nm)] * 100.0)
         # time settings, definitions, takes
         gs = find(tree, "GlobalSettings")
         if gs is not None:

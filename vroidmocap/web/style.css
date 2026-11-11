@@ -92,3 +92,24 @@ dialog .actions { justify-content: flex-end; margin: 6px 0 0; }
 .transport .audio.off input[type=range] { opacity: 0.45; }
 .transport .crop { display: flex; align-items: center; gap: 6px; margin-left: 8px; flex-wrap: wrap; }
 .transport .crop .check { margin: 0 4px; }
+
+/* step 4: fingers & face keys */
+.keypanel { width: 360px; flex-shrink: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.kp-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.kp-tools { display: flex; gap: 6px; flex-wrap: wrap; }
+.kp-body h4 { margin: 8px 0 4px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.kp-body h4 .presets button { padding: 2px 6px; }
+.kp-body h4 .presets { margin-left: auto; display: flex; gap: 4px; }
+.kp-row { display: grid; grid-template-columns: 74px 1fr 48px 14px; gap: 4px 6px; align-items: center; font-size: 12px; }
+.kp-row .nm { color: var(--muted); }
+.kp-row input[type=range] { width: 100%; accent-color: var(--accent2); }
+.kp-row input[type=number] { width: 44px; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 4px; font: inherit; padding: 1px 3px; }
+.kp-row .kd { color: #3a434f; cursor: pointer; text-align: center; user-select: none; }
+.kp-row .kd.on { color: var(--accent2); }
+.kp-row .kd.has { color: #8a6a3a; }
+.kp-finger { border-top: 1px solid var(--line); padding: 4px 0; }
+.kp-finger:first-of-type { border-top: 0; }
+.kp-filter { width: 100%; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; margin-bottom: 6px; }
+.kp-help { margin: 4px 0 0; }
+body.keys-mode .stage.only3d #paneVideo, body.keys-mode .stage.overlay #paneVideo { display: none; }
+@media (max-width: 1100px) { .keypanel { width: 300px; } }

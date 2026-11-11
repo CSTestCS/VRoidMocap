@@ -40,7 +40,8 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 18
+SOLVE_VERSION = 19
+FINGERS_FROM_VIDEO = False  # fingers are set by hand afterwards (keys.py); the solve leaves them at rest
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
 HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
 NO_CLIPPING = True    # limbs do not pass through the body / each other
@@ -49,6 +50,8 @@ NO_CLIPPING = True    # limbs do not pass through the body / each other
 CONTEXT_BONES = ("leftUpperLeg", "rightUpperLeg")
 CONTEXT_LIMBS = True  # hidden arms / thighs from the motion around them
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
+SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
+SEGMENT_BONES = True  # a limb bone is known from one joint + one tracker on it (or two trackers)
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
@@ -525,20 +528,43 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # of the thigh visible) still shows its line; its hidden end is put where
     # the line reaches at the bone's length
     inferred = np.zeros((N, 33), bool)
+    seg_known = np.zeros((N, 8), bool)
     if "markers" in capture:
         from .capture import MARKER_FRAC
-        strong = ((raw_scores(wb_sync, vis, W, H, N) >= 0.6) | (vis >= 0.5)) if wb_sync is not None else (vis >= 0.5)
-        # how long each limb can look in the picture: its measured length at
-        # the character's distance
+        raw0 = raw_scores(wb_sync, vis, W, H, N) if wb_sync is not None else np.zeros((N, 33))
+        strong = (raw0 >= 0.6) | (vis >= 0.5)
+        # how long each limb looks in the picture when square-on: its measured
+        # length at the character's distance
         exp_len = np.full((N, 8), np.nan)
         okZ = valid & np.isfinite(zroot_prop)
         for k, (a_, b_) in enumerate(SEG_MP[:8]):
             e_ = lift.EDGES.index((lift.JI[a_], lift.JI[b_]))
             if np.isfinite(L_prop[e_]):
                 exp_len[okZ, k] = focal[okZ] * L_prop[e_] / np.maximum(zroot_prop[okZ], 0.05)
-        uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
-                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64),
-                                                exp_len=exp_len, covered=occluded_joints(seg, vis_raw))
+        covered = occluded_joints(seg, vis_raw)
+        if SEGMENT_BONES:
+            # one joint + one tracker (or two trackers) of a limb bone seen:
+            # the bone is known, whatever covers the rest of it
+            m_ = 0.015 * max(W, H)
+            in0 = (uv[..., 0] > m_) & (uv[..., 0] < W - m_) & (uv[..., 1] > m_) & (uv[..., 1] < H - m_)
+            seen0 = strong & in0 & valid[:, None]
+            if covered is not None:
+                seen0 &= ~covered
+            dz = np.full((N, 8), np.nan)
+            for k, (a_, b_) in enumerate(SEG_MP[:8]):
+                e_ = lift.EDGES.index((lift.JI[a_], lift.JI[b_]))
+                Lb = L_prop[e_] if np.isfinite(L_prop[e_]) else np.nan
+                zz = z_extra[:, b_] - z_extra[:, a_] if z_extra is not None else np.full(N, np.nan)
+                zz = np.where(np.isfinite(zz), zz, P0[:, b_, 2] - P0[:, a_, 2])
+                dz[:, k] = zz / Lb
+            uv, conf, seg_known, inferred = bones_from_segments(
+                uv, conf, seen0, capture["markers"].astype(np.float64), MARKER_FRAC, valid, W, H,
+                capture["wb2d"].astype(np.float64), exp_len, dz, covered=covered)
+        else:
+            uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
+                                                    MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64),
+                                                    exp_len=exp_len, covered=covered)
+    dbg("seg_known", seg_known)
     dbg("inferred", inferred)
     body_conf = conf.copy()
     P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps, torso=torso_facing,
@@ -732,7 +758,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
     raw_plain = raw_scores(wb_sync, np.ones_like(vis), W, H, N)  # (no edge rule)
     near_out = (just_outside(lm2d, raw_plain, W, H) | inferred) & (valid & ~bad)[:, None]
-    seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of, near_out)
+    seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of, near_out,
+                     seg_known=seg_known & (valid & ~bad)[:, None])
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
     conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
     if face_seen is not None and skel.has("head"):
@@ -829,6 +856,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         progress(0.92, "Keeping limbs from passing through each other")
         allow = touch.allowed_overlaps(con, fps) if HAND_CONTACTS else None
         Q, _ = body_shape.resolve_collisions(skel, Q, caps, fps, shot_of, active=valid, allow=allow)
+    if not FINGERS_FROM_VIDEO:
+        for i_, b_ in enumerate(skel.bones):
+            if any(f_ in b_ for f_ in FINGERS):
+                Q[:, i_] = (0.0, 0.0, 0.0, 1.0)
     dbg("Q_final", Q)
 
     # ---- 8. the cloned camera: where the real camera is in the scene (it never
@@ -1402,7 +1433,7 @@ def floor_follow(skel, Q, root, contacts, fps, shot_of, sigma_s=0.08, max_m=0.2)
     low, _ = _foot_lows(skel, Q, root)
     N = len(root)
     out = np.zeros(N)
-    want = np.where(contacts, -low, np.inf).min(1)
+    want = np.where(contacts, -low, -np.inf).max(1)  # the lowest planted foot
     for (a, b) in runs(np.ones(N, bool), shot_of):
         w = want[a:b]
         ok = np.isfinite(w)
@@ -1590,6 +1621,124 @@ def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None,
     return uv, conf, out
 
 
+def bones_from_segments(uv, conf, seen0, markers, fracs, valid, W, H, wb2d, L2d, dz, min_px=6.0,
+                        line_tol=0.15, agree=0.2, covered=None):
+    """A limb bone is known when one of its two joints and one of the trackers
+    riding it are seen (the line from the joint through the tracker is the
+    bone's direction in the picture), or when two of its trackers are seen
+    (their line, and where the joints lie on it at the trackers' fractions).
+    Something cutting across the bone (a bar, a strand of hair, the edge of the
+    picture) then hides only part of it, not the whole limb. The hidden end is
+    put on that line at the bone's length in the picture: its measured length,
+    foreshortened by how far it reaches towards or away from the camera
+    (depth from the motion), or - when the trackers were put on the full bone -
+    simply where their fractions say.
+
+    seen0 (N,33): joints clearly seen. markers (N,8,F,2) px (nan: lost).
+    L2d (N,8): the bone's full length in the picture when square-on (px).
+    dz (N,8): depth of the distal joint minus the proximal one, as a share of
+    the bone's length (nan: unknown). Arms: only where the hidden end is
+    outside the picture or behind something that is not the person (covered):
+    an arm behind the body has its trackers slide onto the chest.
+    Returns uv, conf, known (N,8) bones known this way, placed (N,33) joints
+    placed this way."""
+    from .capture import SEGMENTS
+    N = len(uv)
+    uv, conf = uv.copy(), conf.copy()
+    known = np.zeros((N, 8), bool)
+    placed = np.zeros((N, 33), bool)
+    fr = np.asarray(fracs, float)
+    mirror = [2, 3, 0, 1, 6, 7, 4, 5]
+    fin = np.isfinite(markers[..., 0])
+    sn = seen0.copy()  # a joint placed this way counts for the next bone down the limb
+    inside = fin & (markers[..., 0] >= 0) & (markers[..., 0] < W) & (markers[..., 1] >= 0) & (markers[..., 1] < H)
+    for k, (a, b) in enumerate(SEG_MP[:8]):
+        if k not in SEGMENT_LIMBS:
+            continue
+        todo = np.where(valid & ~(sn[:, a] & sn[:, b]) & inside[:, [k, mirror[k]]].any((1, 2)))[0]
+        for t in todo:
+            Lp = L2d[t, k]
+            if not np.isfinite(Lp) or Lp < 2 * min_px:
+                continue
+            q = dz[t, k] if np.isfinite(dz[t, k]) else 0.0
+            # the bone's length in the picture, foreshortened by its depth
+            Lfs = Lp * np.sqrt(max(1.0 - min(q * q, 0.94), 0.06))
+            # which tracker set rides this limb: the one whose limb has its
+            # joints where this limb's joints are (labels can swap)
+            ends = [j for j in (a, b) if sn[t, j]] or [a, b]
+            def dist(c):
+                return sum(np.linalg.norm(wb2d[t, SEGMENTS[c][0 if j == a else 1]] - uv[t, j]) for j in ends)
+            c = min((k, mirror[k]), key=dist)
+            ok = inside[t, c]
+            if not ok.any():
+                continue
+            idx = np.where(ok)[0]
+            mk = markers[t, c, idx]
+            f_ = fr[idx]
+            if sn[t, a] or sn[t, b]:
+                s_end, h_end = (a, b) if sn[t, a] else (b, a)
+                S = uv[t, s_end]
+                lever = f_ if s_end == a else 1 - f_
+                m = int(np.argmax(lever))
+                d = mk[m] - S
+                dl = float(np.linalg.norm(d))
+                if dl < max(min_px, 0.12 * Lfs):
+                    continue
+                u = d / dl
+                rel = mk - S
+                if len(idx) > 1:
+                    off = np.abs(rel[:, 0] * u[1] - rel[:, 1] * u[0]) / dl
+                    if off.max() > line_tol or (rel @ u).min() < -0.1 * dl:
+                        continue
+                if dl > 1.25 * Lp:  # a tracker beyond the bone's end: it slid onto something else
+                    continue
+                L_tr = dl / lever[m]
+                L_use = L_tr if 0.8 * Lfs <= L_tr <= 1.2 * Lfs else max(Lfs, 1.02 * dl)
+                est = S + u * L_use
+                det = uv[t, h_end]
+                if k < 4 and not (est[0] < 0 or est[0] >= W or est[1] < 0 or est[1] >= H or
+                                  (covered is not None and covered[t, h_end])):
+                    continue
+                if conf[t, h_end] >= 0.2 and np.linalg.norm(det - est) < agree * L_use:
+                    est = 0.5 * (est + det)  # the detectors agree: between the two
+                uv[t, h_end] = est
+                conf[t, h_end] = max(conf[t, h_end], 0.6)
+                placed[t, h_end] = True
+                sn[t, h_end] = True
+                known[t, k] = True
+            else:
+                # no joint seen: two trackers far enough apart give the line,
+                # and one of the (unsure) joint detections must lie on it
+                if k < 4 or len(idx) < 2 or np.ptp(f_) < 0.25:
+                    continue
+                lo, hi = int(np.argmin(f_)), int(np.argmax(f_))
+                d = mk[hi] - mk[lo]
+                dl = float(np.linalg.norm(d))
+                if dl < min_px:
+                    continue
+                u = d / dl
+                L_tr = dl / (f_[hi] - f_[lo])
+                if not (0.5 * Lfs <= L_tr <= 1.25 * Lp):
+                    continue
+                pa = mk[lo] - u * L_tr * f_[lo]
+                pb = pa + u * L_tr
+                ea = np.linalg.norm(uv[t, a] - pa) if conf[t, a] >= 0.15 else np.inf
+                eb = np.linalg.norm(uv[t, b] - pb) if conf[t, b] >= 0.15 else np.inf
+                if min(ea, eb) > agree * L_tr:
+                    continue
+                if len(idx) > 2:
+                    rel = mk - pa
+                    if (np.abs(rel[:, 0] * u[1] - rel[:, 1] * u[0]) / L_tr).max() > line_tol:
+                        continue
+                for j, p_ in ((a, pa), (b, pb)):
+                    uv[t, j] = p_
+                    conf[t, j] = max(conf[t, j], 0.6)
+                    placed[t, j] = True
+                    sn[t, j] = True
+                known[t, k] = True
+    return uv, conf, known, placed
+
+
 def rigid_track(uv, raw, wb2d, wbs, segM, segN, valid, fps, anchor=0.65, half_life_s=0.4,
                 min_pts=6, agree=0.2):
     """Body segments as rigid pieces. Capture tracked texture points along every
@@ -1747,13 +1896,15 @@ def just_outside(uv, raw, W, H, reach=0.25, min_score=0.5):
     return out & near & (raw >= min_score)
 
 
-def bone_seen(skel, js, hvalid, face_seen, fps, shot_of, near_out=None):
+def bone_seen(skel, js, hvalid, face_seen, fps, shot_of, near_out=None, seg_known=None):
     """(N,B): every joint defining the bone is seen. Bones the solver never
     drives (shoulders, eyes, jaw...) count as seen (they stay as they are).
     With near_out: a limb with one end seen and the other just outside the
     picture (a thigh coming in from the top edge down to a visible knee, a
     shin running out of the bottom) counts as seen: the part in the picture
-    shows which way it points."""
+    shows which way it points. With seg_known (N,8): a limb bone whose
+    direction is known from one joint and a tracker on it (or two trackers)
+    counts as seen (see bones_from_segments)."""
     N = len(js)
     out = np.ones((N, len(skel.bones)), bool)
     head = face_seen if face_seen is not None else js[:, NOSE] & (js[:, L_EAR] | js[:, R_EAR])
@@ -1771,6 +1922,8 @@ def bone_seen(skel, js, hvalid, face_seen, fps, shot_of, near_out=None):
             if near_out is not None and b in LIMB_BONES:
                 a_, d_ = LIMB_BONES[b]
                 m = m | (js[:, d_] & near_out[:, a_]) | (js[:, a_] & near_out[:, d_])
+            if seg_known is not None and b in LIMB_BONES:
+                m = m | seg_known[:, SEG_MP.index(LIMB_BONES[b])]
         else:
             continue
         out[:, i] = _min_run(m, fps, shot_of)
@@ -2072,6 +2225,28 @@ def planted_legs(Q, root, seen, valid, skel, fps, shot_of, ramp_s=0.2):
         Gf[:, 0, 0], Gf[:, 0, 2], Gf[:, 1, 1], Gf[:, 2, 0], Gf[:, 2, 2] = c, s_, 1.0, -s_, c
         _set_world(Q, skel, side + "Foot", Gf, np.where(m, w, 0.0))
         planted[:, si] = m
+    # a lower leg that is seen (from the knee and the trackers on the shin)
+    # above a foot that is not (below the picture, behind something): the shin
+    # keeps the angle it is seen at; the foot is flat and, when it is the
+    # lower of the two and not moving, stands on the floor
+    pos, rot = avatar_fk(skel, Q, root)
+    fwd = np.einsum("nij,j->ni", rot[:, idx["hips"]], np.array([0, 0, 1.0]))
+    yaw = np.arctan2(fwd[:, 0], fwd[:, 2])
+    c, s_ = np.cos(yaw), np.sin(yaw)
+    Gf = np.zeros((N, 3, 3))
+    Gf[:, 0, 0], Gf[:, 0, 2], Gf[:, 1, 1], Gf[:, 2, 0], Gf[:, 2, 2] = c, s_, 1.0, -s_, c
+    ank = np.stack([pos[:, idx["leftFoot"]], pos[:, idx["rightFoot"]]], 1)
+    low = ank[:, :, 1].min(1)
+    sp = np.zeros((N, 2))
+    sp[1:] = np.linalg.norm(np.diff(ank[:, :, [0, 2]], axis=0), axis=-1) * fps
+    for si, side in enumerate(("left", "right")):
+        il, ifo = idx[side + "LowerLeg"], idx[side + "Foot"]
+        m2 = valid & seen[:, il] & ~seen[:, ifo] & ~planted[:, si]
+        if not m2.any():
+            continue
+        w = _ramp_weights(m2, seen[:, ifo], shot_of, nr)
+        _set_world(Q, skel, side + "Foot", Gf, np.where(m2, w, 0.0))
+        planted[:, si] |= m2 & (ank[:, si, 1] - low < 0.05) & (sp[:, si] < 0.6)
     return Q, planted
 
 

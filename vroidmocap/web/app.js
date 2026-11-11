@@ -22,9 +22,14 @@ const S = { analysis: null, character: null, viewer: null, anim: null, playing: 
 
 // ------------------------------------------------------------------ navigation
 function showStep(name) {
-  document.querySelectorAll(".step").forEach((s) => s.classList.toggle("active", s.id === "step-" + name));
+  const keysMode = name === "keys";
+  const sec = keysMode ? "viewer" : name;
+  document.querySelectorAll(".step").forEach((s) => s.classList.toggle("active", s.id === "step-" + sec));
   document.querySelectorAll("#steps button").forEach((b) => b.classList.toggle("active", b.dataset.step === name));
-  if (name === "viewer") S.viewer?.resize();
+  document.body.classList.toggle("keys-mode", keysMode);
+  $("keyPanel").hidden = !keysMode;
+  if (keysMode) refreshKeyPanel();
+  if (sec === "viewer") { S.viewer?.resize(); setTimeout(() => { S.viewer?.resize(); if (S.anim) { sizeLm(); drawTrack(); } }, 30); }
   if (name === "analysis") drawCamChart();
 }
 document.querySelectorAll("#steps button").forEach((b) => b.addEventListener("click", () => showStep(b.dataset.step)));
@@ -253,6 +258,8 @@ async function openAnimation(cid) {
       : "";
     S.character = cid;
     $("steps").children[2].disabled = false;
+    $("steps").children[3].disabled = false;
+    await loadKeys(cid);
     const c = S.analysis.characters.find((x) => x.id === cid);
     $("viewerChar").textContent = c ? c.name : "";
     $("scrub").max = meta.frames - 1;
@@ -265,6 +272,174 @@ async function openAnimation(cid) {
     seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
+// ------------------------------------------------------------------ step 4: fingers & face keys
+const K = { channels: {}, rig: [], expressions: [], defaults: {}, tab: "hands", saveTimer: null, cid: null };
+const FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Little"];
+function kSlopes(t, v) {  // monotone cubic (same as keys.py)
+  const n = t.length, m = new Array(n).fill(0);
+  if (n < 2) return m;
+  const h = [], d = [];
+  for (let i = 0; i < n - 1; i++) { h.push(t[i + 1] - t[i]); d.push((v[i + 1] - v[i]) / (h[i] > 0 ? h[i] : 1e-9)); }
+  m[0] = d[0]; m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] * d[i] <= 0) m[i] = 0;
+    else { const w1 = 2 * h[i] + h[i - 1], w2 = h[i] + 2 * h[i - 1]; m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]); }
+  }
+  for (let i = 0; i < n - 1; i++) if (d[i] === 0) { m[i] = 0; m[i + 1] = 0; }
+  return m;
+}
+function kEval(keys, time, def) {
+  if (!keys || !keys.length) return def;
+  if (keys.length === 1 || time <= keys[0][0]) return keys[0][1];
+  const n = keys.length;
+  if (time >= keys[n - 1][0]) return keys[n - 1][1];
+  const t = keys.map((k) => k[0]), v = keys.map((k) => k[1]);
+  if (!keys._m) keys._m = kSlopes(t, v);  // cached per edit (arrays are replaced on change)
+  const m = keys._m;
+  let i = 0;
+  while (i < n - 2 && t[i + 1] <= time) i++;
+  const h = t[i + 1] - t[i], u = Math.min(1, Math.max(0, (time - t[i]) / (h > 0 ? h : 1e-9)));
+  const h00 = 2 * u ** 3 - 3 * u ** 2 + 1, h10 = u ** 3 - 2 * u ** 2 + u, h01 = -2 * u ** 3 + 3 * u ** 2, h11 = u ** 3 - u ** 2;
+  return h00 * v[i] + h10 * h * m[i] + h01 * v[i + 1] + h11 * h * m[i + 1];
+}
+function kValue(ch, time) { return kEval(K.channels[ch], time, K.defaults[ch] ?? 0); }
+function kAll(time) { const o = {}; for (const ch of Object.keys(K.defaults)) o[ch] = kValue(ch, time); return o; }
+const kTol = () => 0.5 / (S.anim?.fps || 30);
+const kNow = () => S.frame / S.anim.fps;
+function kKeyAt(ch, time) { const ks = K.channels[ch]; return ks ? ks.findIndex((k) => Math.abs(k[0] - time) < kTol()) : -1; }
+function kSet(ch, time, v) {
+  const ks = (K.channels[ch] || []).filter((k) => Math.abs(k[0] - time) >= kTol());
+  ks.push([Math.round(time * 10000) / 10000, v]);
+  ks.sort((a, b) => a[0] - b[0]);
+  K.channels[ch] = ks;
+  kChanged();
+}
+function kDel(ch, time) {
+  if (!K.channels[ch]) return;
+  const ks = K.channels[ch].filter((k) => Math.abs(k[0] - time) >= kTol());
+  if (ks.length) K.channels[ch] = ks; else delete K.channels[ch];
+  kChanged();
+}
+function kChanged() {
+  clearTimeout(K.saveTimer);
+  const cid = K.cid;
+  const body = { channels: Object.fromEntries(Object.entries(K.channels).map(([c, ks]) => [c, ks.map((k) => [k[0], k[1]])])) };
+  K.saveTimer = setTimeout(() => api(`/api/keys/${cid}`, body).catch((e) => toast("Keys not saved: " + e.message, true)), 400);
+  refreshKeyPanel();
+  drawTrack();
+}
+async function loadKeys(cid) {
+  try {
+    const info = await api(`/api/keys/${cid}`);
+    Object.assign(K, { channels: info.channels || {}, rig: info.rig || [], expressions: info.expressions || [], defaults: info.defaults || {}, cid });
+    S.viewer.setKeys(K.rig, kAll, K.expressions);
+    buildKeyPanel();
+  } catch (e) { toast("Finger / face keys unavailable: " + e.message, true); }
+}
+function tabChannels(tab = K.tab) {
+  return Object.keys(K.defaults).filter((c) => (tab === "face") === c.startsWith("expr."));
+}
+function kRow(ch, label, lo, hi, step) {
+  const row = document.createElement("div");
+  row.className = "kp-row";
+  row.dataset.ch = ch;
+  row.innerHTML = `<span class="nm">${label}</span><input type="range" min="${lo}" max="${hi}" step="${step}"><input type="number" min="${lo}" max="${hi}" step="${step}"><span class="kd" title="Key at this frame (click to add / remove)">◆</span>`;
+  const [rng, num, kd] = [row.children[1], row.children[2], row.children[3]];
+  const set = (v) => { v = Math.max(lo, Math.min(hi, Number(v))); if (!Number.isFinite(v)) return; kSet(ch, kNow(), v); };
+  rng.oninput = () => set(rng.value);
+  num.onchange = () => set(num.value);
+  kd.onclick = () => { const t = kNow(); if (kKeyAt(ch, t) >= 0) kDel(ch, t); else kSet(ch, t, kValue(ch, t)); };
+  return row;
+}
+const PRESETS = {
+  Relaxed: { Thumb: [10, 2], Index: [15, 2], Middle: [15, 2], Ring: [15, 2], Little: [15, 2] },
+  Open: { Thumb: [0, 6], Index: [0, 6], Middle: [0, 6], Ring: [0, 6], Little: [0, 6] },
+  Fist: { Thumb: [70, 0], Index: [100, 0], Middle: [100, 0], Ring: [100, 0], Little: [100, 0] },
+  Point: { Thumb: [60, 0], Index: [0, 0], Middle: [100, 0], Ring: [100, 0], Little: [100, 0] },
+  Peace: { Thumb: [70, 0], Index: [0, 6], Middle: [0, 6], Ring: [100, 0], Little: [100, 0] },
+};
+function buildKeyPanel() {
+  const hands = $("kpHands");
+  hands.innerHTML = "";
+  for (const side of ["left", "right"]) {
+    const h = document.createElement("h4");
+    h.innerHTML = `${side === "left" ? "Left" : "Right"} hand <span class="presets"></span>`;
+    for (const name of Object.keys(PRESETS)) {
+      const b = document.createElement("button");
+      b.className = "ghost small"; b.textContent = name; b.title = `Key the ${side} hand as “${name}” at this frame`;
+      b.onclick = () => { const t = kNow(); for (const [f, [c, sp]] of Object.entries(PRESETS[name])) { kSetQuiet(`${side}${f}.curl`, t, c); kSetQuiet(`${side}${f}.splay`, t, sp); } kChanged(); };
+      h.querySelector(".presets").appendChild(b);
+    }
+    const mb = document.createElement("button");
+    mb.className = "ghost small"; mb.textContent = "⇄"; mb.title = `Copy this hand's values at this frame to the other hand (as keys)`;
+    mb.onclick = () => { const t = kNow(), o = side === "left" ? "right" : "left"; for (const f of FINGER_NAMES) for (const k of ["curl", "splay"]) kSetQuiet(`${o}${f}.${k}`, t, kValue(`${side}${f}.${k}`, t)); kChanged(); };
+    h.querySelector(".presets").appendChild(mb);
+    hands.appendChild(h);
+    for (const f of FINGER_NAMES) {
+      if (!(`${side}${f}.curl` in K.defaults)) continue;
+      const box = document.createElement("div");
+      box.className = "kp-finger";
+      box.appendChild(kRow(`${side}${f}.curl`, `${f} curl`, -10, 100, 1));
+      box.appendChild(kRow(`${side}${f}.splay`, "splay", 0, 10, 0.1));
+      hands.appendChild(box);
+    }
+  }
+  const list = $("kpExprList");
+  list.innerHTML = "";
+  if (!K.expressions.length) list.innerHTML = `<p class="muted small">This avatar has no expressions or blend shapes.</p>`;
+  for (const nm of K.expressions) list.appendChild(kRow("expr." + nm, nm, 0, 100, 1));
+  refreshKeyPanel();
+}
+function kSetQuiet(ch, time, v) {
+  const ks = (K.channels[ch] || []).filter((k) => Math.abs(k[0] - time) >= kTol());
+  ks.push([Math.round(time * 10000) / 10000, v]);
+  ks.sort((a, b) => a[0] - b[0]);
+  K.channels[ch] = ks;
+}
+function refreshKeyPanel() {
+  if ($("keyPanel").hidden || !S.anim) return;
+  const t = kNow();
+  for (const row of document.querySelectorAll("#keyPanel .kp-row")) {
+    const ch = row.dataset.ch, v = kValue(ch, t);
+    const [rng, num, kd] = [row.children[1], row.children[2], row.children[3]];
+    if (document.activeElement !== rng) rng.value = v;
+    if (document.activeElement !== num) num.value = Math.round(v * 10) / 10;
+    kd.classList.toggle("on", kKeyAt(ch, t) >= 0);
+    kd.classList.toggle("has", !!K.channels[ch]);
+  }
+  const f = $("kpFilter").value.trim().toLowerCase();
+  for (const row of $("kpExprList").children) if (row.dataset.ch) row.hidden = f && !row.dataset.ch.slice(5).toLowerCase().includes(f);
+  const n = tabChannels().reduce((a, c) => a + (K.channels[c]?.length || 0), 0);
+  $("kpCount").textContent = `${n} key${n === 1 ? "" : "s"} in this tab`;
+}
+function keyTimes(tab) {
+  const ts = new Set();
+  for (const c of tabChannels(tab)) for (const k of K.channels[c] || []) ts.add(k[0]);
+  return [...ts].sort((a, b) => a - b);
+}
+function jumpKey(dir) {
+  const t = kNow(), ts = keyTimes();
+  const tgt = dir > 0 ? ts.find((x) => x > t + kTol()) : [...ts].reverse().find((x) => x < t - kTol());
+  if (tgt != null) { S.playing = false; updatePlay(); seek(Math.round(tgt * S.anim.fps)); }
+}
+document.querySelectorAll("#kpTabs button").forEach((b) => (b.onclick = () => {
+  K.tab = b.dataset.tab;
+  document.querySelectorAll("#kpTabs button").forEach((x) => x.classList.toggle("active", x === b));
+  $("kpHands").hidden = K.tab !== "hands";
+  $("kpFace").hidden = K.tab !== "face";
+  refreshKeyPanel();
+}));
+$("kpPrev").onclick = () => jumpKey(-1);
+$("kpNext").onclick = () => jumpKey(1);
+$("kpKeyAll").onclick = () => { const t = kNow(); for (const c of tabChannels()) kSetQuiet(c, t, kValue(c, t)); kChanged(); };
+$("kpDelHere").onclick = () => { const t = kNow(); for (const c of tabChannels()) { const ks = (K.channels[c] || []).filter((k) => Math.abs(k[0] - t) >= kTol()); if (ks.length) K.channels[c] = ks; else delete K.channels[c]; } kChanged(); };
+$("kpClear").onclick = () => {
+  if (!confirm(`Delete every ${K.tab === "face" ? "expression" : "finger"} key of this character?`)) return;
+  for (const c of tabChannels()) delete K.channels[c];
+  kChanged();
+};
+$("kpFilter").oninput = () => refreshKeyPanel();
+
 function firstValid() { const v = S.anim.valid; for (let i = 0; i < v.length; i++) if (v[i] > 0.5) return i; return 0; }
 $("otherChar").onclick = () => showStep("analysis");
 
@@ -311,6 +486,7 @@ function seek(f) {
   $("camBadge").textContent = S.viewer.mode === "video" || S.layout === "overlay" ? "Video camera" : "Free camera (drag to orbit, right-drag to pan, wheel to zoom)";
   if (S.layout !== "3d") loadFrameImage(f);
   else sizeLm();
+  refreshKeyPanel();
 }
 $("scrub").oninput = (e) => { S.playing = false; updatePlay(); seek(Number(e.target.value)); };
 $("stepBack").onclick = () => { S.playing = false; updatePlay(); seek(S.frame - 1); };
@@ -342,9 +518,12 @@ $("cropOut").onclick = () => setCrop(S.crop ? Math.min(S.crop[0], S.frame) : 0, 
 $("cropClear").onclick = () => setCrop(null);
 document.addEventListener("keydown", (e) => {
   if (!$("step-viewer").classList.contains("active") || e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.target.closest && e.target.closest("#keyPanel") && e.target.type === "range" && e.code.startsWith("Arrow")) return;
   if (e.code === "Space") { e.preventDefault(); $("playBtn").click(); }
+  if (e.shiftKey && !$("keyPanel").hidden && (e.code === "ArrowLeft" || e.code === "ArrowRight")) { e.preventDefault(); jumpKey(e.code === "ArrowLeft" ? -1 : 1); return; }
   if (e.code === "ArrowLeft") { e.preventDefault(); $("stepBack").click(); }
   if (e.code === "ArrowRight") { e.preventDefault(); $("stepFwd").click(); }
+  if (e.code === "KeyK" && !$("keyPanel").hidden) $("kpKeyAll").click();
   if (e.code === "KeyI") $("cropIn").click();
   if (e.code === "KeyO") $("cropOut").click();
   if (e.code === "KeyL") $("loop").click();
@@ -417,6 +596,7 @@ audio.addEventListener("error", () => {
 
 function drawTrack() {
   const cv = $("trackCanvas"), A = S.anim;
+  if (!A) return;
   const dpr = window.devicePixelRatio || 1;
   cv.width = cv.clientWidth * dpr; cv.height = 18 * dpr;
   const ctx = cv.getContext("2d");
@@ -429,6 +609,10 @@ function drawTrack() {
     const h = (A.hs[f * 2] >= 0.5) + (A.hs[f * 2 + 1] >= 0.5);
     ctx.fillStyle = ["#2a2f36", "#7b5a2a", "#c98a3a"][h];
     ctx.fillRect(x, 10, 1, 6);
+  }
+  if (K.cid === S.character) {  // hand-set keys: amber ticks (bright in step 4)
+    ctx.fillStyle = $("keyPanel").hidden ? "rgba(246,173,85,.45)" : "#f6ad55";
+    for (const tab of ["hands", "face"]) for (const t of keyTimes(tab)) ctx.fillRect(Math.round((t * A.fps / n) * W), tab === "hands" ? 0 : 9, 2, 9);
   }
   if (S.crop) {
     const x0 = (S.crop[0] / n) * W, x1 = ((S.crop[1] + 1) / n) * W;

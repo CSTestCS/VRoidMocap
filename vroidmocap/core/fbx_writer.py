@@ -223,7 +223,10 @@ def write_fbx(path, nodes, frames_count, fps, camera=None, take_name="Take 001",
         aw.camera(camera)
 
     if model is not None:
-        _write_model(model, objects, conns, counts, ids, new_id)
+        channels = _write_model(model, objects, conns, counts, ids, new_id)
+        for key, w in (model.get("shape_anim") or {}).items():
+            for cid in channels.get(key, []):
+                aw.scalar(cid, "DeformPercent", np.asarray(w, np.float64) * 100.0)
 
     defs = root.child("Definitions")
     defs.child("Version", 100)
@@ -292,6 +295,28 @@ class AnimWriter:
             ac.child("KeyAttrRefCount", np.array([frames_count], np.int32))
             counts["AnimationCurve"] = counts.get("AnimationCurve", 0) + 1
             conns.child("C", "OP", ("L", cid), ("L", cn_id), f"d|{k}")
+
+    def scalar(self, obj_id, prop, values):
+        """One animated number property (e.g. a blend shape channel's DeformPercent)."""
+        objects, conns, counts, new_id = self.objects, self.conns, self.counts, self.new_id
+        values = np.asarray(values, np.float64)
+        cn_id = new_id()
+        cn = objects.child("AnimationCurveNode", ("L", cn_id), name_class(prop, "AnimCurveNode"), "")
+        P(cn.child("Properties70"), f"d|{prop}", "Number", "", "A", float(values[0]))
+        counts["AnimationCurveNode"] = counts.get("AnimationCurveNode", 0) + 1
+        conns.child("C", "OO", ("L", cn_id), ("L", self.layer_id))
+        conns.child("C", "OP", ("L", cn_id), ("L", obj_id), prop)
+        cid = new_id()
+        ac = objects.child("AnimationCurve", ("L", cid), name_class("", "AnimCurve"), "")
+        ac.child("Default", float(values[0]))
+        ac.child("KeyVer", 4008)
+        ac.child("KeyTime", self.key_times)
+        ac.child("KeyValueFloat", values.astype(np.float32))
+        ac.child("KeyAttrFlags", np.array([1 << 2 | 1 << 8 | 1 << 13 | 1 << 14], np.int32))
+        ac.child("KeyAttrDataFloat", np.array([0.0, 0.0, 9.419963346924634e-30, 0.0], np.float32))
+        ac.child("KeyAttrRefCount", np.array([len(self.key_times)], np.int32))
+        counts["AnimationCurve"] = counts.get("AnimationCurve", 0) + 1
+        conns.child("C", "OP", ("L", cid), ("L", cn_id), f"d|{prop}")
 
     def camera(self, camera, parent_id=0):
         """camera: dict(pos (N,3), rot_deg (N,3) Euler XYZ of an FBX camera (looks down +X),
@@ -431,6 +456,7 @@ def _write_model(model, objects, conns, counts, ids, new_id):
             if mt.get("transparent"):
                 conns.child("C", "OP", ("L", tex_ids[mt["texture"]]), ("L", mid), "TransparentColor")
     pose_nodes = []
+    channels = {}
     for ms in model.get("meshes", []):
         gid, mid = new_id(), new_id()
         V = np.asarray(ms["vertices"], np.float64)
@@ -509,6 +535,30 @@ def _write_model(model, objects, conns, counts, ids, new_id):
                 counts["Deformer"] += 1
                 conns.child("C", "OO", ("L", cid), ("L", sid))
                 conns.child("C", "OO", ("L", ids[node_i]), ("L", cid))
+        if ms.get("shapes"):
+            # blend shapes (morph targets): one channel per shape, 0..100 %
+            bid = new_id()
+            bs = objects.child("Deformer", ("L", bid), name_class(ms["name"], "Deformer"), "BlendShape")
+            bs.child("Version", 100)
+            counts["Deformer"] += 1
+            conns.child("C", "OO", ("L", bid), ("L", gid))
+            for sh in ms["shapes"]:
+                cid, shid = new_id(), new_id()
+                ch = objects.child("Deformer", ("L", cid), name_class(sh["name"], "SubDeformer"), "BlendShapeChannel")
+                ch.child("Version", 100)
+                ch.child("DeformPercent", 0.0)
+                ch.child("FullWeights", np.array([100.0]))
+                P(ch.child("Properties70"), "DeformPercent", "Number", "", "A", 0.0)
+                counts["Deformer"] += 1
+                g2 = objects.child("Geometry", ("L", shid), name_class(sh["name"], "Geometry"), "Shape")
+                g2.child("Version", 100)
+                g2.child("Indexes", np.ascontiguousarray(np.asarray(sh["index"], np.int32)))
+                g2.child("Vertices", np.ascontiguousarray(np.asarray(sh["delta"], np.float64).reshape(-1)))
+                counts["Geometry"] += 1
+                conns.child("C", "OO", ("L", shid), ("L", cid))
+                conns.child("C", "OO", ("L", cid), ("L", bid))
+                for key in sh.get("keys", ()):
+                    channels.setdefault(key, []).append(cid)
     for (node_i, bind) in model.get("bind_nodes", []):
         pose_nodes.append((ids[node_i], bind))
     if pose_nodes:
@@ -522,6 +572,7 @@ def _write_model(model, objects, conns, counts, ids, new_id):
             pn.child("Node", ("L", nid))
             pn.child("Matrix", _mat16(mtx))
         counts["Pose"] += 1
+    return channels
 
 
 # ----------------------------------------------------------------------------- euler helpers
@@ -637,6 +688,12 @@ def export_animation_fbx(path, skel, anim, in_place=False, lock_height=False, in
     model = None
     if include_model:
         model = build_model(gl, idx_of, texture_dir)
+        if anim.get("expr_names") and "expr_w" in anim:
+            # hand-set expressions -> the morph targets they move (0..1 per frame)
+            from .keys import morph_weights, vrm_expressions
+            ew = np.asarray(anim["expr_w"], np.float64)[s_:e_]
+            model["shape_anim"] = morph_weights({nm: ew[:, k] for k, nm in enumerate(anim["expr_names"])},
+                                                vrm_expressions(gl.json))
     camera = None
     if include_camera and "cam_pos" in anim:
         cp = np.asarray(anim["cam_pos"][s_:e_], np.float64).copy()
@@ -694,6 +751,7 @@ def build_model(gl, idx_of, texture_dir=None):
             continue
         mesh = gl.meshes[nd["mesh"]]
         Vs, Ns, Us, Ts, TM, J, Wt = [], [], [], [], [], [], []
+        Ms = []  # morph target position deltas per primitive
         mats, base = [], 0
         for prim in mesh["primitives"]:
             if prim.get("mode", 4) != 4:
@@ -713,6 +771,8 @@ def build_model(gl, idx_of, texture_dir=None):
             TM.append(np.full(len(ix) // 3, mats.index(mat)))
             J.append(gl.accessor(at["JOINTS_0"]).astype(np.int64) if "JOINTS_0" in at else np.zeros((nv, 4), np.int64))
             Wt.append(gl.accessor(at["WEIGHTS_0"]) if "WEIGHTS_0" in at else np.zeros((nv, 4)))
+            Ms.append([gl.accessor(tg["POSITION"]) if "POSITION" in tg else np.zeros((nv, 3))
+                       for tg in prim.get("targets", [])])
             base += nv
         if not Vs:
             continue
@@ -720,6 +780,21 @@ def build_model(gl, idx_of, texture_dir=None):
         entry = {"name": nd.get("name", mesh.get("name", f"mesh{ni}")), "normals": np.concatenate(Ns),
                  "uvs": np.concatenate(Us), "tris": np.concatenate(Ts), "tri_mat": np.concatenate(TM),
                  "materials": mats, "parent": None, "skin": None}
+        nt = max((len(m_) for m_ in Ms), default=0)
+        if nt:
+            names = (mesh.get("extras") or {}).get("targetNames") or \
+                    (mesh["primitives"][0].get("extras") or {}).get("targetNames") or []
+            D = np.concatenate([np.stack(m_, 0) if len(m_) == nt else np.zeros((nt, len(v_), 3))
+                                for m_, v_ in zip(Ms, Vs)], 1)  # (targets, vertices, 3)
+            shapes = []
+            for k in range(nt):
+                idx = np.where(np.abs(D[k]).max(1) > 1e-7)[0]
+                if len(idx) == 0:
+                    continue
+                shapes.append({"name": names[k] if k < len(names) else f"morph{k}", "index": idx,
+                               "delta": D[k, idx] * 100.0, "keys": [(nd["mesh"], k)]})
+            if shapes:
+                entry["shapes"] = shapes
         if "skin" in nd:
             sk = gl.skins[nd["skin"]]
             ibm = gl.accessor(sk["inverseBindMatrices"]).reshape(-1, 4, 4).transpose(0, 2, 1) \
@@ -746,6 +821,8 @@ def build_model(gl, idx_of, texture_dir=None):
             W = gl.world_matrix(ni)
             entry["vertices"] = (V @ W[:3, :3].T + W[:3, 3]) * 100.0
             entry["normals"] = entry["normals"] @ W[:3, :3].T
+            for sh in entry.get("shapes", []):
+                sh["delta"] = sh["delta"] @ W[:3, :3].T
         meshes.append(entry)
     return {"meshes": meshes, "materials": materials, "textures": textures,
             "bind_nodes": sorted(bind_nodes.items())}

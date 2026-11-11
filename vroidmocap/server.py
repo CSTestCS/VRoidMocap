@@ -271,7 +271,7 @@ class AppState:
         from .core.fbx_writer import export_animation_fbx
         from .core.retarget import crop_anim
         tex_dir = os.path.splitext(path)[0] + ".fbm" if (include_model and write_textures) else None
-        anim = self.anim_at(char_id, fps)
+        anim = self.with_keys(char_id, self.anim_at(char_id, fps))
         if start is not None and end is not None:
             anim = crop_anim(anim, int(start), int(end))
         if self.skel.version == "fbx":  # the FBX avatar's own file, with the animation added
@@ -281,6 +281,45 @@ class AppState:
         return export_animation_fbx(path, self.skel, anim, in_place=in_place,
                                     lock_height=lock_height, include_camera=include_camera,
                                     vrm_path=self.vrm, include_model=include_model, texture_dir=tex_dir)
+
+    # ------------------------------------------------------------------ hand-set keys (fingers, expressions)
+    def expression_names(self):
+        from .core import keys
+        if self.skel is None:
+            return []
+        cache = self.__dict__.setdefault("_expr_names", {})
+        if self.vrm not in cache:
+            cache.clear()
+            cache[self.vrm] = keys.expression_names(self.skel, self.vrm)
+        return cache[self.vrm]
+
+    def keys_info(self, char_id):
+        from .core import keys
+        if self.skel is None:
+            raise ValueError("Choose an avatar first")
+        names = self.expression_names()
+        chans = keys.finger_channels() + ["expr." + n for n in names]
+        return {"channels": keys.load_keys(self.workdir, char_id), "rig": keys.rig_for_app(self.skel),
+                "expressions": names, "kind": "fbx" if self.skel.version == "fbx" else "vrm",
+                "defaults": {c: keys.default_value(c) for c in chans},
+                "ranges": {"curl": list(keys.CURL_RANGE), "splay": list(keys.SPLAY_RANGE), "expr": [0, 100]}}
+
+    def save_keys(self, char_id, channels):
+        from .core import keys
+        return keys.save_keys(self.workdir, char_id, channels)
+
+    def with_keys(self, char_id, anim):
+        """The animation with the hand-set fingers and expressions baked in."""
+        from .core import keys
+        ch = keys.load_keys(self.workdir, char_id)
+        out = dict(anim)
+        out["quats"] = keys.bake_fingers(self.skel, anim, ch)
+        names = self.expression_names()
+        ew = keys.bake_expressions(names, anim, ch)
+        if ew:
+            out["expr_names"] = list(ew)
+            out["expr_w"] = np.stack([ew[n] for n in ew], 1).astype(np.float32)
+        return out
 
 
 STATE = AppState()
@@ -410,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[4] == "meta":
                     return self._send(200, meta)
                 return self._send(200, blob, "application/octet-stream")
+            if p.startswith("/api/keys/"):
+                return self._send(200, STATE.keys_info(int(p.split("/")[3])))
             if p == "/api/export.fbx":
                 cid = int(q["character"])
                 fd, tmp = tempfile.mkstemp(suffix=".fbx")
@@ -472,6 +513,9 @@ class Handler(BaseHTTPRequestHandler):
                              int(body.get("fps", 30)), bool(body.get("model", True)),
                              start=body.get("start"), end=body.get("end"))
                 return self._send(200, {"ok": True, "path": path})
+            if p.startswith("/api/keys/"):
+                ch = STATE.save_keys(int(p.split("/")[3]), body.get("channels", {}))
+                return self._send(200, {"ok": True, "channels": ch})
             if p == "/api/rename":
                 cid = int(body["character"])
                 for c in STATE.analysis["characters"]:

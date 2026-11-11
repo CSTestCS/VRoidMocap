@@ -135,6 +135,56 @@ export class Viewer {
     this.resize();
   }
 
+  /** Hand-set keys (fingers, expressions): rig from /api/keys, evalFn(t) -> {channel: value} */
+  setKeys(rig, evalFn, expressions) {
+    this.keyRig = rig;
+    this.keyEval = evalFn;
+    this.keyExpr = expressions || [];
+    this.keyNodes = null;
+    this.morphMap = null;
+  }
+
+  _applyKeys(f) {
+    if (!this.keyRig || !this.keyEval || !this.anim) return;
+    const vals = this.keyEval(f / this.anim.fps);
+    const fbx = !!this.fbx;
+    if (!this.keyNodes) {
+      this.keyNodes = this.keyRig.map((e) => (fbx ? (e.node ? this.fbx.get(e.node) : null) : this.vrm?.humanoid.getNormalizedBoneNode(e.bone)));
+    }
+    const s = !fbx && this.isVrm0 ? -1 : 1;
+    const qa = new THREE.Quaternion(), qb = new THREE.Quaternion(), ax = new THREE.Vector3();
+    this.keyRig.forEach((e, i) => {
+      const n = this.keyNodes[i];
+      if (!n) return;
+      const base = e.side + e.finger;
+      const curl = vals[base + ".curl"], splay = vals[base + ".splay"];
+      const ca = fbx ? e.node_curl_axis : e.curl_axis, sa = fbx ? e.node_splay_axis : e.splay_axis;
+      qa.setFromAxisAngle(ax.set(ca[0], ca[1], ca[2]), (e.curl_max * Math.PI / 180) * curl / 100);
+      qb.setFromAxisAngle(ax.set(sa[0], sa[1], sa[2]), (e.splay_max * Math.PI / 180) * splay / 10);
+      qb.multiply(qa);  // splay after curl
+      if (fbx) n.quaternion.multiply(qb);  // on top of the file's rest (fingers are not animated)
+      else n.quaternion.set(s * qb.x, qb.y, s * qb.z, qb.w);
+    });
+    if (this.vrm?.expressionManager) {
+      for (const nm of this.keyExpr) this.vrm.expressionManager.setValue(nm, (vals["expr." + nm] || 0) / 100);
+    } else if (fbx) {
+      if (!this.morphMap) {
+        this.morphMap = new Map();
+        this.fbx.root.traverse((o) => {
+          if (!o.isMesh || !o.morphTargetDictionary) return;
+          for (const [nm, k] of Object.entries(o.morphTargetDictionary)) {
+            if (!this.morphMap.has(nm)) this.morphMap.set(nm, []);
+            this.morphMap.get(nm).push([o, k]);
+          }
+        });
+      }
+      for (const nm of this.keyExpr) {
+        const w = (vals["expr." + nm] || 0) / 100;
+        for (const [o, k] of this.morphMap.get(nm) || []) o.morphTargetInfluences[k] = w;
+      }
+    }
+  }
+
   _bindNodes() {
     if (!this.vrm || !this.anim) return;
     this.nodes = this.anim.bones.map((b) => this.vrm.humanoid.getNormalizedBoneNode(b));
@@ -177,6 +227,8 @@ export class Viewer {
     if (this.fbx) {
       this.restHipsY = this.fbx.restHipsY;
       this._applyFbx(A, this.frame);
+      this._applyKeys(this.frame);
+      this.fbx.group.updateMatrixWorld(true);
       this.lastFrame = this.frame;
       this._applyCommon(A, this.frame, this.fbx.hips, this.fbx.feet);
       return;
@@ -201,6 +253,7 @@ export class Viewer {
       const x = A.root[f * 3] - off.x, y = A.root[f * 3 + 1] - off.y, z = A.root[f * 3 + 2] - off.z;
       hips.position.set(s * x, y, s * z);
     }
+    this._applyKeys(f);
     const jumped = Math.abs(f - this.lastFrame) > 2;
     const dt = jumped ? 0 : Math.min(0.1, Math.abs(f - this.lastFrame) / A.fps);
     this.vrm.update(dt);
