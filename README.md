@@ -210,11 +210,22 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   A visible bone whose parent is held keeps the direction it is seen in.
   Frames whose detection contradicts everything around them count as not
   seen.
-* **Walking out of the picture.** The person tracker loses someone whose
-  body has mostly left the picture; where a track ends (or starts) at the edge
-  of the picture, the character is followed on along their motion for up to a
-  second, so the foot or hand still in the picture is still captured as the
-  same character. Recurring characters are re-identified by appearance.
+* **Context from both directions.** The person tracker needs most of a body
+  to find someone. After the scan, every track is followed backwards from
+  where it starts and forwards from where it ends (within its shot, up to 3 s):
+  the box moves with the camera and re-centres on whatever the whole-body
+  model finds (a pair of legs, a hand), so a low camera that first shows only
+  the feet, or someone walking out of the picture, is captured as the same
+  character. Short shots (fast cuts) keep their tracks. A weak detection that
+  runs into a clear sighting of the same joint, before or after it, counts as
+  seen, and one- or two-frame flickers do not split a sighting. A frame is
+  usable when a few joints are clearly seen (legs alone are enough), and when
+  the box cuts the body off, the detector is run again on a larger box.
+* **Close to the camera.** A limb that runs out of the picture is squeezed into
+  it by the detectors and looks far too short. A limb much shorter than its
+  bone length allows at its distance, ending at the picture edge it heads for,
+  is treated as cut off (frozen), not as pointing at the camera, so a
+  character walking up to the camera does not kneel.
 * **Tracking box.** In back views the tracker can lose the body and follow
   only the head; the detectors then "find" a tiny, contorted person in that
   box. Within a shot the box may not collapse below 60% of the body size
