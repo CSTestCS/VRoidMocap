@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 13
+SOLVE_VERSION = 14
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -1372,6 +1372,8 @@ def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None,
                 # the tracker line must run through (near) the seen end
                 idx = np.where(ok)[0]
                 f_far = fr[idx]
+                # the visible tracker furthest from the seen end (the longest lever;
+                # trackers that slid off the person were dropped in capture)
                 if s_end == a:
                     m = idx[np.argmax(f_far)]
                     d = mk[m] - S

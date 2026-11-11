@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 7
+CAPTURE_VERSION = 8
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -469,6 +469,9 @@ def process_chunk(args):
     prev_g, last_kp = None, None
     markers = np.full((n, 8, len(MARKER_FRAC), 2), np.nan, np.float32)
     mk = np.full((8, len(MARKER_FRAC), 2), np.nan)
+    mk_age = np.zeros((8, len(MARKER_FRAC)), int)
+    max_age = int(round(0.5 * fps))
+    mask = None
     for i, (fi, bgr) in enumerate(rd.iter_frames(1, s, e)):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         g = cv2.cvtColor(cv2.resize(bgr, None, fx=SEG_SCALE, fy=SEG_SCALE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
@@ -476,6 +479,8 @@ def process_chunk(args):
             # each body segment's own rigid motion since the previous frame
             segM[i], segN[i] = segment_motion(prev_g, g, *last_kp)
         mk = update_markers(mk, prev_g, g)  # trackers on the bones follow the picture
+        mk_age += 1
+        mk[mk_age > max_age] = np.nan  # followed too long without seeing the limb clearly: drift
         b = boxes[i]
         cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
         size = max(b[2] - b[0], b[3] - b[1]) * 1.3
@@ -520,7 +525,19 @@ def process_chunk(args):
                     if sc2[5:23].mean() > wbs[i, 5:23].mean() + 0.05:
                         wb2d[i], wbs[i], wbz[i] = kp2, sc2, wbody.last_z
             last_kp = (wb2d[i].astype(np.float64), wbs[i].astype(np.float64))
-            mk = update_markers(mk, None, g, *last_kp)  # ...and sit on the line wherever it is clear
+            mk_new = update_markers(mk, None, g, *last_kp)  # ...and sit on the line wherever it is clear
+            snapped = np.isfinite(mk_new[..., 0]) & ~(np.isfinite(mk[..., 0]) & (mk_new == mk).all(-1))
+            mk_age[snapped] = 0
+            mk = mk_new
+        if mask is not None and np.isfinite(mk[..., 0]).any():
+            # a tracker that is no longer on the person (it slid onto something in
+            # front of the limb, or the background) is dropped
+            have = np.isfinite(mk[..., 0])
+            mv = mask_at(mask, mk[have], x0, y0, sc)
+            gone = mv < 0.3
+            tmp = mk[have]
+            tmp[gone] = np.nan
+            mk[have] = tmp
         markers[i] = mk
         prev_g = g
         if not ok:
