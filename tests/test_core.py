@@ -717,9 +717,15 @@ class BoneTrackers(unittest.TestCase):
         strong[0, L_HIP] = True               # hip seen, knee hidden
         markers = np.full((N, 8, 3, 2), np.nan)
         markers[0, 4, 0] = [510, 350]         # only the first tracker (25%) of the left thigh is visible
-        uv2, conf2, inf = infer_from_markers(uv, conf, strong, markers, (0.25, 0.5, 0.75), np.ones(N, bool), 1920, 1080)
+        covered = np.zeros((N, 33), bool)
+        covered[0, L_KNEE] = True             # something is in front of the knee
+        uv2, conf2, inf = infer_from_markers(uv, conf, strong, markers, (0.25, 0.5, 0.75), np.ones(N, bool), 1920, 1080,
+                                             covered=covered)
         self.assertTrue(inf[0, L_KNEE])
         self.assertTrue(np.allclose(uv2[0, L_KNEE], [540, 500]))  # the line, carried to full length
+        # a knee that is in the picture and not covered (e.g. under a skirt) is left to the detectors
+        _, _, inf2 = infer_from_markers(uv, conf, strong, markers, (0.25, 0.5, 0.75), np.ones(N, bool), 1920, 1080)
+        self.assertFalse(inf2[0, L_KNEE])
 
 
 if __name__ == "__main__":

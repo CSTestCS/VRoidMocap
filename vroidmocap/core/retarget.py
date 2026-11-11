@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 14
+SOLVE_VERSION = 15
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -469,7 +469,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # rigid segments: each limb's texture moves as one piece; carry clearly
     # detected joints along it into frames where the detectors are unsure
     trk_ok = np.zeros((N, 33), bool)
-    if "segM" in capture and wb_sync is not None and os.environ.get("VM_RIGID", "1") == "1":
+    if "segM" in capture and wb_sync is not None:
         uv, trk_ok = rigid_track(uv, raw_scores(wb_sync, vis, W, H, N), capture["wb2d"], capture["wbs"],
                                  capture["segM"].astype(np.float64), capture["segN"], valid, fps)
     dbg("trk_ok", trk_ok)
@@ -480,8 +480,17 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if "markers" in capture:
         from .capture import MARKER_FRAC
         strong = ((raw_scores(wb_sync, vis, W, H, N) >= 0.6) | (vis >= 0.5)) if wb_sync is not None else (vis >= 0.5)
+        # how long each limb can look in the picture: its length (from the body
+        # model, over the clip) at the character's distance
+        exp_len = np.full((N, 8), np.nan)
+        okT = valid & np.isfinite(T).all(1)
+        for k, (a_, b_) in enumerate(SEG_MP[:8]):
+            Lk = np.linalg.norm(Wc[okT, a_] - Wc[okT, b_], axis=1)
+            if len(Lk):
+                exp_len[okT, k] = focal[okT] * np.median(Lk) / np.maximum(T[okT, 2], 0.05)
         uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
-                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64))
+                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64),
+                                                exp_len=exp_len, covered=occluded_joints(seg, vis_raw))
     dbg("inferred", inferred)
     body_conf = conf.copy()
     P0 = np.full((N, 33, 3), np.nan)
@@ -1341,7 +1350,8 @@ _WB_OF_MP = {L_SH: 5, R_SH: 6, L_EL: 7, R_EL: 8, L_WR: 9, R_WR: 10, L_HIP: 11, R
              L_KNEE: 13, R_KNEE: 14, L_ANK: 15, R_ANK: 16}
 
 
-def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None, min_px=8.0):
+def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None, min_px=8.0, exp_len=None,
+                       too_long=1.2, too_short=0.6, covered=None):
     """The hidden end of a limb from one clearly seen end and the trackers that
     ride the limb's line (at known fractions of its length): the line through
     the seen end and the furthest visible tracker, carried on to the full
@@ -1389,6 +1399,12 @@ def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None,
                 # consistency: other visible trackers lie on that line
                 line = est - S
                 Ln = np.linalg.norm(line)
+                # ...and the limb has a length this bone can have in the picture at
+                # this distance (never longer, not absurdly short): trackers that
+                # slipped onto clothing that moves on its own fail this
+                if exp_len is not None and np.isfinite(exp_len[t, k]) and exp_len[t, k] > 0:
+                    if Ln > too_long * exp_len[t, k] or Ln < too_short * exp_len[t, k]:
+                        continue
                 off = 0.0
                 if len(idx) > 1:
                     u_ = line / Ln
@@ -1399,6 +1415,13 @@ def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None,
                 if best is None or off < best[0]:
                     best = (off, est)
             if best is None:
+                continue
+            # only an end that is really out of view: outside the picture, or with
+            # something in front of it (under clothing the detectors know better
+            # than trackers riding cloth that moves on its own)
+            e_ = best[1]
+            outside = e_[0] < 0 or e_[0] >= W or e_[1] < 0 or e_[1] >= H
+            if not outside and (covered is None or not covered[t, h_end]):
                 continue
             uv[t, h_end] = best[1]
             conf[t, h_end] = max(conf[t, h_end], 0.6)

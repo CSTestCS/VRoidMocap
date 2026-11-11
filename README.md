@@ -225,6 +225,18 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   seen, and one- or two-frame flickers do not split a sighting. A frame is
   usable when a few joints are clearly seen (legs alone are enough), and when
   the box cuts the body off, the detector is run again on a larger box.
+* **Trackers riding the bones.** Besides the joints, every upper arm,
+  forearm, thigh and shin carries three trackers on its line (at 25, 50 and
+  75% of its length). Where both joints of a limb are clear they sit on the
+  line; otherwise they follow the picture (checked forwards and backwards,
+  dropped when they leave the person or after 0.5 s without a clear view of
+  the limb). When one end of a limb is seen and its other end is out of the
+  picture or behind something, the line through the seen end and a visible
+  tracker, carried on to the bone's length, gives the hidden end: a thigh 40%
+  in view still has its pose. The length it gets must be one that bone can
+  have in the picture at that distance. Each limb's texture is also tracked
+  as one rigid piece, which carries clearly seen joints into frames where the
+  detectors are unsure.
 * **Close to the camera.** A limb that runs out of the picture is squeezed into
   it by the detectors and looks far too short. A limb much shorter than its
   bone length allows at its distance, ending at the picture edge it heads for,
