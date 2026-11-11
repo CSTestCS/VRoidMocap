@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 7
+SOLVE_VERSION = 8
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -578,7 +578,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     hidden = occluded_joints(seg, vis_raw)
     # (seen: the whole-body model is sure (>= 0.6) or MediaPipe calls it visible (>= 0.5);
     # measured against rendered ground truth with occluders, this is the best trade-off)
-    js = joint_seen(lm2d, np.maximum(body_conf - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden)
+    # (raw whole-body score: the fused confidence above is rescaled for the 3D solve)
+    raw = raw_scores(wb_sync, vis, W, H, N)
+    hidden = hidden if hidden is not None else np.zeros((N, 33), bool)
+    hidden = hidden | cut_off_joints(uv, P, blen, focal, cx, cy, W, H)
+    js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
+                    weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)))
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
     seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of)
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
@@ -1160,15 +1165,83 @@ def _min_run(mask, fps, shot_of, min_s=0.15):
     return out
 
 
-def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None):
+def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None):
     """(N,33) joint clearly inside the picture (not on its edge), detected, and
-    not behind something (hidden: see occluded_joints)."""
+    not behind something (hidden: see occluded_joints).
+    With `weak` (a lower bar), context from both directions: a stretch of weak
+    detections counts as seen when it runs without a break into a stretch
+    where the joint is clearly seen, before or after it (legs at the top of
+    the picture just before the whole body comes into view are the same legs
+    seen clearly a moment later)."""
     m = 0.015 * max(W, H)
     inside = (uv[..., 0] > m) & (uv[..., 0] < W - m) & (uv[..., 1] > m) & (uv[..., 1] < H - m)
-    s = inside & (conf >= 0.5) & valid[:, None]
+    ok = inside & valid[:, None]
     if hidden is not None:
-        s &= ~hidden
+        ok &= ~hidden
+    s = ok & (conf >= 0.5)
+    if weak is not None:
+        w = ok & (weak | s)
+        for j in range(s.shape[1]):
+            for (a, b) in runs(w[:, j], shot_of):
+                if s[a:b, j].any():
+                    s[a:b, j] = True
     return np.stack([_min_run(s[:, j], fps, shot_of) for j in range(s.shape[1])], 1)
+
+
+def raw_scores(wb_sync, vis, W, H, N):
+    """(N,33) the whole-body model's own score for each body joint (labels
+    already matched to MediaPipe's); near the picture edge only as far as
+    MediaPipe also sees the joint (the model puts joints outside the picture on
+    its edge)."""
+    from .detect import WB_TO_MP
+    out = np.zeros((N, 33))
+    if wb_sync is None:
+        return out
+    wb2d, wbs = wb_sync
+    edge = 0.03 * max(W, H)
+    for m, w in WB_TO_MP.items():
+        if m < 11:
+            continue
+        p = wb2d[:, w]
+        near = (p[:, 0] < edge) | (p[:, 0] > W - edge) | (p[:, 1] < edge) | (p[:, 1] > H - edge)
+        out[:, m] = np.where(near, np.minimum(wbs[:, w], vis[:, m]), wbs[:, w])
+    return out
+
+
+LIMB_PAIRS = [(L_HIP, L_KNEE), (L_KNEE, L_ANK), (R_HIP, R_KNEE), (R_KNEE, R_ANK),
+              (L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR)]
+
+
+def cut_off_joints(uv, P, blen, focal, cx, cy, W, H, edge_frac=0.15, short=0.55):
+    """(N,33) joints of a limb that leaves the picture. Close to the camera the
+    detectors squeeze a limb that runs out of the picture into it: the end
+    joint is put near the edge, and the limb looks far shorter than a bone of
+    its length can look at that distance. A limb that short, ending near the
+    edge it is heading for, is cut off (not pointing at the camera): its end
+    joint is not seen."""
+    N = len(uv)
+    out = np.zeros((N, 33), bool)
+    ex, ey = edge_frac * W, edge_frac * H
+    for a, b in LIMB_PAIRS:
+        L = blen.get((a, b))
+        if not L:
+            continue
+        z = np.where(np.isfinite(P[:, a, 2]), P[:, a, 2], np.nan)
+        exp = focal * L / np.maximum(z, 0.05)
+        d = uv[:, b] - uv[:, a]
+        l2 = np.linalg.norm(d, axis=1)
+        p = uv[:, b]
+        # near the edge the limb points towards
+        near = ((p[:, 0] < ex) & (d[:, 0] < 0)) | ((p[:, 0] > W - ex) & (d[:, 0] > 0)) | \
+               ((p[:, 1] < ey) & (d[:, 1] < 0)) | ((p[:, 1] > H - ey) & (d[:, 1] > 0))
+        out[:, b] |= near & np.isfinite(exp) & (l2 < short * exp)
+    # what hangs below a cut-off joint is cut off as well
+    for a, b in ((L_KNEE, L_ANK), (R_KNEE, R_ANK), (L_EL, L_WR), (R_EL, R_WR)):
+        out[:, b] |= out[:, a]
+    for a, bs in ((L_ANK, (L_HEEL, L_FOOT)), (R_ANK, (R_HEEL, R_FOOT))):
+        for b in bs:
+            out[:, b] |= out[:, a]
+    return out
 
 
 def occluded_joints(seg, vis):

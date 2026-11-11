@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 3
+CAPTURE_VERSION = 4
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -147,6 +147,154 @@ def extend_at_edges(boxes, segs, shot_of, W, H, fps, max_s=1.0, min_in=0.08):
             f += 1
         segs2.append((s0, f))
     return out, segs2
+
+
+def follow_job(args):
+    """Worker: follow a character beyond the ends of its track, within its shot.
+
+    args: (video, seed_frame, seed_box, direction (+1/-1), stop_frame (exclusive),
+           cam_R (N,3,3) camera->shot reference, focal (N,), W, H, fps, wb_path, out_path)
+    The person tracker needs most of a body to find someone; the whole-body
+    model also finds a pair of legs or an arm. Frame by frame (backwards from
+    where the track starts, forwards from where it ends) the box is carried
+    along with the camera's own motion and re-centred on the body parts the
+    whole-body model finds in it. It stops where nothing of the person is
+    found any more (0.3 s) or the box leaves the picture. Returns {frame: box}."""
+    (video, seed, box, direction, stop, cam_R, focal, W, H, fps, wb_path, out_path) = args
+    if os.path.exists(out_path):
+        return out_path
+    wbody = WholeBody(wb_path)
+    rd = VideoReader(video)
+    step = max(1, int(round(fps / 30.0)))
+    lost_max = max(2, int(round(0.3 * fps / step)))
+    cx, cy = W / 2, H / 2
+    box = np.asarray(box, np.float64)
+    prev_f = seed
+    out = {}
+    lost = 0
+
+    def warp(b, fa, fb):
+        Ka = np.array([[focal[fa], 0, cx], [0, focal[fa], cy], [0, 0, 1.0]])
+        Kb = np.array([[focal[fb], 0, cx], [0, focal[fb], cy], [0, 0, 1.0]])
+        Hm = Kb @ cam_R[fb].T @ cam_R[fa] @ np.linalg.inv(Ka)
+        pts = np.array([[b[0], b[1], 1], [b[2], b[1], 1], [b[0], b[3], 1], [b[2], b[3], 1], [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 1]])
+        q = pts @ Hm.T
+        q = q[:, :2] / q[:, 2:3]
+        c = q[4]
+        sc = np.mean(np.linalg.norm(q[:4] - c, axis=1)) / max(np.mean(np.linalg.norm(pts[:4, :2] - pts[4, :2], axis=1)), 1e-6)
+        w, h = (b[2] - b[0]) * sc, (b[3] - b[1]) * sc
+        return np.array([c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2])
+
+    def frames():
+        if direction > 0:
+            yield from rd.iter_frames(step, seed + step, stop)
+        else:
+            hi = seed
+            while hi > stop:
+                lo = max(stop, hi - 30)
+                block = list(rd.iter_frames(1, lo, hi))
+                for fi, im in reversed(block):
+                    if (seed - fi) % step == 0:
+                        yield fi, im
+                hi = lo
+    for fi, bgr in frames():
+        if (direction > 0 and fi >= stop) or (direction < 0 and fi <= stop - 1):
+            break
+        pred = warp(box, prev_f, fi)
+        iw = max(0.0, min(pred[2], W) - max(pred[0], 0)) * max(0.0, min(pred[3], H) - max(pred[1], 0))
+        if iw < 0.05 * (pred[2] - pred[0]) * (pred[3] - pred[1]):
+            break
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        kp, sc = wbody.detect(rgb, pred)
+        body = np.arange(23)
+        pw, ph = pred[2] - pred[0], pred[3] - pred[1]
+        ins = (kp[body, 0] > pred[0] - 0.1 * pw) & (kp[body, 0] < pred[2] + 0.1 * pw) & \
+              (kp[body, 1] > pred[1] - 0.1 * ph) & (kp[body, 1] < pred[3] + 0.1 * ph)
+        good = (sc[body] >= 0.55) & ins & (kp[body, 0] >= 0) & (kp[body, 0] < W) & (kp[body, 1] >= 0) & (kp[body, 1] < H)
+        if good.sum() >= 3:
+            lost = 0
+            k = kp[body][good]
+            lo_, hi_ = k.min(0), k.max(0)
+            m = 0.08 * np.array([pw, ph])
+            dx = min(0.0, lo_[0] - m[0] - pred[0]) + max(0.0, hi_[0] + m[0] - pred[2])
+            dy = min(0.0, lo_[1] - m[1] - pred[1]) + max(0.0, hi_[1] + m[1] - pred[3])
+            pred = pred + np.array([dx, dy, dx, dy])
+        else:
+            lost += 1
+            if lost > lost_max:
+                break
+        box = pred
+        out[fi] = box.copy() if lost == 0 else None
+        prev_f = fi
+    rd.close()
+    # keep the frames up to the last one where the person was found; fill the stride gaps
+    keep = sorted(f for f, b in out.items() if b is not None)
+    res = {}
+    for a, b in zip(keep[:-1], keep[1:]):
+        lo, hi = min(a, b), max(a, b)
+        for f in range(lo, hi + 1):
+            t = (f - lo) / max(hi - lo, 1)
+            res[f] = (1 - t) * out[lo] + t * out[hi]
+    if keep:
+        res[keep[0]] = out[keep[0]]
+        nxt = keep[-1] + direction
+        for f in range(keep[-1], nxt + direction * (step - 1) + direction, direction):
+            if (direction > 0 and f < stop) or (direction < 0 and f >= stop):
+                res.setdefault(f, out[keep[-1]])
+    with open(out_path + ".tmp", "wb") as fh:
+        import pickle
+        pickle.dump(res, fh)
+    os.replace(out_path + ".tmp", out_path)
+    return out_path
+
+
+def follow_beyond_tracks(video, boxes, segs, shot_of, cam_R, focal, W, H, fps, wb_path, cdir, pool, max_s=3.0):
+    """Follow the character before its tracks start and after they end
+    (within each shot), so legs or a hand seen before (or after) the whole body
+    are captured too. Returns the new frames' boxes as extra segments."""
+    import pickle
+    N = len(boxes)
+    taken = ~np.isnan(boxes[:, 0])
+    starts = np.r_[0, np.where(shot_of[1:] != shot_of[:-1])[0] + 1]
+    ends = np.r_[starts[1:], N]
+    jobs = []
+    K = int(round(max_s * fps))
+    for (s, e) in segs:
+        sh = shot_of[s]
+        a, b = starts[sh], ends[sh]
+        if s > a and not taken[s - 1]:
+            lo = s - 1
+            while lo > a and not taken[lo - 1] and s - lo < K:
+                lo -= 1
+            jobs.append((video, s, boxes[s].copy(), -1, lo, cam_R, focal, W, H, fps, wb_path,
+                         os.path.join(cdir, f"follow_{s:07d}_b.pkl")))
+        if e < b and not taken[e]:
+            hi = e
+            while hi < b and not taken[hi] and hi - e < K:
+                hi += 1
+            jobs.append((video, e - 1, boxes[e - 1].copy(), 1, hi, cam_R, focal, W, H, fps, wb_path,
+                         os.path.join(cdir, f"follow_{e - 1:07d}_f.pkl")))
+    out = boxes.copy()
+    if not jobs:
+        return out, []
+    for path in pool.imap_unordered(follow_job, jobs):
+        with open(path, "rb") as fh:
+            res = pickle.load(fh)
+        for f, bx in res.items():
+            if 0 <= f < N and np.isnan(out[f, 0]):
+                out[f] = bx
+    new = ~np.isnan(out[:, 0]) & ~taken
+    extra = []
+    f = 0
+    while f < N:
+        if not new[f]:
+            f += 1
+            continue
+        s0 = f
+        while f < N and new[f] and shot_of[f] == shot_of[s0]:
+            f += 1
+        extra.append((s0, f))
+    return out, extra
 
 
 def _hand_attempts(lm2d, side):
@@ -300,28 +448,39 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     N, fps = A["frames"], A["fps"]
     boxes = stabilize_boxes(boxes, segs, fps)
     npz = np.load(os.path.join(workdir, "analysis.npz"))
-    boxes, segs = extend_at_edges(boxes, segs, npz["shot_of"], A["width"], A["height"], fps)
     cdir = os.path.join(workdir, f"capture_c{char_id}")
     os.makedirs(cdir, exist_ok=True)
     from .detect import ensure_model
     progress(0.0, "Getting the whole-body model (one-time download, 370 MB)")
     wb_path = ensure_model("wholebody", lambda f: progress(0.0, f"Downloading the whole-body model: {f * 100:.0f}%"))
     tag = (f"w{CAPTURE_VERSION}" if wb_path else f"m{CAPTURE_VERSION}")
+    workers = workers or max(1, min(6, (os.cpu_count() or 2) - 1))
+    ctx = mpc.get_context("spawn")
+    extra = []
+    if wb_path:
+        # context from both directions: follow the character before / after its tracks
+        progress(0.0, "Following the character before and after it is fully in view")
+        from .mathutil import quat_to_mat
+        with ctx.Pool(workers) as pool:
+            boxes, extra = follow_beyond_tracks(video, boxes, segs, npz["shot_of"],
+                                                quat_to_mat(npz["cam_q"].astype(np.float64)),
+                                                npz["focal"].astype(np.float64), A["width"], A["height"], fps,
+                                                wb_path, cdir, pool)
+    else:
+        boxes, segs = extend_at_edges(boxes, segs, npz["shot_of"], A["width"], A["height"], fps)
     jobs = []
-    for (s, e) in segs:
+    for (s, e) in list(segs) + list(extra):
         for cs in range(s, e, CHUNK):
             ce = min(e, cs + CHUNK)
             if ce - cs < 1:
                 continue
             jobs.append((video, cs, ce, boxes[cs:ce].copy(), fps, os.path.join(cdir, f"chunk{tag}_{cs:07d}_{ce:07d}.npz"), wb_path))
     total = sum(j[2] - j[1] for j in jobs)
-    # each worker holds its own models (~300 MB): cap the count to keep memory reasonable
-    workers = workers or max(1, min(len(jobs), (os.cpu_count() or 2) - 1, 6))
+    # (each worker holds its own models, ~300 MB: the count is capped)
     t0 = time.time()
     done = 0
     if jobs:
-        ctx = mpc.get_context("spawn")
-        with ctx.Pool(workers) as pool:
+        with ctx.Pool(max(1, min(len(jobs), workers))) as pool:
             for path in pool.imap_unordered(process_chunk, jobs):
                 if cancel():
                     pool.terminate()

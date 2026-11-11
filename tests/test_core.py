@@ -672,5 +672,37 @@ class SceneHelpers(unittest.TestCase):
         self.assertTrue(np.allclose(out[:6, ua], neutral_pose(skel)[ua], atol=1e-6))
 
 
+class SeenRules(unittest.TestCase):
+    def test_weak_detections_linked_to_a_clear_sighting_both_ways(self):
+        from vroidmocap.core.retarget import joint_seen
+        N = 60
+        uv = np.full((N, 33, 2), 500.0)
+        conf = np.zeros((N, 33))
+        weak = np.zeros((N, 33), bool)
+        conf[30:, 0] = 1.0       # clearly seen from frame 30 on
+        weak[10:30, 0] = True    # weakly seen just before (e.g. legs at the top of the picture)
+        weak[:5, 1] = True       # weak only, never clear: not seen
+        s = joint_seen(uv, conf, np.ones(N, bool), 1920, 1080, 30.0, np.zeros(N, int), weak=weak)
+        self.assertTrue(s[10:, 0].all())
+        self.assertFalse(s[:10, 0].any())
+        self.assertFalse(s[:, 1].any())
+
+    def test_limb_squeezed_into_the_picture_is_cut_off(self):
+        from vroidmocap.core.detect import L_ANK, L_HIP, L_KNEE
+        from vroidmocap.core.retarget import cut_off_joints
+        N = 2
+        uv = np.zeros((N, 33, 2))
+        P = np.zeros((N, 33, 3))
+        P[:, :, 2] = 1.5  # close to the camera
+        uv[:, L_HIP] = [960, 800]
+        uv[0, L_KNEE] = [960, 1000]   # 200 px thigh ending near the bottom edge: far too short at 1.5 m
+        uv[1, L_KNEE] = [960, 600]    # a short thigh pointing up, away from the edge: not cut off
+        uv[:, L_ANK] = uv[:, L_KNEE] + [0, 20]
+        blen = {(L_HIP, L_KNEE): 0.42, (L_KNEE, L_ANK): 0.40}
+        out = cut_off_joints(uv, P, blen, np.full(N, 1500.0), 960, 540, 1920, 1080)
+        self.assertTrue(out[0, L_KNEE] and out[0, L_ANK])
+        self.assertFalse(out[1, L_KNEE])
+
+
 if __name__ == "__main__":
     unittest.main()

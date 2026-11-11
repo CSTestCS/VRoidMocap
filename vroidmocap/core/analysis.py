@@ -28,7 +28,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 6
+ANALYSIS_VERSION = 7
 
 
 class Cancelled(Exception):
@@ -472,7 +472,16 @@ class Analyzer:
         for t in sc["tracks"]:
             t.shot = int(frame_shot[t.frames[0]])
         min_len = max(3, int(round(0.4 * fps / stride)))
-        tracklets = [t for t in sc["tracks"] if len(t.frames) >= min_len and t.embs and is_human_track(t)]
+        # a track shorter than min_len is usually a glimpse or a false detection,
+        # except in a short shot (a fast cut): there it may be all there is
+        shot_len = np.diff(np.r_[merged, N])
+
+        def long_enough(t):
+            if len(t.frames) >= min_len:
+                return True
+            n_shot = shot_len[t.shot] / stride
+            return len(t.frames) >= 2 and len(t.frames) >= 0.6 * n_shot
+        tracklets = [t for t in sc["tracks"] if long_enough(t) and t.embs and is_human_track(t)]
         result = self._solve(N, fps, W, H, stride, np.array(sc["frame_ids"]), sc["H_rel"], sc["H_ok"], sc["H_ids"],
                              merged, tracklets, sc["thumbs"])
         result["elapsed_s"] = time.time() - t_start
