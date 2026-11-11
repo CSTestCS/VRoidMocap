@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 8
+SOLVE_VERSION = 9
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -372,7 +372,40 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     vis = np.where(inside, vis, 0.0)
     vis_raw = vis.copy()
     seg = capture["seg"].astype(np.float64) if "seg" in capture else None  # person mask at each landmark
-    valid = capture["tracked"] & (vis.mean(1) > 0.35) & (np.abs(world).sum((1, 2)) > 0)
+    # a frame is usable when enough joints are clearly seen by either model (a
+    # pair of legs in the picture is enough: the rest of the body being outside
+    # the picture does not make the legs unusable)
+    wbs_c = capture.get("wbs")
+    n_mp = (vis > 0.5).sum(1)
+    n_wb = np.zeros(N, int)
+    if wbs_c is not None and np.any(wbs_c):
+        from .detect import WB_TO_MP
+        wb2d_c = capture["wb2d"]
+        for m, w in WB_TO_MP.items():
+            if m >= 11:
+                p_ = wb2d_c[:, w]
+                ins = (p_[:, 0] > 0) & (p_[:, 0] < W) & (p_[:, 1] > 0) & (p_[:, 1] < H)
+                n_wb += (ins & (wbs_c[:, w] >= 0.6)).astype(int)
+    has_mp = np.abs(world).sum((1, 2)) > 0
+    # short MediaPipe dropouts while the whole-body model still sees the person:
+    # its 3D guess and landmarks are carried over from the nearest frame it had
+    bridge = capture["tracked"] & ~has_mp & (n_wb >= 4)
+    t_w = None
+    if bridge.any() and has_mp.any():
+        t_w = vis ** 2
+        idx = np.where(has_mp)[0]
+        for f in np.where(bridge)[0]:
+            j = idx[np.argmin(np.abs(idx - f))]
+            if abs(j - f) <= 0.5 * fps and shot_of[j] == shot_of[f]:
+                world[f], cropc[f] = world[j], cropc[j] + (wb2d_c[f, 11:13].mean(0) - wb2d_c[j, 11:13].mean(0))
+                lm2d[f] = lm2d[j]
+                for m, w in WB_TO_MP.items():
+                    if m >= 11:
+                        lm2d[f, m] = wb2d_c[f, w]
+                        t_w[f, m] = float(wbs_c[f, w]) ** 2
+                vis[f] = 0.0  # nothing seen by MediaPipe itself: the whole-body model decides
+                has_mp[f] = True
+    valid = capture["tracked"] & ((n_mp >= 4) | (n_wb >= 4)) & has_mp
     hvalid = (hs >= 0.5) & valid[:, None]
 
     # ---- 1. orient landmarks into the real camera; translation
@@ -382,12 +415,22 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for f in np.where(valid)[0]:
         Rray = cam.ray_rotation(focal[f], cx, cy, *cropc[f])
         Wc[f] = world[f] @ Rray.T
+    bridged = np.zeros(N, bool)
+    if t_w is not None:
+        bridged = bridge & has_mp
     for f in np.where(valid)[0]:
-        t = cam.solve_translation(Wc[f], lm2d[f], vis[f] ** 2, focal[f], cx, cy)
+        t = cam.solve_translation(Wc[f], lm2d[f], vis[f] ** 2 if t_w is None else t_w[f], focal[f], cx, cy)
         if t is None:
             valid[f] = False
         else:
             T[f] = t
+    # a bridged frame whose position could not be solved: the nearest solved one
+    # (the joints' own positions still come from the picture)
+    for f in np.where(bridged & ~valid)[0]:
+        ok = np.where(valid & ~bridged & (shot_of == shot_of[f]))[0]
+        if len(ok) and abs(ok[np.argmin(np.abs(ok - f))] - f) <= 0.5 * fps:
+            T[f] = T[ok[np.argmin(np.abs(ok - f))]]
+            valid[f] = True
     if valid.sum() < 2:
         raise RuntimeError("The selected character was not tracked well enough to animate.")
     # which way the torso faces, frame by frame (this also settles which body
@@ -584,6 +627,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     hidden = hidden | cut_off_joints(uv, P, blen, focal, cx, cy, W, H)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
                     weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)))
+    dbg("js", js)
+    dbg("raw", raw)
+    dbg("uvs", lm2d)
+    dbg("hidden", hidden)
+    dbg("valid", valid)
+    dbg("bad", bad)
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
     seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of)
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
@@ -1185,6 +1234,19 @@ def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None):
             for (a, b) in runs(w[:, j], shot_of):
                 if s[a:b, j].any():
                     s[a:b, j] = True
+    # one or two frames missing inside a sighting (a flicker of the detector)
+    # do not break it up
+    gap = max(1, int(round(0.05 * fps)))
+    for j in range(s.shape[1]):
+        col = s[:, j]
+        on = np.where(col)[0]
+        if len(on) < 2:
+            continue
+        d = np.diff(on)
+        for k in np.where((d > 1) & (d <= gap + 1))[0]:
+            a, b = on[k], on[k + 1]
+            if shot_of[a] == shot_of[b] and (inside[a:b, j] & valid[a:b]).all():
+                col[a:b] = True
     return np.stack([_min_run(s[:, j], fps, shot_of) for j in range(s.shape[1])], 1)
 
 

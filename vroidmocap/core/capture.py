@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 4
+CAPTURE_VERSION = 5
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -397,6 +397,15 @@ def process_chunk(args):
                 bb = np.array([min(bb[0], lb[0]), min(bb[1], lb[1]), max(bb[2], lb[2]), max(bb[3], lb[3])])
             wb2d[i], wbs[i] = wbody.detect(rgb, bb)
             wbz[i] = wbody.last_z
+            # a box that cuts the body off (camera low or moving, tracker lagging)
+            # leaves the model unsure: try larger boxes, keep the surest reading
+            if wbs[i, 5:23].mean() < 0.6:
+                c = (bb[:2] + bb[2:]) / 2
+                for k in (1.6, 2.2):
+                    hb = (bb[2:] - bb[:2]) * k / 2
+                    kp2, sc2 = wbody.detect(rgb, np.r_[c - hb, c + hb])
+                    if sc2[5:23].mean() > wbs[i, 5:23].mean() + 0.05:
+                        wb2d[i], wbs[i], wbz[i] = kp2, sc2, wbody.last_z
         if not ok:
             prev_hand = [None, None]
             continue
