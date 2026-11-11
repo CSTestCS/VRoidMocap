@@ -28,7 +28,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 7
+ANALYSIS_VERSION = 8
 
 
 class Cancelled(Exception):
@@ -676,7 +676,11 @@ class Analyzer:
 
 
 # ----------------------------------------------------------------------------- identities
-def cluster_identities(tracklets, fps, threshold=0.42):
+GLIMPSE_S = 1.0      # a character seen for less than this is a glimpse
+MIN_LISTED_S = 0.5   # shorter characters are not listed
+
+
+def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6):
     """Agglomerative (average-link) clustering of tracklets with cannot-link
     constraints for tracklets visible at the same time."""
     n = len(tracklets)
@@ -758,6 +762,28 @@ def cluster_identities(tracklets, fps, threshold=0.42):
         _, a, b = best
         clusters[a] = clusters[a] + clusters[b]
         del clusters[b]
+    # brief glimpses (a fast cut, a moment at the edge of the picture) are much
+    # less certain in appearance than a long track: one that never shares the
+    # picture with a longer-seen character and looks reasonably like it is that
+    # character. What is left that is shorter than half a second is not listed
+    # (nobody wants to capture a 0.2 s glimpse, and it looks like a duplicate).
+    def seconds(c):
+        fr = sorted({f for i in c for f in tracklets[i].frames})
+        return len(fr) * (float(np.median(np.diff(fr))) if len(fr) > 1 else 1.0) / fps
+    if any(seconds(c) >= GLIMPSE_S for c in clusters):
+        for c in sorted([c for c in clusters if seconds(c) < GLIMPSE_S], key=seconds):
+            best = None
+            for o in clusters:
+                if o is c or seconds(o) < GLIMPSE_S or conflict(c, o):
+                    continue
+                pair = [Dm[i, j] for i in c for j in o]
+                d = 0.5 * (float(np.mean(pair)) + float(np.min(pair)))
+                if best is None or d < best[0]:
+                    best = (d, o)
+            if best is not None and best[0] < glimpse_threshold:
+                best[1].extend(c)
+                clusters = [x for x in clusters if x is not c]
+        clusters = [c for c in clusters if seconds(c) >= MIN_LISTED_S]
     # characters ordered by screen time
     clusters.sort(key=lambda c: -sum(len(tracklets[i].frames) for i in c))
     chars, char_of = [], {}

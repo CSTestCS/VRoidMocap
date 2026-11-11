@@ -199,13 +199,20 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   than 0.15 s do not count. A joint also counts when both models are fairly
   sure of it (a leg under a skirt or behind hair), and a weak detection that
   runs into a clear sighting, before or after, counts too.
+* **One character per person.** A glimpse of under a second (a fast cut, a
+  moment at the edge of the picture) that never shares the picture with a
+  character seen longer, and looks like them, is part of that character.
+  Anything left that is seen for less than half a second is not listed.
 * **Keyframes only where seen.** A bone gets keyframes only while it is seen.
   Where it is not (out of the picture, behind something, cut off by a zoom or
   a cut), it gets no keyframes: the motion in between is a smooth curve from
   its last seen pose to its next seen pose, leaving and arriving with the
   speed it had there. The character's position works the same way. So:
   * the character out of the shot: it moves smoothly from where it left to
-    where it comes back; after the last sighting it stays,
+    where it comes back; after the last sighting it stays. A gap longer than
+    1.5 s keeps the last seen pose and position and only moves into the next
+    one over its last 0.6 s (the position at walking pace), so it never
+    drifts slowly through made-up poses,
   * only partly in the shot: the visible part follows the video, the rest
     moves in between its sightings; the position follows whatever part is
     seen (hips, shoulders, eyes, a knee, a foot, a hand),

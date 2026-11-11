@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 15
+SOLVE_VERSION = 16
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -1184,8 +1184,16 @@ def place_root(skel, Q, Xw, js_ok, scale, fps, shot_of, tau_s=0.3):
         a, b = seen[i], seen[i + 1]
         if b - a <= 1:
             continue
-        L = b - a
         va = root[a] - root[a - 1] if a - 1 >= first and typ[a - 1] >= 0 else np.zeros(3)
+        if b - a > GAP_HOLD_S * fps:
+            # out of the picture for a while: stays where it was last seen and
+            # moves to where it is seen next at walking pace (at least MOVE_S)
+            dist = float(np.linalg.norm(root[b] - root[a]))
+            T = int(round(max(MOVE_S, dist / (1.5 * scale)) * fps))
+            if T < b - a:
+                root[a + 1:b - T + 1] = root[a]
+                a, va = b - T, np.zeros(3)
+        L = b - a
         vb = root[b + 1] - root[b] if b + 1 <= last and typ[b + 1] >= 0 else np.zeros(3)
         k = float(np.clip(0.15 * fps / L, 0.0, 1.0))
         t = ((np.arange(a + 1, b) - a) / L)[:, None]
@@ -1655,12 +1663,17 @@ def _qexp(r):
     return np.concatenate([ax * np.sin(a / 2), np.cos(a / 2)], -1)
 
 
+GAP_HOLD_S = 1.5  # gaps longer than this hold the last seen pose ...
+MOVE_S = 0.6      # ... and move into the next seen pose over this time
+
+
 def keyframe_fill(target, sb, fps, neutral, nb):
     """One bone over the clip: keyframes only where it is seen, in-between
     motion everywhere else. Gaps between two sightings are filled with a smooth
     curve (Hermite in rotation space) that leaves the last seen pose and
     arrives at the next one with the speeds the bone had there (the speeds
-    count less the longer the gap). Before the bone is first seen it is in the
+    count less the longer the gap). A long gap holds the last seen pose and
+    moves into the next one over its last MOVE_S. Before the bone is first seen it is in the
     A pose (neutral) and eases into the first seen pose over nb frames; after
     the last sighting it keeps that pose."""
     from .naturalize import slerp_many
@@ -1678,10 +1691,17 @@ def keyframe_fill(target, sb, fps, neutral, nb):
         b = a + 1
         while not sb[b]:
             b += 1
+        # a long gap (the character out of the picture for a while): the pose
+        # stays as it was last seen and only moves into the next seen pose over
+        # the last MOVE_S before it (no slow drift through made-up angles)
+        hold = b - a - int(round(MOVE_S * fps))
+        if b - a > GAP_HOLD_S * fps and hold > 0:
+            col[a + 1:a + hold + 1] = target[a]
+            a = a + hold
         L = b - a
-        qa, qb = target[a], target[b]
+        qa, qb = target[f], target[b]
         r = _qlog(_qmul(_qinv(qa), qb))
-        wa = _qlog(_qmul(_qinv(target[a - 1]), qa)) if a >= 1 and sb[a - 1] else np.zeros(3)
+        wa = _qlog(_qmul(_qinv(target[a - 1]), qa)) if a == f and a >= 1 and sb[a - 1] else np.zeros(3)
         wb = _qlog(_qmul(_qinv(qb), target[b + 1])) if b + 1 < N and sb[b + 1] else np.zeros(3)
         k = float(np.clip(0.6 * fps / L, 0.0, 1.0))
         t = (np.arange(a + 1, b) - a) / L
