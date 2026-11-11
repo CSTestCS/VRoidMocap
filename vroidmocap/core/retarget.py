@@ -50,6 +50,7 @@ NO_CLIPPING = True    # limbs do not pass through the body / each other
 CONTEXT_BONES = ("leftUpperLeg", "rightUpperLeg")
 CONTEXT_LIMBS = True  # hidden arms / thighs from the motion around them
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
+HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
 SEGMENT_BONES = True  # a limb bone is known from one joint + one tracker on it (or two trackers)
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
@@ -600,6 +601,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     turned_away = ~np.isfinite(psi_c) | (np.cos(np.nan_to_num(psi_c)) < np.cos(np.radians(110)))
     neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(75))
     face_q = np.where(turned_away | ~neck_ok, 0.0, face_q)
+    if not HEAD_FACE_FIT:
+        face_q = np.zeros_like(face_q)
     head_w = np.einsum("nij,njk->nik", R_w, Rface)
     dbg("face_q", face_q)
 

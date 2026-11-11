@@ -25,8 +25,8 @@ MMD conversions...).
      model tracks both hands on crops around the wrists,
    * the **3D solve** combines them over the whole shot (see below) into joint
      positions in front of the camera,
-   * these become VRM bone rotations, including all 15 finger bones per hand,
-     wrists, forearm twist and feet. The character is placed in the scene
+   * these become VRM bone rotations: body, wrists, forearm twist and feet
+     (the fingers are keyed by hand in step 4). The character is placed in the scene
      where the camera sees it (camera position + what is in the picture), and
      planted feet are pinned with leg IK so they do not slide, and held on
      the floor frame by frame (not in it, not above it).
@@ -41,6 +41,21 @@ MMD conversions...).
    `.fbx`** of the whole clip or just the range, with or without the avatar
    model. Go back and pick another character at any time without
    re-analysing.
+
+4. **Fingers & face** (step 4). The fingers and the face are set by hand on
+   top of the animation: scrub or step to a frame and move a slider, and that
+   sets a key there. Every finger has a **curl** from −10 (bent slightly back)
+   through 0 (straight, as modelled) to 100 (a fist), and a **splay** from 0
+   (the model's own spread) to 10 (wide); presets (relaxed, open, fist, point,
+   peace) and copying one hand to the other key a whole hand at once. The
+   **Expressions** tab lists the avatar's own expressions (VRM: happy, angry,
+   blink, aa...; FBX: its blend shapes), 0 to 100%. Between keys a value
+   moves smoothly without overshooting; before the first key and after the
+   last it holds. Keys show as amber ticks on the timeline, ◀ key / key ▶
+   (Shift+←/→) jump between them and K keys everything at the current frame.
+   They are saved with the project and baked into the export: finger bone
+   rotations, and blend shape channels animated in the FBX (VRM expressions
+   become the morph targets they move). Fingers are not taken from the video.
 
 ## Download / run
 
@@ -79,6 +94,9 @@ VRoidMocapCLI.exe selftest
   folder they are also written to `<name>.fbm/`. Untick *Include the avatar
   model* for an animation-only FBX that binds by bone name to the same model
   in Blender, Unity (Humanoid), Unreal or Maya.
+* **Fingers and expressions** as keyed in step 4: finger bone rotations, and
+  the avatar's blend shapes (VRM: the morph targets each expression moves;
+  FBX: the file's own blend shape channels) animated through DeformPercent.
 * Optional animated **VideoCamera** that reproduces the original camera
   (position, rotation, focal length).
 * **Range:** with a range selected in the viewer, *Only the selected range*
@@ -289,11 +307,17 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   75% of its length). Where both joints of a limb are clear they sit on the
   line; otherwise they follow the picture (checked forwards and backwards,
   dropped when they leave the person or after 0.5 s without a clear view of
-  the limb). When one end of a limb is seen and its other end is out of the
-  picture or behind something, the line through the seen end and a visible
-  tracker, carried on to the bone's length, gives the hidden end: a thigh 40%
-  in view still has its pose. The length it gets must be one that bone can
-  have in the picture at that distance. Each limb's texture is also tracked
+  the limb). **One joint and one tracker are enough**: the line from the
+  seen joint through a visible tracker is the bone's direction, and the hidden
+  end lies on it at the bone's measured length (foreshortened by how far it
+  reaches towards or away from the camera, from the depth read off the
+  motion). With no joint seen, two trackers give the line and where both
+  joints sit on it. So a bar, a strand of hair or the edge of the picture
+  across a thigh or a shin hides only part of the bone, not the leg: a knee
+  and the top of a shin above a foot that is below the picture still give the
+  shin's angle. (Arms use this only when the hidden end is outside the
+  picture or behind something that is not the body: an arm behind the body
+  has its trackers slide onto the chest.) Each limb's texture is also tracked
   as one rigid piece, which carries clearly seen joints into frames where the
   detectors are unsure.
 * **Close to the camera.** A limb that runs out of the picture is squeezed into
