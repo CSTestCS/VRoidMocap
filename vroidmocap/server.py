@@ -16,6 +16,8 @@ import numpy as np
 from .core.detect import resource_dir
 
 WEB_DIR = os.path.join(resource_dir(), "web")
+VIDEO_MIME = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4", ".webm": "video/webm",
+              ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".mp3": "audio/mpeg", ".wav": "audio/wav"}
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".json": "application/json", ".png": "image/png",
         ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
@@ -312,14 +314,43 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found"})
         ctype = ctype or MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
         size = os.path.getsize(path)
-        self.send_response(200)
+        # byte ranges: media elements need them to seek (the reference audio)
+        rng = self.headers.get("Range")
+        start, end = 0, size - 1
+        if rng and rng.startswith("bytes=") and size:
+            a, _, b = rng[6:].split(",")[0].partition("-")
+            try:
+                if a:
+                    start, end = int(a), (int(b) if b else size - 1)
+                else:
+                    start, end = max(0, size - int(b)), size - 1
+            except ValueError:
+                start, end = 0, size - 1
+            end = min(end, size - 1)
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
         if download_name:
             self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
         self.end_headers()
         with open(path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile, 1 << 20)
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                buf = f.read(min(1 << 20, left))
+                if not buf:
+                    break
+                self.wfile.write(buf)
+                left -= len(buf)
 
     # ------------------------------------------------------------------ routes
     def do_GET(self):
@@ -352,6 +383,10 @@ class Handler(BaseHTTPRequestHandler):
                 if data is None:
                     return self._send(404, {"error": "no frame"})
                 return self._send(200, data, "image/jpeg", {"Cache-Control": "max-age=3600"})
+            if p == "/api/media":  # the reference video itself (its sound plays along)
+                if not STATE.video:
+                    return self._send(404, {"error": "no video"})
+                return self._file(STATE.video, VIDEO_MIME.get(os.path.splitext(STATE.video)[1].lower(), "video/mp4"))
             if p == "/api/vrm":
                 return self._file(STATE.vrm, "application/octet-stream")
             if p == "/api/avatar_info":

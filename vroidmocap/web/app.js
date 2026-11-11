@@ -245,6 +245,7 @@ async function openAnimation(cid) {
     const buf = await (await fetch(`/api/anim/${cid}/bin?fps=${fps}`)).arrayBuffer();
     S.viewer.setAnimation(meta, buf);
     S.anim = S.viewer.anim;
+    loadAudio();
     S.character = cid;
     $("steps").children[2].disabled = false;
     const c = S.analysis.characters.find((x) => x.id === cid);
@@ -309,7 +310,7 @@ function seek(f) {
 $("scrub").oninput = (e) => { S.playing = false; updatePlay(); seek(Number(e.target.value)); };
 $("stepBack").onclick = () => { S.playing = false; updatePlay(); seek(S.frame - 1); };
 $("stepFwd").onclick = () => { S.playing = false; updatePlay(); seek(S.frame + 1); };
-function updatePlay() { $("playBtn").textContent = S.playing ? "⏸" : "▶"; }
+function updatePlay() { $("playBtn").textContent = S.playing ? "⏸" : "▶"; syncAudio(); }
 $("playBtn").onclick = () => {
   S.playing = !S.playing;
   const [a, b] = playRange();
@@ -342,6 +343,7 @@ document.addEventListener("keydown", (e) => {
   if (e.code === "KeyI") $("cropIn").click();
   if (e.code === "KeyO") $("cropOut").click();
   if (e.code === "KeyL") $("loop").click();
+  if (e.code === "KeyM") $("muteBtn").click();
 });
 function tick(now) {
   requestAnimationFrame(tick);
@@ -356,8 +358,57 @@ function tick(now) {
     else { S.playing = false; updatePlay(); seek(b); return; }
   }
   if (f !== S.frame) { const t = S.t; seek(f); S.t = t; }
+  syncAudio();
 }
 requestAnimationFrame(tick);
+
+// ---- sound of the reference video: follows playback (speed, seeking, loop); off by default
+const audio = $("refAudio");
+let soundOn = false;
+try { const v = localStorage.getItem("vm.volume"); if (v != null) $("volume").value = v; } catch (e) { /* no storage */ }
+audio.volume = Number($("volume").value);
+function loadAudio() {
+  audio.pause();
+  audio.removeAttribute("src");
+  if (soundOn) { audio.src = `/api/media?t=${Date.now()}`; }
+  updateSound();
+}
+function updateSound() {
+  $("muteBtn").textContent = soundOn ? "🔊" : "🔇";
+  $("muteBtn").closest(".audio").classList.toggle("off", !soundOn);
+}
+// where the sound should be (s) for the current playback position
+function audioTime() {
+  const A = S.anim;
+  const sfps = A.meta.src_fps || A.fps;
+  const f = S.frame;
+  return A.src[f] / sfps + Math.max(0, S.t - f / A.fps);
+}
+function syncAudio() {
+  if (!S.anim || !soundOn || !S.playing) {
+    if (!audio.paused) audio.pause();
+    return;
+  }
+  if (!audio.getAttribute("src")) audio.src = `/api/media?t=${Date.now()}`;
+  const rate = Number($("speed").value);
+  if (audio.playbackRate !== rate) audio.playbackRate = rate;
+  const want = audioTime();
+  if (audio.paused) {
+    try { audio.currentTime = want; } catch (e) { /* not loaded yet */ }
+    audio.play().catch(() => {});
+  } else if (Math.abs(audio.currentTime - want) > 0.15 * Math.max(rate, 1)) {
+    audio.currentTime = want;  // jumped (seek, loop, a cut in the animation) or drifted
+  }
+}
+$("muteBtn").onclick = () => { soundOn = !soundOn; updateSound(); syncAudio(); };
+$("volume").oninput = (e) => {
+  audio.volume = Number(e.target.value);
+  try { localStorage.setItem("vm.volume", e.target.value); } catch (er) { /* no storage */ }
+  if (!soundOn && audio.volume > 0) { soundOn = true; updateSound(); syncAudio(); }
+};
+audio.addEventListener("error", () => {
+  if (soundOn && audio.getAttribute("src")) toast("This video's sound cannot be played here", true);
+});
 
 function drawTrack() {
   const cv = $("trackCanvas"), A = S.anim;

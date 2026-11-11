@@ -134,6 +134,11 @@
         <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
         <option value="1" selected>1×</option><option value="2">2×</option>
       </select>
+      <div class="audio" title="Sound of the reference video">
+        <button id="muteBtn" class="icon" title="Sound on / off (M)" aria-label="Sound on / off">🔇</button>
+        <input type="range" id="volume" min="0" max="1" step="0.05" value="0.8" aria-label="Volume">
+        <audio id="refAudio" preload="metadata"></audio>
+      </div>
       <div class="crop">
         <button id="cropIn" class="ghost small" title="Start the range at this frame (I)">[ In</button>
         <button id="cropOut" class="ghost small" title="End the range at this frame (O)">Out ]</button>

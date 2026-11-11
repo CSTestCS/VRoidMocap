@@ -34,7 +34,9 @@ MMD conversions...).
    free orbit camera. Scrub, step frame by frame, pick the output frame rate
    (12/24/30/60 fps), **lock movement** (keeps the character in the middle of
    the room, optionally height too), **select a range** (drag on the timeline,
-   or `[ In` / `Out ]`, keys I / O) and **loop** it (key L), and **export
+   or `[ In` / `Out ]`, keys I / O) and **loop** it (key L), hear the
+   video's **sound** along with playback (off at the start: the speaker button
+   or key M, with a volume slider), and **export
    `.fbx`** of the whole clip or just the range, with or without the avatar
    model. Go back and pick another character at any time without
    re-analysing.
