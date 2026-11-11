@@ -368,14 +368,7 @@ def apply_torso_facing(zrel, wz, P0, torso):
         wz[ok, ia] = wz[ok, ib] = TORSO_WZ * 2
 
 
-def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None, z_extra_w=0.5):
-    """P0: (N,33,3) rough camera-space landmarks (learned depth, metric root
-    distance). uv: (N,33,2) picture positions. conf: (N,33) 0..1.
-    z_extra: optional (N,33) second depth opinion relative to the hip centre
-    (nan = none). segments: list of (start, end) runs of valid frames.
-    torso: optional (psi_chest, psi_pelvis, r3, view) from facing.track_facing:
-    sets how much deeper the left shoulder / hip is than the right one.
-    Returns (P (N,33,3) with the solved joints replaced, lengths dict)."""
+def _prepare(P0, uv, conf, segments, fps, z_extra, torso, z_extra_w):
     N = len(P0)
     idx = np.array(JOINTS)
     fin = np.zeros(N, bool)
@@ -397,6 +390,11 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
             zrel[s:e] = gaussian_smooth(zrel[s:e], 1.5 * fps / 30.0)
     if torso is not None:
         apply_torso_facing(zrel, wz, P0, torso)
+    return N, idx, fin, uvj, cj, zrel, wz, zroot
+
+
+def _lengths_and_distance(uvj, cj, zrel, zroot, focal, segments, fps, fin):
+    zroot = zroot.copy()
     # bone lengths and the character's distance depend on each other: alternate.
     # (the overall scale stays that of the rough input)
     z_in = zroot.copy()
@@ -416,6 +414,32 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
     k = np.median(z_in[fin]) / np.median(zroot[fin])
     zroot *= k
     L = L * k
+    return L, zroot
+
+
+def measure_proportions(P0, uv, conf, focal, segments, fps, z_extra=None, torso=None, z_extra_w=0.5):
+    """The proportions pass: every bone's length (left and right equal),
+    measured over the whole video before any pose is solved, from the frames
+    where a bone lies across the picture. Returns (L per EDGES (metres, in
+    the scale of the rough input), the character's distance per frame)."""
+    N, idx, fin, uvj, cj, zrel, wz, zroot = _prepare(P0, uv, conf, segments, fps, z_extra, torso, z_extra_w)
+    return _lengths_and_distance(uvj, cj, zrel, zroot, focal, segments, fps, fin)
+
+
+def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None, z_extra_w=0.5,
+              measured=None):
+    """P0: (N,33,3) rough camera-space landmarks (learned depth, metric root
+    distance). uv: (N,33,2) picture positions. conf: (N,33) 0..1.
+    z_extra: optional (N,33) second depth opinion relative to the hip centre
+    (nan = none). segments: list of (start, end) runs of valid frames.
+    torso: optional (psi_chest, psi_pelvis, r3, view) from facing.track_facing:
+    sets how much deeper the left shoulder / hip is than the right one.
+    Returns (P (N,33,3) with the solved joints replaced, lengths dict)."""
+    N, idx, fin, uvj, cj, zrel, wz, zroot = _prepare(P0, uv, conf, segments, fps, z_extra, torso, z_extra_w)
+    if measured is not None:
+        L, zroot = measured
+    else:
+        L, zroot = _lengths_and_distance(uvj, cj, zrel, zroot, focal, segments, fps, fin)
     P = P0.copy()
     rays_all = _rays(uvj, focal, cx, cy)
     for k, (s, e) in enumerate(segments):

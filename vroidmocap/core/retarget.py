@@ -40,8 +40,15 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 17
+SOLVE_VERSION = 18
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
+HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
+NO_CLIPPING = True    # limbs do not pass through the body / each other
+# hidden bones placed from the motion around them (measured: helps the thighs;
+# hidden arms do better with in-between motion; hidden shins stand on the floor)
+CONTEXT_BONES = ("leftUpperLeg", "rightUpperLeg")
+CONTEXT_LIMBS = True  # hidden arms / thighs from the motion around them
+PLANT_UNSEEN = True   # hidden lower legs stand on the floor
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
@@ -490,26 +497,6 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         uv, trk_ok = rigid_track(uv, raw_scores(wb_sync, vis, W, H, N), capture["wb2d"], capture["wbs"],
                                  capture["segM"].astype(np.float64), capture["segN"], valid, fps)
     dbg("trk_ok", trk_ok)
-    # trackers riding the limb bones: a limb partly in view (a knee hidden, 40%
-    # of the thigh visible) still shows its line; its hidden end is put where
-    # the line reaches at the bone's length
-    inferred = np.zeros((N, 33), bool)
-    if "markers" in capture:
-        from .capture import MARKER_FRAC
-        strong = ((raw_scores(wb_sync, vis, W, H, N) >= 0.6) | (vis >= 0.5)) if wb_sync is not None else (vis >= 0.5)
-        # how long each limb can look in the picture: its length (from the body
-        # model, over the clip) at the character's distance
-        exp_len = np.full((N, 8), np.nan)
-        okT = valid & np.isfinite(T).all(1)
-        for k, (a_, b_) in enumerate(SEG_MP[:8]):
-            Lk = np.linalg.norm(Wc[okT, a_] - Wc[okT, b_], axis=1)
-            if len(Lk):
-                exp_len[okT, k] = focal[okT] * np.median(Lk) / np.maximum(T[okT, 2], 0.05)
-        uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
-                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64),
-                                                exp_len=exp_len, covered=occluded_joints(seg, vis_raw))
-    dbg("inferred", inferred)
-    body_conf = conf.copy()
     P0 = np.full((N, 33, 3), np.nan)
     P0[valid] = Wc[valid] + T[valid][:, None]
     segs = runs(valid, shot_of)
@@ -517,13 +504,45 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # opinion on which way each limb points, towards or away from the camera
     z_extra = None
     if Ylift is not None:
-        if True:
-            from . import lifter
-            z_extra = lifter.depth_opinion(Ylift, np.nan_to_num(T[:, 2], nan=3.0), focal, W, H, N)
-            z_extra[swap] = z_extra[swap][:, LR_PERM]
-            z_extra[~valid] = np.nan
-    P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps, torso=(psi_c, psi_p, r3, view),
-                             z_extra=z_extra, z_extra_w=LIFT_W,
+        from . import lifter
+        z_extra = lifter.depth_opinion(Ylift, np.nan_to_num(T[:, 2], nan=3.0), focal, W, H, N)
+        z_extra[swap] = z_extra[swap][:, LR_PERM]
+        z_extra[~valid] = np.nan
+    # ---- the proportions pass: before any pose is worked out, every bone's
+    # length is measured over the whole video (left and right equal), so the
+    # animation knows the character's proportions from its first frame
+    progress(0.04, "Measuring the character's proportions (whole video)")
+    torso_facing = (psi_c, psi_p, r3, view)
+    L_prop, zroot_prop = lift.measure_proportions(np.nan_to_num(P0), uv, conf, focal, segs, fps, z_extra=z_extra,
+                                                  torso=torso_facing, z_extra_w=LIFT_W)
+    proportions = proportion_report(L_prop)
+    try:
+        with open(os.path.join(workdir, f"proportions_c{char_id}.json"), "w") as fh:
+            json.dump(proportions, fh, indent=1)
+    except OSError:
+        pass
+    # trackers riding the limb bones: a limb partly in view (a knee hidden, 40%
+    # of the thigh visible) still shows its line; its hidden end is put where
+    # the line reaches at the bone's length
+    inferred = np.zeros((N, 33), bool)
+    if "markers" in capture:
+        from .capture import MARKER_FRAC
+        strong = ((raw_scores(wb_sync, vis, W, H, N) >= 0.6) | (vis >= 0.5)) if wb_sync is not None else (vis >= 0.5)
+        # how long each limb can look in the picture: its measured length at
+        # the character's distance
+        exp_len = np.full((N, 8), np.nan)
+        okZ = valid & np.isfinite(zroot_prop)
+        for k, (a_, b_) in enumerate(SEG_MP[:8]):
+            e_ = lift.EDGES.index((lift.JI[a_], lift.JI[b_]))
+            if np.isfinite(L_prop[e_]):
+                exp_len[okZ, k] = focal[okZ] * L_prop[e_] / np.maximum(zroot_prop[okZ], 0.05)
+        uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
+                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64),
+                                                exp_len=exp_len, covered=occluded_joints(seg, vis_raw))
+    dbg("inferred", inferred)
+    body_conf = conf.copy()
+    P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps, torso=torso_facing,
+                             z_extra=z_extra, z_extra_w=LIFT_W, measured=(L_prop, zroot_prop),
                              progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
     P[~valid] = np.nan
     T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
@@ -763,16 +782,53 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # from its last seen pose to its next; before a bone is first seen it is in
     # the A pose
     Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel, Q_world=Q_obs)
+    # a limb that is not seen is still there: arms and thighs point where the
+    # motion around them says (read over +-4 s; +-8 s or +-20 s when the limb
+    # was not seen for longer than that)
+    kept = seen.copy()
+    if Ylift is not None and CONTEXT_LIMBS:
+        progress(0.82, "Placing hidden limbs from the motion around them")
+        dirs = context_directions(Ylift, swap, R_w, seen, valid, skel, fps, shot_of,
+                                  lambda m: lifter.cached_lift(workdir, capture, runs(valid, shot_of), W, H, fps, m))
+        Q, filled = context_fill(Q, seen, valid, dirs, skel, fps, shot_of)
+        kept |= filled
     root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
-    lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of)
+    stand_y = float(skel.rest_pos["hips"][1]) * 0.98 if "hips" in skel.rest_pos else None
+    lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of, stand_y=stand_y)
     root[:, 1] += lift_y
+    # lower legs that are not seen (below the picture, behind something) stand
+    # on the floor
+    planted = np.zeros((N, 2), bool)
+    if PLANT_UNSEEN:
+        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of)
+        contacts = contacts | planted
     # and frame by frame: a planted foot is on the floor, not in it or above it
     root[:, 1] += floor_follow(skel, Q, root, contacts, fps, shot_of)
+    if PLANT_UNSEEN and planted.any():
+        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of)
+        for si, side in enumerate(("left", "right")):
+            for b in (side + "UpperLeg", side + "LowerLeg", side + "Foot"):
+                kept[:, bidx[b]] |= planted[:, si]
     if foot_lock:  # pins planted feet (two-bone IK) - only legs that are seen
-        Q = foot_lock_ik(skel, Q, root, contacts, fps)
+        Q = foot_lock_ik(skel, Q, root, contacts & ~planted, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
-        Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel, Q_world=Q_obs)
+        Q = hold_unseen(Q, kept, fps, neutral_pose(skel), skel, Q_world=Q_obs)
+    # ---- 7b. hands that touch the body touch it on the avatar too, and no
+    # limb passes through another part of the body (they just touch)
+    from . import body_shape, contacts as touch
+    caps = body_shape.capsules(skel)
+    if HAND_CONTACTS:
+        progress(0.9, "Hands touching")
+        con, palm3 = touch.detect(P, Ph, h2d, hvalid, uv, valid, fps, shot_of)
+        palm_w = np.einsum("nij,nkj->nki", R_w, palm3)
+        Q = touch.apply(skel, Q, root, con, palm_w, caps, fps)
+        for k_, v_ in con.items():
+            dbg(f"contact_{k_}", v_)
+    if NO_CLIPPING:
+        progress(0.92, "Keeping limbs from passing through each other")
+        allow = touch.allowed_overlaps(con, fps) if HAND_CONTACTS else None
+        Q, _ = body_shape.resolve_collisions(skel, Q, caps, fps, shot_of, active=valid, allow=allow)
     dbg("Q_final", Q)
 
     # ---- 8. the cloned camera: where the real camera is in the scene (it never
@@ -786,7 +842,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     anim = {
         "fps": fps, "frames": N, "width": W, "height": H, "character": char_id,
         "bones": skel.bones, "quats": Q.astype(np.float32), "root": root.astype(np.float32),
-        "valid": valid, "contacts": contacts, "finger_valid": finger_valid,
+        "valid": valid, "contacts": contacts, "finger_valid": finger_valid, "proportions": proportions,
         "cam_pos": cam_pos.astype(np.float32), "cam_quat": cam_quat.astype(np.float32),
         "cam_vfov": cam_vfov.astype(np.float32), "shot_of": shot_of.astype(np.int32),
         "lm2d": lm2d.astype(np.float32), "vis": vis.astype(np.float32),
@@ -1301,7 +1357,7 @@ def foot_contacts(skel, Q, root, fps, feet_ok):
     return contact
 
 
-def settle_on_floor(skel, Q, root, contacts, fps, shot_of):
+def settle_on_floor(skel, Q, root, contacts, fps, shot_of, stand_y=None):
     """Per shot, one vertical shift of the whole scene (character and camera
     together, so the picture is unchanged) that puts the planted feet on the
     floor (y = 0). Returns the shift per frame."""
@@ -1313,7 +1369,30 @@ def settle_on_floor(skel, Q, root, contacts, fps, shot_of):
         c = c[np.isfinite(c)]
         if len(c) >= 3:
             shift[a:b] = float(np.median(c))
+        elif stand_y is not None:
+            # no foot seen on the floor in this shot (feet below the picture):
+            # the feet are still on the floor, so the hips are at standing height
+            shift[a:b] = stand_y - float(np.median(root[a:b, 1]))
     return shift
+
+
+def proportion_report(L):
+    """The measured proportions, for the project folder and the app: each
+    limb bone's length in metres (the body model's scale) and as a share of
+    the leg length (hip to ankle)."""
+    names = {(L_SH, L_EL): "upper_arm", (L_EL, L_WR): "forearm", (L_HIP, L_KNEE): "thigh", (L_KNEE, L_ANK): "shin",
+             (L_SH, R_SH): "shoulder_width", (L_HIP, R_HIP): "hip_width", (L_SH, L_HIP): "torso_side"}
+    out = {}
+    for (a, b), nm in names.items():
+        key = (lift.JI[a], lift.JI[b])
+        if key in lift.EDGES:
+            v = float(L[lift.EDGES.index(key)])
+            if np.isfinite(v):
+                out[nm] = round(v, 4)
+    leg = out.get("thigh", 0) + out.get("shin", 0)
+    if leg > 0:
+        out["share_of_leg"] = {k: round(v / leg, 3) for k, v in list(out.items()) if isinstance(v, float)}
+    return out
 
 
 def floor_follow(skel, Q, root, contacts, fps, shot_of, sigma_s=0.08, max_m=0.2):
@@ -1793,6 +1872,207 @@ def keyframe_fill(target, sb, fps, neutral, nb):
             tt = tt * tt * (3 - 2 * tt)
             col[g] = slerp_many(neutral, col[g], np.array([tt]))[0]
     return col
+
+
+CHILD_OF = {"leftUpperArm": "leftLowerArm", "leftLowerArm": "leftHand", "rightUpperArm": "rightLowerArm",
+            "rightLowerArm": "rightHand", "leftUpperLeg": "leftLowerLeg", "leftLowerLeg": "leftFoot",
+            "rightUpperLeg": "rightLowerLeg", "rightLowerLeg": "rightFoot"}
+
+
+def _align_batch(a, b):
+    """(n,3,3) minimal rotations taking unit vectors a onto b."""
+    a, b = normalize(a), normalize(b)
+    v = np.cross(a, b)
+    c = np.sum(a * b, -1)
+    K = np.zeros(a.shape[:-1] + (3, 3))
+    K[..., 0, 1], K[..., 0, 2], K[..., 1, 2] = -v[..., 2], v[..., 1], -v[..., 0]
+    K[..., 1, 0], K[..., 2, 0], K[..., 2, 1] = v[..., 2], -v[..., 1], v[..., 0]
+    k = 1.0 / np.maximum(1.0 + c, 1e-6)
+    return np.eye(3) + K + np.einsum("...ij,...jk->...ik", K, K) * k[..., None, None]
+
+
+def _ramp_weights(mask, seen_col, shot_of, nr):
+    """Per frame weight (0..1) inside runs of `mask`: 1 in the middle, easing
+    from / to the frames just outside a run where the bone is seen."""
+    N = len(mask)
+    w = np.zeros(N)
+    for (a, e) in runs(mask, shot_of):
+        k = np.arange(a, e)
+        wl = np.clip((k - a + 1) / nr, 0, 1) if (a > 0 and seen_col[a - 1] and shot_of[a - 1] == shot_of[a]) else 1.0
+        wr = np.clip((e - k) / nr, 0, 1) if (e < N and seen_col[e] and shot_of[e] == shot_of[e - 1]) else 1.0
+        t = np.minimum(wl, wr)
+        w[a:e] = t * t * (3 - 2 * t)
+    return w
+
+
+def _set_world(Q, skel, b, Gnew, w):
+    """Give bone b the world rotation Gnew (n,3,3) with weight w (n,), keeping
+    its parent; Q (N,B,4) is changed in place where w > 0."""
+    idx = {x: i for i, x in enumerate(skel.bones)}
+    i = idx[b]
+    m = w > 0
+    if not m.any():
+        return
+    _, rot = avatar_fk(skel, Q[m], np.zeros((int(m.sum()), 3)))
+    p = skel.parent[b]
+    Gp = rot[:, idx[p]] if p is not None else np.tile(np.eye(3), (int(m.sum()), 1, 1))
+    Gold = rot[:, i]
+    q_old, q_new = mat_to_quat(Gold), mat_to_quat(Gnew[m])
+    q_new = np.where((np.sum(q_old * q_new, 1) < 0)[:, None], -q_new, q_new)
+    t = w[m][:, None]
+    Gb = quat_to_mat(normalize((1 - t) * q_old + t * q_new))
+    Q[m, i] = mat_to_quat(np.einsum("nji,njk->nik", Gp, Gb))
+
+
+def _frames_to_seen(col, shot_of):
+    """Per frame: frames to the nearest frame (same shot) where col is True (inf if none)."""
+    N = len(col)
+    d = np.full(N, np.inf)
+    last = -np.inf
+    for f in range(N):
+        if f > 0 and shot_of[f] != shot_of[f - 1]:
+            last = -np.inf
+        if col[f]:
+            last = f
+        d[f] = f - last
+    last = np.inf
+    for f in range(N - 1, -1, -1):
+        if f < N - 1 and shot_of[f] != shot_of[f + 1]:
+            last = np.inf
+        if col[f]:
+            last = f
+        d[f] = min(d[f], last - f)
+    return d
+
+
+def context_directions(Ylift, swap, R_w, seen, valid, skel, fps, shot_of, get_lift):
+    """World direction of arms and thighs read from the motion around each
+    frame: from the +-4 s reading, or the +-8 s / +-20 s one (get_lift(2),
+    get_lift(5)) where the limb was not seen for longer than 3 s / 7 s."""
+    from . import lifter
+    Ys = {1: lifter.swap_labels(Ylift, swap)}
+    idx = {b: i for i, b in enumerate(skel.bones)}
+    dirs = {}
+    for b, (ha, hb) in lifter.BONE_H36M.items():
+        if b not in idx or b not in CONTEXT_BONES:
+            continue
+        i = idx[b]
+        dist = _frames_to_seen(seen[:, i] & valid, shot_of) / fps
+        need = valid & ~seen[:, i]
+        mult = np.where(dist <= 3.0, 1, np.where(dist <= 7.0, 2, 5))
+        for m in (2, 5):
+            if (need & (mult == m)).any() and m not in Ys:
+                try:
+                    Y = get_lift(m)
+                except Exception:
+                    log.exception("long-range depth from motion failed")
+                    Y = None
+                Ys[m] = lifter.swap_labels(Y, swap) if Y is not None else None
+        v = np.full((len(seen), 3), np.nan)
+        for m in (1, 2, 5):
+            Y = Ys.get(m)
+            if Y is None:
+                Y = Ys[1]
+            sel = mult == m
+            v[sel] = (Y[sel, hb] - Y[sel, ha])
+        w = np.einsum("nij,nj->ni", R_w, v)
+        # light smoothing along each stretch (no steps where the reading changes)
+        for (a, e) in runs(need & np.isfinite(w).all(1), shot_of):
+            if e - a >= 3:
+                w[a:e] = gaussian_smooth(w[a:e], 0.08 * fps)
+        dirs[b] = np.where(np.isfinite(w).all(1, keepdims=True), normalize(np.nan_to_num(w)), np.nan)
+    return dirs
+
+
+def context_fill(Q, seen, valid, dirs, skel, fps, shot_of, ramp_s=0.25):
+    """A limb that is not seen is still there: where it points comes from the
+    motion around it (dirs: {bone: (N,3) world direction, nan = unknown}). Its
+    stretches without sightings follow that direction, easing from / into the
+    seen poses at their ends. Returns (Q, filled (N,B) bool)."""
+    Q = normalize(Q.copy())
+    idx = {b: i for i, b in enumerate(skel.bones)}
+    filled = np.zeros(seen.shape, bool)
+    nr = max(1, int(round(ramp_s * fps)))
+    rp = skel.rest_pos
+    for b in skel.bones:  # parents before children
+        if b not in dirs or b not in CHILD_OF or not skel.has(CHILD_OF[b]):
+            continue
+        i = idx[b]
+        d = dirs[b]
+        m = valid & ~seen[:, i] & np.isfinite(d).all(1)
+        if not m.any():
+            continue
+        w = _ramp_weights(m, seen[:, i], shot_of, nr)
+        _, rot = avatar_fk(skel, Q, np.zeros((len(Q), 3)))
+        rest_dir = rp[CHILD_OF[b]] - rp[b]
+        cur = np.einsum("nij,j->ni", rot[:, i], rest_dir)
+        G = np.einsum("nij,njk->nik", _align_batch(cur, np.nan_to_num(d)), rot[:, i])
+        _set_world(Q, skel, b, G, np.where(m, w, 0.0))
+        filled[:, i] |= m
+    return Q, filled
+
+
+def planted_legs(Q, root, seen, valid, skel, fps, shot_of, ramp_s=0.2):
+    """A lower leg that is not seen (below the picture, behind something)
+    stands on the floor: its foot is put flat on the floor (y = 0) under the
+    knee / hip, and the leg reaches it (two-bone IK when the thigh is not seen
+    either, otherwise the shin alone). Returns (Q, planted (N,2) bool)."""
+    Q = normalize(Q.copy())
+    N = len(Q)
+    idx = {b: i for i, b in enumerate(skel.bones)}
+    rp = skel.rest_pos
+    planted = np.zeros((N, 2), bool)
+    nr = max(1, int(round(ramp_s * fps)))
+    for si, side in enumerate(("left", "right")):
+        iu, il, ifo = idx[side + "UpperLeg"], idx[side + "LowerLeg"], idx[side + "Foot"]
+        m = valid & ~seen[:, il]
+        if not m.any():
+            continue
+        w = _ramp_weights(m, seen[:, il], shot_of, nr)
+        pos, rot = avatar_fk(skel, Q, root)
+        l1 = np.linalg.norm(rp[side + "LowerLeg"] - rp[side + "UpperLeg"])
+        l2 = np.linalg.norm(rp[side + "Foot"] - rp[side + "LowerLeg"])
+        ankle_h = float(rp[side + "Foot"][1])
+        H, K, A = pos[:, iu], pos[:, il], pos[:, ifo]
+        # where the foot stands: below where the leg is now, not further out
+        # than a natural stance, on the floor
+        T = A.copy()
+        off = T[:, [0, 2]] - H[:, [0, 2]]
+        on = np.linalg.norm(off, axis=1, keepdims=True)
+        lim = 0.3 * (l1 + l2)
+        T[:, [0, 2]] = H[:, [0, 2]] + off * np.minimum(1.0, lim / np.maximum(on, 1e-6))
+        T[:, 1] = ankle_h
+        thigh_seen = seen[:, iu]
+        dvec = T - H
+        dl = np.linalg.norm(dvec, axis=1)
+        d = np.clip(dl, abs(l1 - l2) + 1e-4, l1 + l2 - 1e-4)
+        dn = dvec / np.maximum(dl, 1e-9)[:, None]
+        pole = (K - H) - dn * np.sum((K - H) * dn, 1, keepdims=True)
+        pn = np.linalg.norm(pole, axis=1)
+        fwd = np.einsum("nij,j->ni", rot[:, idx["hips"]], np.array([0, 0, 1.0]))
+        pole = np.where((pn < 1e-6)[:, None], fwd - dn * np.sum(fwd * dn, 1, keepdims=True), pole)
+        pole = normalize(pole)
+        a = (l1 * l1 - l2 * l2 + d * d) / (2 * d)
+        h = np.sqrt(np.maximum(l1 * l1 - a * a, 0.0))
+        Kn = H + dn * a[:, None] + pole * h[:, None]
+        Kn = np.where(thigh_seen[:, None], K, Kn)
+        An = np.where(thigh_seen[:, None], K + l2 * normalize(T - K), H + dn * d[:, None])
+        rest_u = rp[side + "LowerLeg"] - rp[side + "UpperLeg"]
+        rest_l = rp[side + "Foot"] - rp[side + "LowerLeg"]
+        Gu = np.einsum("nij,njk->nik", _align_batch(np.einsum("nij,j->ni", rot[:, iu], rest_u), Kn - H), rot[:, iu])
+        _set_world(Q, skel, side + "UpperLeg", Gu, np.where(m & ~thigh_seen, w, 0.0))
+        _, rot = avatar_fk(skel, Q, root)
+        Gl = np.einsum("nij,njk->nik", _align_batch(np.einsum("nij,j->ni", rot[:, il], rest_l), An - Kn), rot[:, il])
+        _set_world(Q, skel, side + "LowerLeg", Gl, np.where(m, w, 0.0))
+        # the foot flat on the floor, pointing where the pelvis points
+        _, rot = avatar_fk(skel, Q, root)
+        yaw = np.arctan2(fwd[:, 0], fwd[:, 2])
+        c, s_ = np.cos(yaw), np.sin(yaw)
+        Gf = np.zeros((N, 3, 3))
+        Gf[:, 0, 0], Gf[:, 0, 2], Gf[:, 1, 1], Gf[:, 2, 0], Gf[:, 2, 2] = c, s_, 1.0, -s_, c
+        _set_world(Q, skel, side + "Foot", Gf, np.where(m, w, 0.0))
+        planted[:, si] = m
+    return Q, planted
 
 
 def world_smoothed(Q, skel, sigma):

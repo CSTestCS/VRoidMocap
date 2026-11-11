@@ -730,3 +730,65 @@ class BoneTrackers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BodyContacts(unittest.TestCase):
+    """Limbs do not pass through each other (they end up just touching), a
+    palm can be put exactly on a point, and an unseen lower leg stands on
+    the floor."""
+
+    def _pose(self, skel, n, bone, axis, deg):
+        Q = np.zeros((n, len(skel.bones), 4))
+        Q[..., 3] = 1
+        a = np.radians(deg) / 2
+        Q[:, skel.bones.index(bone)] = np.r_[np.sin(a) * np.asarray(axis, float), np.cos(a)]
+        return Q
+
+    def test_forearms_crossing_are_pushed_apart(self):
+        from vroidmocap.core import body_shape
+        skel = synthetic_skeleton()
+        caps = body_shape.capsules(skel)
+        n = 5
+        Q = np.zeros((n, len(skel.bones), 4))
+        Q[..., 3] = 1
+        # both arms forward, forearms bent in towards each other so they cross
+        for side, sg in (("left", 1), ("right", -1)):
+            a = np.radians(-90 * sg) / 2
+            Q[:, skel.bones.index(side + "UpperArm")] = [0, np.sin(a), 0, np.cos(a)]
+            b = np.radians(-80 * sg) / 2
+            Q[:, skel.bones.index(side + "LowerArm")] = [0, np.sin(b), 0, np.cos(b)]
+        before = body_shape.penetration(skel, Q, None, caps)
+        self.assertTrue((before > 0.02).all())
+        Q2, left = body_shape.resolve_collisions(skel, Q, caps, 30, np.zeros(n, int), smooth_s=0)
+        after = body_shape.penetration(skel, Q2, None, caps)
+        self.assertTrue((after < 0.005).all(), after)
+
+    def test_palm_reaches_its_target(self):
+        from vroidmocap.core import contacts
+        skel = synthetic_skeleton()
+        n = 3
+        Q = np.zeros((n, len(skel.bones), 4))
+        Q[..., 3] = 1
+        root = np.tile([[0, 1.0, 0]], (n, 1))
+        target = np.tile([[0.05, 1.75, 0.15]], (n, 1))
+        contacts.arm_reach(skel, Q, root, "left", target, np.ones(n))
+        pos, rot = avatar_fk(skel, Q, root)
+        i, j = skel.bones.index("leftHand"), skel.bones.index("leftMiddleProximal")
+        palm = pos[:, i] + 0.5 * (pos[:, j] - pos[:, i])
+        self.assertLess(np.abs(palm - target).max(), 0.02)
+
+    def test_unseen_lower_leg_stands_on_the_floor(self):
+        from vroidmocap.core.retarget import _foot_lows, planted_legs
+        skel = synthetic_skeleton()
+        n = 4
+        Q = np.zeros((n, len(skel.bones), 4))
+        Q[..., 3] = 1
+        hip_h = float(skel.rest_pos["hips"][1])
+        root = np.tile([[0, hip_h - 0.12, 0]], (n, 1))  # hips lower than standing: knees must bend
+        seen = np.ones((n, len(skel.bones)), bool)
+        for b in ("leftUpperLeg", "leftLowerLeg", "leftFoot"):
+            seen[:, skel.bones.index(b)] = False
+        Q2, planted = planted_legs(Q, root, seen, np.ones(n, bool), skel, 30, np.zeros(n, int))
+        self.assertTrue(planted[:, 0].all())
+        lows, _ = _foot_lows(skel, Q2, root)
+        self.assertLess(np.abs(lows[:, 0]).max(), 0.02)

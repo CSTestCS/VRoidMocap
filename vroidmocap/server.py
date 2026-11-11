@@ -249,6 +249,8 @@ class AppState:
                  ("lm2d", a["lm2d"]), ("vis", a["vis"]), ("h2d", a["h2d"]), ("hs", a["hs"]),
                  ("shot_of", a["shot_of"].astype(np.float32))]
         meta = {k: a[k] for k in ("fps", "frames", "width", "height", "character", "bones", "scale", "src_fps")}
+        if "proportions" in a:
+            meta["proportions"] = a["proportions"]
         if self.skel is not None and self.skel.version == "fbx":
             # the model's own bones: local rotations as in the file + hips translation
             names, fq, fh = self.skel.fbx.pose(list(a["bones"]), a["quats"], a["root"])

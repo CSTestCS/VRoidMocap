@@ -246,6 +246,11 @@ async function openAnimation(cid) {
     S.viewer.setAnimation(meta, buf);
     S.anim = S.viewer.anim;
     loadAudio();
+    const pr = meta.proportions && meta.proportions.share_of_leg;
+    const f2 = (v) => (v == null ? "–" : Number(v).toFixed(2));
+    $("propInfo").textContent = pr
+      ? `Proportions measured over the whole video (share of the leg length): upper arm ${f2(pr.upper_arm)} · forearm ${f2(pr.forearm)} · thigh ${f2(pr.thigh)} · shin ${f2(pr.shin)} · shoulders ${f2(pr.shoulder_width)} · hips ${f2(pr.hip_width)}`
+      : "";
     S.character = cid;
     $("steps").children[2].disabled = false;
     const c = S.analysis.characters.find((x) => x.id === cid);

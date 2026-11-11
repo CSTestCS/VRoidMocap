@@ -31,7 +31,7 @@ def coco_to_h36m(x):
     return y
 
 
-def lift(wb2d, wbs, spans, W, H, fps, model_path, threads=2):
+def lift(wb2d, wbs, spans, W, H, fps, model_path, threads=2, step_mult=1):
     """wb2d (N,133,2) px, wbs (N,133) scores, spans: (start, end) stretches to
     read as one motion (inside a shot). Returns (N,17,3) in the model's units
     (x right, y down, z away from the camera; units of half the shorter
@@ -47,7 +47,12 @@ def lift(wb2d, wbs, spans, W, H, fps, model_path, threads=2):
     X = np.concatenate([wb2d[:, :17].astype(np.float64), np.clip(wbs[:, :17, None], 0, 1)], -1)
     X = coco_to_h36m(X)
     X[..., :2] = (X[..., :2] - [W / 2.0, H / 2.0]) / (min(W, H) / 2.0)
-    step = max(1, int(round(fps / 30.0)))  # the model was trained on ~30-50 fps motion
+    # a joint with no score at all is "not seen" for the model: all zeros (as it
+    # was trained with masked joints); it fills it in from the motion around it
+    X[X[..., 2] <= 0] = 0.0
+    # the model was trained on ~30-50 fps motion; a coarser step reads a longer
+    # stretch at once (x2: about 8 s each way, x5: about 20 s each way)
+    step = max(1, int(round(fps / 30.0))) * int(step_mult)
     for (s, e) in spans:
         idx = np.arange(s, e, step)
         if len(idx) < 4:
@@ -101,13 +106,14 @@ def model_file():
     return model_available("lifter")
 
 
-def cached_lift(workdir, capture, spans, W, H, fps):
+def cached_lift(workdir, capture, spans, W, H, fps, step_mult=1):
     """The lifter's output for this capture, computed once and kept next to it."""
     from .detect import ensure_model
     path = ensure_model("lifter")
     if not path or "wb2d" not in capture:
         return None
-    key = f"lift_{int(np.asarray(capture.get('version', 0)))}_{len(capture['wb2d'])}.npy"
+    sfx = "" if step_mult == 1 else f"_x{step_mult}"
+    key = f"lift_{int(np.asarray(capture.get('version', 0)))}_{len(capture['wb2d'])}{sfx}.npy"
     cp = os.path.join(workdir, key)
     if os.path.exists(cp):
         try:
@@ -116,9 +122,27 @@ def cached_lift(workdir, capture, spans, W, H, fps):
                 return Y
         except (OSError, ValueError):
             pass
-    Y = lift(capture["wb2d"], capture["wbs"], spans, W, H, fps, path)
+    Y = lift(capture["wb2d"], capture["wbs"], spans, W, H, fps, path, step_mult=step_mult)
     try:
         np.save(cp, Y)
     except OSError:
         pass
+    return Y
+
+
+# H36M joint pairs that swap with the left/right labels
+H36M_LR = [(1, 4), (2, 5), (3, 6), (11, 14), (12, 15), (13, 16)]
+# avatar bone -> (H36M from, H36M to): the bone's direction in the model's 3D
+BONE_H36M = {"leftUpperArm": (11, 12), "leftLowerArm": (12, 13), "rightUpperArm": (14, 15), "rightLowerArm": (15, 16),
+             "leftUpperLeg": (4, 5), "rightUpperLeg": (1, 2), "leftLowerLeg": (5, 6), "rightLowerLeg": (2, 3)}
+
+
+def swap_labels(Y, swap):
+    """The model reads the labels as detected; where the facing tracker found
+    them swapped, swap its left and right joints too."""
+    Y = Y.copy()
+    for a, b in H36M_LR:
+        ya = Y[swap, a].copy()
+        Y[swap, a] = Y[swap, b]
+        Y[swap, b] = ya
     return Y
