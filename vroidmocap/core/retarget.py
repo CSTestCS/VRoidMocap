@@ -40,7 +40,7 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 19
+SOLVE_VERSION = 20
 FINGERS_FROM_VIDEO = False  # fingers are set by hand afterwards (keys.py); the solve leaves them at rest
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
 HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
@@ -49,6 +49,12 @@ NO_CLIPPING = True    # limbs do not pass through the body / each other
 # hidden arms do better with in-between motion; hidden shins stand on the floor)
 CONTEXT_BONES = ("leftUpperLeg", "rightUpperLeg")
 CONTEXT_LIMBS = True  # hidden arms / thighs from the motion around them
+PLANT_UNDER_HIPS = True
+HAND_STEADY_SCALE = True  # hand size steady over time (a turned hand looks narrower)
+HAND_SMOOTH = 2.0  # smoothing of the wrists relative to the rest of the body
+HAND_PNP = True  # hand rotation from the avatar's rigid palm fitted to the picture
+HEAD_GAIN = (1.0, 1.0, 1.5)  # turn, nod, tilt of the head (relative to the chest) as read from the face, scaled
+STAND_HIPS = 0.95  # hips height (share of the rest height) when no foot is seen in a whole shot
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
@@ -110,6 +116,52 @@ def snap_chain(P, rays, w, tree, lengths, fixed=()):
         if n > 1e-9:
             P[c] = P[p] + d / n * L
     return P
+
+
+PALM_IDX = [0, 1, 5, 9, 13, 17]
+
+
+def _palm_fit(Ph, uv, tmpl, focal, cx, cy):
+    """Turn a reconstructed hand (21,3, camera frame) so its palm matches the
+    avatar's rigid palm fitted to the picture (perspective fit of wrist, thumb
+    base and knuckles): the hand's rotation from the picture itself, not from
+    the hand model's depth guess. Of the two fits a flat palm allows (turned
+    towards or away from the camera by the same amount), the one nearer the
+    reconstructed hand. The wrist stays where it is."""
+    import cv2
+    if not np.isfinite(Ph).all() or not np.isfinite(uv).all():
+        return Ph
+    obj = (tmpl - tmpl[0]).astype(np.float64)
+    img = uv[PALM_IDX].astype(np.float64)
+    if np.ptp(img, axis=0).max() < 6:
+        return Ph
+    K = np.array([[focal, 0, cx], [0, focal, cy], [0, 0, 1.0]])
+    try:
+        n, rvs, tvs, errs = cv2.solvePnPGeneric(obj, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
+        cands = [cv2.Rodrigues(r)[0] for r in rvs]
+        n2, rvs2, _, _ = cv2.solvePnPGeneric(obj[[0, 2, 3, 4, 5]], img[[0, 2, 3, 4, 5]], K, None, flags=cv2.SOLVEPNP_IPPE)
+        cands += [cv2.Rodrigues(r)[0] for r in rvs2]
+    except cv2.error:
+        return Ph
+    if not cands:
+        return Ph
+    def frame(p0, p5, p9, p17):
+        a = p9 - p0
+        b = np.cross(p5 - p0, p17 - p0)
+        a = a / max(np.linalg.norm(a), 1e-9)
+        b = b - a * np.dot(b, a)
+        b = b / max(np.linalg.norm(b), 1e-9)
+        return np.stack([a, b, np.cross(a, b)], 1)
+    F0 = frame(Ph[0], Ph[5], Ph[9], Ph[17])
+    best, bd = None, -9
+    for R in cands:
+        q = obj @ R.T
+        F1 = frame(q[0], q[2], q[3], q[5])
+        d = np.trace(F0.T @ F1)
+        if d > bd:
+            best, bd = F1, d
+    Rc = best @ F0.T  # turns the reconstructed palm onto the fitted one
+    return Ph[0] + (Ph - Ph[0]) @ Rc.T
 
 
 def rays_for(lm2d, f, cx, cy):
@@ -635,22 +687,49 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             Hc[f, side] = hw[f, side] @ Rr.T
     hlen = [median_lengths(Hc[:, s], HAND_TREE, hvalid[:, s]) if hvalid[:, s].sum() > 3 else {} for s in (0, 1)]
     Ph = np.full((N, 2, 21, 3), np.nan)
+    # the avatar's own palm (wrist, thumb base and the four knuckles) as a rigid shape
+    palm_tmpl = []
+    for sd in ("left", "right"):
+        bs = [sd + "Hand", sd + "ThumbMetacarpal", sd + "IndexProximal", sd + "MiddleProximal", sd + "RingProximal",
+              sd + "LittleProximal"]
+        palm_tmpl.append(np.array([skel.rest_pos[b] for b in bs]) if all(b in skel.rest_pos for b in bs) else None)
+    # the hand model's metric size need not agree with the body's depth: the
+    # hand is rescaled so it is as large as the detected hand. The scale is
+    # held steady over time (taken from the moments the hand shows its full
+    # size): a hand turned away from the camera looks narrower, and that is
+    # how far it is turned, not a smaller hand
+    kk = np.full((N, 2), np.nan)
     for f in np.where(valid)[0]:
         for side, wi in ((0, L_WR), (1, R_WR)):
             if not hvalid[f, side] or not hlen[side]:
                 continue
-            # the hand model's metric size need not agree with the body's depth:
-            # rescale the hand so its projection is as large as the detected hand
             rel = Hc[f, side] - Hc[f, side, 0]
             z = max(P[f, wi, 2], 0.1)
             proj = np.linalg.norm(rel[:, :2] * focal[f] / z, axis=1)[1:]
             img = np.linalg.norm(h2d[f, side, 1:] - h2d[f, side, 0], axis=1)
-            k = float(np.clip(np.median(img) / max(np.median(proj), 1e-6), 0.5, 2.0))
+            kk[f, side] = float(np.clip(np.median(img) / max(np.median(proj), 1e-6), 0.5, 2.0))
+    k_used = kk.copy()
+    if HAND_STEADY_SCALE:
+        win = int(round(1.5 * fps))
+        for side in (0, 1):
+            col = kk[:, side]
+            for f in np.where(np.isfinite(col))[0]:
+                a_, b_ = max(0, f - win), min(N, f + win + 1)
+                w_ = col[a_:b_][(shot_of[a_:b_] == shot_of[f]) & np.isfinite(col[a_:b_])]
+                k_used[f, side] = np.percentile(w_, 80)
+    for f in np.where(valid)[0]:
+        for side, wi in ((0, L_WR), (1, R_WR)):
+            if not hvalid[f, side] or not hlen[side]:
+                continue
+            rel = Hc[f, side] - Hc[f, side, 0]
+            k = float(k_used[f, side])
             hp = rel * k + P[f, wi]
             hr = rays_for(h2d[f, side], focal[f], cx, cy)
             ww = np.full(21, 0.9)
             ww[0] = 0
             Ph[f, side] = snap_chain(hp, hr, ww, HAND_TREE, {e: L * k for e, L in hlen[side].items()}, fixed=(0,))
+            if HAND_PNP and palm_tmpl[side] is not None:
+                Ph[f, side] = _palm_fit(Ph[f, side], h2d[f, side], palm_tmpl[side], focal[f], cx, cy)
         if f % 500 == 0:
             progress(0.05 + 0.25 * f / N, "Reconstructing 3D joints")
 
@@ -729,6 +808,29 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             corr = quat_to_mat(np.array([np.sin(-off / 2), 0, 0, np.cos(off / 2)]))
             Q[qvalid, hi] = mat_to_quat(R @ corr)
 
+    # the face points under-read how far the head turns, nods and tilts (the
+    # detector pulls an unusual face towards a straight-on one): measured on
+    # rendered heads with known motion, scale them back up
+    if HEAD_GAIN != (1.0, 1.0, 1.0) and skel.has("head") and skel.has("neck"):
+        hn, hh = bidx["neck"], bidx["head"]
+        use = qvalid & (face_q > 0.15)
+        Rel = quat_to_mat(Q[use, hn]) @ quat_to_mat(Q[use, hh])
+        yaw = np.arctan2(Rel[:, 0, 2], Rel[:, 2, 2]) * HEAD_GAIN[0]
+        pitch = np.arcsin(np.clip(-Rel[:, 1, 2], -1, 1)) * HEAD_GAIN[1]
+        roll = np.arctan2(Rel[:, 1, 0], Rel[:, 1, 1]) * HEAD_GAIN[2]
+        lim = np.radians([80.0, 60.0, 50.0])
+        yaw, pitch, roll = (np.clip(x, -l, l) for x, l in zip((yaw, pitch, roll), lim))
+        def _ax(axis, t):
+            q = np.zeros((len(t), 4)); q[:, axis] = np.sin(t / 2); q[:, 3] = np.cos(t / 2)
+            return quat_to_mat(q)
+        R2 = _ax(1, yaw) @ _ax(0, pitch) @ _ax(2, roll)
+        q2 = mat_to_quat(R2)
+        q2 = np.where(q2[:, 3:] < 0, -q2, q2)
+        th = 2 * np.arccos(np.clip(q2[:, 3], -1, 1))
+        axn = q2[:, :3] / np.maximum(np.linalg.norm(q2[:, :3], axis=1, keepdims=True), 1e-12)
+        qn = np.concatenate([axn * np.sin(0.35 * th / 2)[:, None], np.cos(0.35 * th / 2)[:, None]], 1)  # 35% in the neck
+        Q[use, hn] = qn
+        Q[use, hh] = mat_to_quat(np.einsum("nji,njk->nik", quat_to_mat(qn), R2))
     dbg("Pcam", P)
     dbg("Q_raw", Q)
     Q_raw = Q.copy()
@@ -771,7 +873,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("seen", seen)
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)
-    strength = np.array([2.0 if (b.endswith("Hand") or any(f in b for f in FINGERS)) else 1.0 for b in skel.bones])
+    strength = np.array([HAND_SMOOTH if b.endswith("Hand") else 2.0 if any(f in b for f in FINGERS) else 1.0
+                         for b in skel.bones])
     Q = filter_rotations(Q, conf, fps, smoothing, strength=strength)
     dbg("Q_filt", Q)
 
@@ -824,19 +927,20 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         kept |= filled
     root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
-    stand_y = float(skel.rest_pos["hips"][1]) * 0.98 if "hips" in skel.rest_pos else None
+    stand_y = float(skel.rest_pos["hips"][1]) * STAND_HIPS if "hips" in skel.rest_pos else None
     lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of, stand_y=stand_y)
     root[:, 1] += lift_y
     # lower legs that are not seen (below the picture, behind something) stand
     # on the floor
     planted = np.zeros((N, 2), bool)
+    cam_av = scale * cam_world + np.array([0.0, 1.0, 0.0]) * lift_y[:, None]  # the camera, in the avatar's world
     if PLANT_UNSEEN:
-        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of)
+        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of, cam=cam_av)
         contacts = contacts | planted
     # and frame by frame: a planted foot is on the floor, not in it or above it
     root[:, 1] += floor_follow(skel, Q, root, contacts, fps, shot_of)
     if PLANT_UNSEEN and planted.any():
-        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of)
+        Q, planted = planted_legs(Q, root, seen, valid, skel, fps, shot_of, cam=cam_av)
         for si, side in enumerate(("left", "right")):
             for b in (side + "UpperLeg", side + "LowerLeg", side + "Foot"):
                 kept[:, bidx[b]] |= planted[:, si]
@@ -2168,7 +2272,7 @@ def context_fill(Q, seen, valid, dirs, skel, fps, shot_of, ramp_s=0.25):
     return Q, filled
 
 
-def planted_legs(Q, root, seen, valid, skel, fps, shot_of, ramp_s=0.2):
+def planted_legs(Q, root, seen, valid, skel, fps, shot_of, ramp_s=0.2, cam=None):
     """A lower leg that is not seen (below the picture, behind something)
     stands on the floor: its foot is put flat on the floor (y = 0) under the
     knee / hip, and the leg reaches it (two-bone IK when the thigh is not seen
@@ -2248,8 +2352,47 @@ def planted_legs(Q, root, seen, valid, skel, fps, shot_of, ramp_s=0.2):
         if not m2.any():
             continue
         w = _ramp_weights(m2, seen[:, ifo], shot_of, nr)
-        _set_world(Q, skel, side + "Foot", Gf, np.where(m2, w, 0.0))
-        planted[:, si] |= m2 & (ank[:, si, 1] - low < 0.05) & (sp[:, si] < 0.6)
+        if cam is not None:
+            # the picture gives the shin's line, not how far it reaches towards
+            # or away from the camera: of the shins along that line, the one
+            # whose foot stands on the floor
+            pos, rot = avatar_fk(skel, Q, root)
+            K, A = pos[:, il], pos[:, ifo]
+            l2 = np.linalg.norm(rp[side + "Foot"] - rp[side + "LowerLeg"])
+            ankle_h = float(rp[side + "Foot"][1])
+            n_ = np.cross(K - cam, A - cam)
+            n_ = normalize(n_)
+            u = normalize(A - K)
+            v = normalize(np.cross(n_, u))
+            R_ = np.hypot(u[:, 1], v[:, 1])
+            phi = np.arctan2(v[:, 1], u[:, 1])
+            rhs = (ankle_h - K[:, 1]) / l2
+            reach = np.abs(rhs) <= R_ - 1e-6
+            d_ = np.arccos(np.clip(rhs / np.maximum(R_, 1e-9), -1, 1))
+            # two solutions phi +- d; the one nearer the seen direction (theta = 0)
+            th1, th2 = phi + d_, phi - d_
+            wrap = lambda x: np.abs(np.arctan2(np.sin(x), np.cos(x)))
+            if PLANT_UNDER_HIPS:
+                # (of the two, the foot nearer to under the hips: how people stand)
+                Hx = pos[:, idx["hips"]][:, [0, 2]]
+                f1 = (K + l2 * (np.cos(th1)[:, None] * u + np.sin(th1)[:, None] * v))[:, [0, 2]]
+                f2 = (K + l2 * (np.cos(th2)[:, None] * u + np.sin(th2)[:, None] * v))[:, [0, 2]]
+                th = np.where(np.linalg.norm(f1 - Hx, axis=1) <= np.linalg.norm(f2 - Hx, axis=1), th1, th2)
+            else:
+                th = np.where(wrap(th1) <= wrap(th2), th1, th2)
+            # (a knee too high for the foot to reach the floor: the leg reaches down as far as it can)
+            th = np.where(reach, th, phi + np.pi)
+            th = np.clip(np.arctan2(np.sin(th), np.cos(th)), -np.radians(75), np.radians(75))
+            P_ = K + l2 * (np.cos(th)[:, None] * u + np.sin(th)[:, None] * v)
+            rest_l = rp[side + "Foot"] - rp[side + "LowerLeg"]
+            Gl = np.einsum("nij,njk->nik", _align_batch(np.einsum("nij,j->ni", rot[:, il], rest_l), P_ - K), rot[:, il])
+            ok = m2 & np.isfinite(P_).all(1) & np.isfinite(cam).all(1)
+            _set_world(Q, skel, side + "LowerLeg", Gl, np.where(ok, w, 0.0))
+            _set_world(Q, skel, side + "Foot", Gf, np.where(m2, w, 0.0))
+            planted[:, si] |= ok & reach
+        else:
+            _set_world(Q, skel, side + "Foot", Gf, np.where(m2, w, 0.0))
+            planted[:, si] |= m2 & (ank[:, si, 1] - low < 0.05) & (sp[:, si] < 0.6)
     return Q, planted
 
 
