@@ -527,6 +527,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                              progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
     P[~valid] = np.nan
     T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
+    mp2d = lm2d  # MediaPipe's own picture positions (it does not clamp joints to the edge)
     lm2d = uv
     # landmarks that are not part of the solve ride along with their parent joint
     shc0, shc = (P0[:, L_SH] + P0[:, R_SH]) / 2, (P[:, L_SH] + P[:, R_SH]) / 2
@@ -695,9 +696,14 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     raw = raw_scores(wb_sync, vis, W, H, N)
     hidden = hidden if hidden is not None else np.zeros((N, 33), bool)
     hidden = hidden | cut_off_joints(uv, P, blen, focal, cx, cy, W, H)
+    # a joint close to the picture edge (feet just above the bottom of the
+    # picture): seen when MediaPipe, which does not clamp joints to the edge,
+    # has it inside the picture and both models are sure
+    mp_in = (mp2d[..., 0] > 2) & (mp2d[..., 0] < W - 2) & (mp2d[..., 1] > 2) & (mp2d[..., 1] < H - 2)
+    edge_ok = mp_in & (vis >= 0.5) & (raw >= 0.6)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
                     weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)),
-                    both=((raw >= 0.45) & (vis >= 0.25)) | trk_ok)
+                    both=((raw >= 0.45) & (vis >= 0.25)) | trk_ok, edge_ok=edge_ok)
     dbg("js", js)
     dbg("raw", raw)
     dbg("uvs", lm2d)
@@ -1355,7 +1361,7 @@ def _min_run(mask, fps, shot_of, min_s=0.15):
     return out
 
 
-def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None, both=None):
+def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None, both=None, edge_ok=None):
     """(N,33) joint clearly inside the picture (not on its edge), detected, and
     not behind something (hidden: see occluded_joints).
     With `weak` (a lower bar), context from both directions: a stretch of weak
@@ -1365,6 +1371,8 @@ def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None, both
     seen clearly a moment later)."""
     m = 0.015 * max(W, H)
     inside = (uv[..., 0] > m) & (uv[..., 0] < W - m) & (uv[..., 1] > m) & (uv[..., 1] < H - m)
+    if edge_ok is not None:
+        inside |= edge_ok & (uv[..., 0] > 0) & (uv[..., 0] < W) & (uv[..., 1] > 0) & (uv[..., 1] < H)
     ok = inside & valid[:, None]
     if hidden is not None:
         ok &= ~hidden

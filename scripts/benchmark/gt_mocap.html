@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+<script type="importmap">{ "imports": {"three": "./vendor/three/three.module.min.js","three/addons/": "./vendor/three/addons/","@pixiv/three-vrm": "./vendor/three-vrm.module.min.js"} }</script>
+</head><body><canvas id="c" width="1920" height="1080"></canvas>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
+const W=1920,H=1080;
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true,preserveDrawingBuffer:true});
+renderer.setPixelRatio(1); renderer.setSize(W,H,false); renderer.outputColorSpace=THREE.SRGBColorSpace;
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x6a7a90);
+scene.add(new THREE.HemisphereLight(0xffffff,0x556677,1.8));
+const dl=new THREE.DirectionalLight(0xffffff,1.4); dl.position.set(1.5,3,2); scene.add(dl);
+let seed=7; const rnd=()=>{seed=(seed*1664525+1013904223)>>>0; return seed/4294967296;};
+function tex(n,base){const c=document.createElement('canvas');c.width=c.height=1024;const g=c.getContext('2d');g.fillStyle=base;g.fillRect(0,0,1024,1024);
+ for(let i=0;i<n;i++){g.fillStyle=`hsl(${rnd()*360|0},${30+rnd()*40|0}%,${25+rnd()*50|0}%)`;const w=20+rnd()*90,h=20+rnd()*90;g.fillRect(rnd()*1024,rnd()*1024,w,h);}
+ const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return t;}
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(16,16),new THREE.MeshBasicMaterial({map:tex(260,'#7b6a58')}));
+floor.rotation.x=-Math.PI/2; scene.add(floor);
+for(const [x,z,ry] of [[0,-6,0],[-8,0,Math.PI/2],[8,0,-Math.PI/2],[0,8,Math.PI]]){
+ const w=new THREE.Mesh(new THREE.PlaneGeometry(16,6),new THREE.MeshBasicMaterial({map:tex(160,'#9aa7b5')}));
+ w.position.set(x,3,z); w.rotation.y=ry; scene.add(w);}
+const cam=new THREE.PerspectiveCamera(35,W/H,0.05,100);
+const loader=new GLTFLoader(); loader.register(p=>new VRMLoaderPlugin(p));
+const gltf=await loader.loadAsync('./avatar.vrm'); const vrm=gltf.userData.vrm;
+VRMUtils.removeUnnecessaryVertices(gltf.scene);
+vrm.scene.traverse(o=>{o.frustumCulled=false;}); scene.add(vrm.scene);
+const A=await (await fetch('./mocap/gt_anim.json')).json();
+const nodes=A.bones.map(b=>vrm.humanoid.getNormalizedBoneNode(b));
+const raw=A.bones.map(b=>vrm.humanoid.getRawBoneNode(b));
+const hipsI=A.bones.indexOf('hips');
+const frames=[]; A.shots.forEach((s,si)=>s.root.forEach((_,k)=>frames.push([si,k])));
+window.nFrames=frames.length;
+let last=-1; const occ=[];
+window.renderFrame=(i)=>{
+ const [si,k]=frames[i]; const s=A.shots[si];
+ for(let b=0;b<nodes.length;b++){const q=s.quats[k][b]; if(nodes[b]) nodes[b].quaternion.set(q[0],q[1],q[2],q[3]);}
+ const r=s.root[k]; nodes[hipsI].position.set(r[0],r[1],r[2]);
+ const newShot=(k===0);
+ vrm.update(newShot?0:1/30); if(newShot) vrm.springBoneManager?.reset?.();
+ const c=s.camera[k];
+ if(newShot){ occ.forEach(o=>scene.remove(o)); occ.length=0;
+   for(const o of s.occluders){ const m=new THREE.Mesh(new THREE.BoxGeometry(...o.size),new THREE.MeshBasicMaterial({map:tex(40,'#405060')}));
+     if(o.pos) m.position.set(...o.pos); m.userData.path=o.path; scene.add(m); occ.push(m);} }
+ occ.forEach(m=>{ if(m.userData.path) m.position.set(...m.userData.path[k]); });
+ cam.position.set(c[0],c[1],c[2]); cam.lookAt(new THREE.Vector3(c[3],c[4],c[5])); cam.fov=c[6]; cam.updateProjectionMatrix(); cam.updateMatrixWorld();
+ renderer.render(scene,cam);
+ const v=new THREE.Vector3(), q=new THREE.Quaternion(); const pos=[],rot=[];
+ for(const n of nodes){ if(!n){pos.push(null);rot.push(null);continue;} n.getWorldPosition(v); pos.push([v.x,v.y,v.z]); n.getWorldQuaternion(q); rot.push([q.x,q.y,q.z,q.w]); }
+ return {shot:si,pos,rot,cam:[cam.position.x,cam.position.y,cam.position.z,cam.quaternion.x,cam.quaternion.y,cam.quaternion.z,cam.quaternion.w,cam.fov]};
+};
+window.ready=true;
+</script></body></html>

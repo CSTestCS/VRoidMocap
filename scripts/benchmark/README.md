@@ -27,3 +27,26 @@ turn, side and back views, fast spins); render it with `gt.html` pointed at
 `eval_gt.py` prints joint position error (cm), limb direction error (degrees,
 only limbs inside the picture), bone orientation error, finger error, camera
 tilt and field-of-view error, per shot.
+
+## Real-motion test
+
+Real dance motion capture (the free CMU library) on the avatar, with shots
+aimed at hard cases: a plain front view, fast spins, a close camera with arms
+and a kick aimed at the lens, a post passing in front of the legs, a side view
+with crossing legs and a low camera at the feet. Fingers get a smooth
+open/close motion of their own.
+
+```
+mkdir mocap
+for f in 005/05_02 005/05_06 055/55_01 060/60_08 094/94_01; do
+  curl -o mocap/$(basename $f).bvh https://raw.githubusercontent.com/una-dinosauria/cmu-mocap/master/data/$f.bvh
+done
+python make_mocap_gt.py                 # -> mocap/gt_anim.json (BVH -> the avatar's bones)
+python -m http.server 8799 &
+node rgt_mocap.js                       # -> mocap/frames/*.jpg, mocap/gt.json
+ffmpeg -framerate 30 -i mocap/frames/f_%05d.jpg -c:v libx264 -crf 16 -pix_fmt yuv420p mocap/bench.mp4
+# run the app on mocap/bench.mp4, then
+python eval_mocap.py <work folder>      # one number per problem: limbs, body angle, spine / head,
+                                        # pointing at the camera, spins, passing object, crossed
+                                        # legs, feet on the floor, hands, flicker
+```

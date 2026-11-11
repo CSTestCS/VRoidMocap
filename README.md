@@ -28,7 +28,8 @@ MMD conversions...).
    * these become VRM bone rotations, including all 15 finger bones per hand,
      wrists, forearm twist and feet. The character is placed in the scene
      where the camera sees it (camera position + what is in the picture), and
-     planted feet are pinned with leg IK so they do not slide.
+     planted feet are pinned with leg IK so they do not slide, and held on
+     the floor frame by frame (not in it, not above it).
 3. **Viewer**. Watch side by side with the video, as *avatar over video*
    (the clip rendered through the solved camera, to check alignment), or with a
    free orbit camera. Scrub, step frame by frame, pick the output frame rate
@@ -47,9 +48,10 @@ MMD conversions...).
   [GitHub Actions build](../../actions/workflows/build-windows.yml) (artifact
   *VRoidMocap-windows*) or from Releases, and double-click it. It needs no
   install. It uses the Edge WebView2 runtime that ships with Windows 10/11.
-  The first motion capture downloads the whole-body model once (370 MB, into
-  `%LOCALAPPDATA%\VRoidMocap\models`). Without internet the app still works,
-  using the MediaPipe body model alone (less precise).
+  The first motion capture downloads two models once, into
+  `%LOCALAPPDATA%\VRoidMocap\models`: the whole-body model (370 MB) and the
+  depth-from-motion model (MotionBERT, 170 MB). Without internet the app still
+  works, using the MediaPipe body model alone (less precise).
 * **From source** (any OS, Python 3.10–3.12):
   ```
   pip install -r requirements.txt
@@ -112,7 +114,14 @@ its far end, pointing towards the camera or away from it. The solve
 3. **Towards or away** is chosen per limb over the whole shot (not frame by
    frame): the choice has to agree with the learned depth bone by bone, keep
    knees and elbows bending the right way, keep the thigh within the hip's
-   range, and not flip between frames.
+   range and the upper arm in front of (not far behind) the chest, and not
+   flip between frames.
+   The learned depth comes from two models: MediaPipe's guess for each single
+   frame, and **depth from the motion** (`lifter.py`, MotionBERT): it reads
+   the 2D body points of 243 frames at once (about 8 seconds, before and after
+   each frame) and is right much more often where one frame is ambiguous, for
+   example an arm reaching towards the camera or a leg crossing behind the
+   other. The two are blended 1:3.
 4. **Refinement**: all joints of all frames are then adjusted together
    (Gauss-Newton) so that they match the picture, keep their bone lengths,
    stay near the learned depth and move smoothly along the line of sight.
@@ -125,7 +134,12 @@ The hardest part of a turn is telling which way the chest and pelvis face,
 and detectors often swap left and right in back views. `facing.py` tracks
 the chest and the pelvis separately, frame by frame, from several clues:
 
-* how wide the shoulders / hips look compared with their real width,
+* how wide the shoulders / hips look compared with their real width (the
+  real width is measured on the frames the depth-from-motion model sees
+  square to the camera, not the widest ever seen, which can be a shoulder
+  point put on a hand in front of it),
+* the facing angle of both learned 3D guesses (the depth-from-motion one
+  counts most; it does not mirror the body the way a single frame can),
 * which side of the picture the character's left is on (with a state for
   "labels swapped", so a detector's left/right mix-up is recognised),
 * the nose sits in front of the neck (which way the head and chest turn),
@@ -151,6 +165,11 @@ behind, the head holds its pose relative to the neck.
 
 The camera is worked out from the background, never from the characters:
 
+* **Screen recordings** (a video playing in a browser or player window): the
+  window around the picture never changes, so the app finds the moving
+  picture and works on that part only (the viewer shows it cropped too).
+  Captions and logos that sit still in one corner do not make the camera
+  look still.
 * Background points are tracked over many frames (people masked out, every
   track checked forwards and backwards).
 * **Turning and zooming** are fitted per frame (rotation + focal length change
@@ -197,7 +216,9 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   picture, detected (the whole-body model sure of it or MediaPipe calling it
   visible) and not behind something (the person mask says the pixel is not
   the person and the pose model agrees). A joint the whole-body model puts on
-  the edge of the picture needs MediaPipe to see it too, and glimpses shorter
+  the edge of the picture needs MediaPipe to see it too (feet just above the
+  bottom of the picture count when MediaPipe has them inside it and both
+  models are sure), and glimpses shorter
   than 0.15 s do not count. A joint also counts when both models are fairly
   sure of it (a leg under a skirt or behind hair), and a weak detection that
   runs into a clear sighting, before or after, counts too.
@@ -219,7 +240,7 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
     moves in between its sightings; the position follows whatever part is
     seen (hips, shoulders, eyes, a knee, a foot, a hand),
   * until a bone is first seen it is in the **A pose** (arms 45 degrees down),
-    and it eases into its first seen pose once it is in the picture.
+    and it takes its pose on the first frame it is seen.
   A visible bone whose parent is not seen keeps the direction it is seen in.
   Frames whose detection contradicts everything around them count as not
   seen.
@@ -310,10 +331,27 @@ side and back views and two fast spins; 1080p):
 On the sample dance video: rotation jitter (99th percentile) 4.9 → 2.7
 °/frame², worst single-frame jump 88° → 59°.
 
+**Real-motion test** (`scripts/benchmark`, dance motion capture from the CMU
+library on the avatar: plain front view, fast spins, a close camera with arms
+and a kick aimed at the lens, a post passing in front of the legs, a side view
+with crossing legs, a low camera at the feet):
+
+| | previous version | now |
+|---|---|---|
+| limbs more than 45° off | 6.3% | 3.2% |
+| body (hips) angle error | 16.5° | 12.4° |
+| chest angle error | 17.9° | 13.5° |
+| arms / leg pointing at the camera | 29.5° | 21.0° |
+| spins: facing more than 90° off | 3.3% | 0% |
+| legs crossing in a side view | 12.7° | 8.7° |
+| legs while a post passes in front | 12.5° | 9.3° |
+| planted feet: in the floor / above it (> 3 cm) | 31% / 12% | 20% / 8% |
+| hands animated (sample dance video) | 59% of frames | 96% |
+
 Honest limits of single-camera capture:
 * **Depth** is inferred, not measured. A limb that points only slightly
   towards or away from the camera can be reconstructed on the wrong side
-  (about 6% of limbs are more than 45° off in the test above).
+  (about 3% of limbs are more than 45° off in the real-motion test).
 * **Hands:** in a full-body shot a hand is about 40 pixels. Decoded over the
   clip, whether the palm or the back faces the camera is right in about 83-93%
   of frames in the tests; forearm twist and hand orientation are still the
