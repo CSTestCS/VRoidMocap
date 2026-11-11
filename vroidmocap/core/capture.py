@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 5
+CAPTURE_VERSION = 6
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -297,6 +297,65 @@ def follow_beyond_tracks(video, boxes, segs, shot_of, cam_R, focal, W, H, fps, w
     return out, extra
 
 
+# body segments tracked as rigid pieces (whole-body model indices): the limb
+# bones, and the torso as a quad
+SEGMENTS = [(5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14, 16), (5, 6, 12, 11)]
+SEG_SCALE = 0.5   # tracking resolution (fraction of full size)
+
+
+def segment_motion(prev_g, g, kp, sc):
+    """Rigid 2D motion (rotation, translation, scale) of each body segment from
+    the previous frame to this one: texture points inside the segment (cloth,
+    skin, stockings) are tracked; points that do not move with the rest
+    (hair, a skirt, the background) are rejected. kp/sc: whole-body keypoints of
+    the previous frame (full-resolution px). Returns (len(SEGMENTS),2,3) motions
+    in full-resolution px and the number of points that agree."""
+    M = np.zeros((len(SEGMENTS), 2, 3), np.float32)
+    M[:, 0, 0] = M[:, 1, 1] = 1.0
+    nin = np.zeros(len(SEGMENTS), np.int16)
+    h, w = g.shape
+    for k, segm in enumerate(SEGMENTS):
+        if sc[list(segm)].min() < 0.3:
+            continue
+        P = kp[list(segm)] * SEG_SCALE
+        if len(segm) == 2:
+            a, b = P
+            d = b - a
+            L = np.linalg.norm(d)
+            if L < 6:
+                continue
+            n_ = np.array([-d[1], d[0]]) / L
+            hw = max(3.0, 0.18 * L)
+            poly = np.array([a + 0.1 * d + n_ * hw, a + 0.9 * d + n_ * hw, a + 0.9 * d - n_ * hw, a + 0.1 * d - n_ * hw])
+        else:
+            c = P.mean(0)
+            poly = c + 0.8 * (P - c)
+        x0, y0 = np.floor(poly.min(0)).astype(int) - 2
+        x1, y1 = np.ceil(poly.max(0)).astype(int) + 2
+        x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, w), min(y1, h)
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            continue
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillConvexPoly(mask, np.round(poly - [x0, y0]).astype(np.int32), 255)
+        pts = cv2.goodFeaturesToTrack(prev_g[y0:y1, x0:x1], 30, 0.01, 3, mask=mask)
+        if pts is None or len(pts) < 6:
+            continue
+        p0 = (pts.reshape(-1, 2) + [x0, y0]).astype(np.float32).reshape(-1, 1, 2)
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, g, p0, None, winSize=(15, 15), maxLevel=2)
+        pb, st2, _ = cv2.calcOpticalFlowPyrLK(g, prev_g, p1, None, winSize=(15, 15), maxLevel=2)
+        good = (st.ravel() == 1) & (st2.ravel() == 1) & (np.linalg.norm((pb - p0).reshape(-1, 2), axis=1) < 0.7)
+        if good.sum() < 6:
+            continue
+        A, inl = cv2.estimateAffinePartial2D(p0[good], p1[good], method=cv2.RANSAC, ransacReprojThreshold=1.0)
+        if A is None or inl is None or inl.sum() < 6:
+            continue
+        A = A.astype(np.float64)
+        A[:, 2] /= SEG_SCALE  # to full-resolution px (rotation/scale unchanged)
+        M[k] = A
+        nin[k] = int(inl.sum())
+    return M, nin
+
+
 def _hand_attempts(lm2d, side):
     wr, el = (L_WR, L_EL) if side == 0 else (R_WR, R_EL)
     tips = [L_INDEX, L_PINKY, L_THUMB] if side == 0 else [R_INDEX, R_PINKY, R_THUMB]
@@ -369,8 +428,17 @@ def process_chunk(args):
     rd = VideoReader(video)
     prev_hand = [None, None]
     size_s = None
+    segM = np.zeros((n, len(SEGMENTS), 2, 3), np.float32)
+    segM[:, :, 0, 0] = segM[:, :, 1, 1] = 1.0
+    segN = np.zeros((n, len(SEGMENTS)), np.int16)
+    prev_g, last_kp = None, None
     for i, (fi, bgr) in enumerate(rd.iter_frames(1, s, e)):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        g = cv2.cvtColor(cv2.resize(bgr, None, fx=SEG_SCALE, fy=SEG_SCALE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        if prev_g is not None and last_kp is not None:
+            # each body segment's own rigid motion since the previous frame
+            segM[i], segN[i] = segment_motion(prev_g, g, *last_kp)
+        prev_g = g
         b = boxes[i]
         cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
         size = max(b[2] - b[0], b[3] - b[1]) * 1.3
@@ -399,13 +467,22 @@ def process_chunk(args):
             wbz[i] = wbody.last_z
             # a box that cuts the body off (camera low or moving, tracker lagging)
             # leaves the model unsure: try larger boxes, keep the surest reading
+            H_, W_ = rgb.shape[:2]
+
+            def in_area(b_):
+                return max(0.0, min(b_[2], W_) - max(b_[0], 0)) * max(0.0, min(b_[3], H_) - max(b_[1], 0))
             if wbs[i, 5:23].mean() < 0.6:
                 c = (bb[:2] + bb[2:]) / 2
                 for k in (1.6, 2.2):
                     hb = (bb[2:] - bb[:2]) * k / 2
+                    # only where a larger box shows more of the picture (the box,
+                    # not the picture edge, cuts the body off)
+                    if in_area(np.r_[c - hb, c + hb]) < 1.3 * in_area(bb):
+                        break
                     kp2, sc2 = wbody.detect(rgb, np.r_[c - hb, c + hb])
                     if sc2[5:23].mean() > wbs[i, 5:23].mean() + 0.05:
                         wb2d[i], wbs[i], wbz[i] = kp2, sc2, wbody.last_z
+            last_kp = (wb2d[i].astype(np.float64), wbs[i].astype(np.float64))
         if not ok:
             prev_hand = [None, None]
             continue
@@ -445,7 +522,7 @@ def process_chunk(args):
     if pose_img is not None:
         pose_img.close()
     np.savez_compressed(out_path + ".tmp.npz", lm2d=lm2d, vis=vis, world=world, cropc=cropc,
-                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs, wbz=wbz, seg=seg)
+                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs, wbz=wbz, seg=seg, segM=segM, segN=segN)
     os.replace(out_path + ".tmp.npz", out_path)
     return out_path
 
@@ -508,6 +585,8 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         "hs": np.zeros((N, 2), np.float32), "hc": np.zeros((N, 2, 2), np.float32),
         "wb2d": np.zeros((N, 133, 2), np.float32), "wbs": np.zeros((N, 133), np.float32),
         "seg": np.full((N, 33), -1.0, np.float32), "wbz": np.zeros((N, 133), np.float16),
+        "segM": np.tile(np.array([[1, 0, 0], [0, 1, 0]], np.float32), (N, len(SEGMENTS), 1, 1)),
+        "segN": np.zeros((N, len(SEGMENTS)), np.int16),
     }
     for j in jobs:
         d = np.load(j[5])

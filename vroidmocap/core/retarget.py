@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 11
+SOLVE_VERSION = 12
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -466,6 +466,13 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("psi", np.stack([psi_c, psi_p], 1))
     dbg("swap", swap)
     # ---- 2. body in 3D: bone lengths + picture positions + learned depth, solved over time
+    # rigid segments: each limb's texture moves as one piece; carry clearly
+    # detected joints along it into frames where the detectors are unsure
+    trk_ok = np.zeros((N, 33), bool)
+    if "segM" in capture and wb_sync is not None and os.environ.get("VM_RIGID", "1") == "1":
+        uv, trk_ok = rigid_track(uv, raw_scores(wb_sync, vis, W, H, N), capture["wb2d"], capture["wbs"],
+                                 capture["segM"].astype(np.float64), capture["segN"], valid, fps)
+    dbg("trk_ok", trk_ok)
     body_conf = conf.copy()
     P0 = np.full((N, 33, 3), np.nan)
     P0[valid] = Wc[valid] + T[valid][:, None]
@@ -628,7 +635,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     hidden = hidden | cut_off_joints(uv, P, blen, focal, cx, cy, W, H)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
                     weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)),
-                    both=(raw >= 0.45) & (vis >= 0.25))
+                    both=((raw >= 0.45) & (vis >= 0.25)) | trk_ok)
     dbg("js", js)
     dbg("raw", raw)
     dbg("uvs", lm2d)
@@ -1315,6 +1322,110 @@ def raw_scores(wb_sync, vis, W, H, N):
 
 LIMB_PAIRS = [(L_HIP, L_KNEE), (L_KNEE, L_ANK), (R_HIP, R_KNEE), (R_KNEE, R_ANK),
               (L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR)]
+
+
+# segments of capture.SEGMENTS as MediaPipe joints (limbs: proximal, distal)
+SEG_MP = [(L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR), (L_HIP, L_KNEE), (L_KNEE, L_ANK),
+          (R_HIP, R_KNEE), (R_KNEE, R_ANK), (L_SH, R_SH, R_HIP, L_HIP)]
+_WB_OF_MP = {L_SH: 5, R_SH: 6, L_EL: 7, R_EL: 8, L_WR: 9, R_WR: 10, L_HIP: 11, R_HIP: 12,
+             L_KNEE: 13, R_KNEE: 14, L_ANK: 15, R_ANK: 16}
+
+
+def rigid_track(uv, raw, wb2d, wbs, segM, segN, valid, fps, anchor=0.65, half_life_s=0.4,
+                min_pts=6, agree=0.2):
+    """Body segments as rigid pieces. Capture tracked texture points along every
+    limb and the torso, frame to frame, and kept the points that move together
+    (segM: each segment's rotation + translation + scale). Here every joint
+    that is clearly detected (score >= anchor) is carried along the motion of
+    a segment it belongs to, forwards and backwards in time, into the frames
+    around it where the detectors are unsure; the carried position counts less
+    the further it is from the clear sighting (half-life). Where a weak
+    detection agrees with the carried position (within `agree` of the
+    segment's length) the joint is placed between the two and counts as seen.
+    Returns uv and (N,33) the joints confirmed this way.
+    Segments are matched to the limbs by position, not by left/right label (the
+    detectors' labels can swap from frame to frame)."""
+    N = len(uv)
+    uv = uv.copy()
+    ok_out = np.zeros((N, 33), bool)
+    K = len(SEG_MP)
+    # which captured segment moves each limb from frame t-1 to t
+    seg_of = -np.ones((N, K), int)
+    wbp = {j: wb2d[:, w] for j, w in _WB_OF_MP.items()}
+    for t in range(1, N):
+        if not (valid[t] and valid[t - 1]):
+            continue
+        for k, js_ in enumerate(SEG_MP):
+            if len(js_) != 2:
+                if segN[t, 8] >= min_pts:
+                    seg_of[t, k] = 8
+                continue
+            a, b = js_
+            L = np.linalg.norm(uv[t - 1, b] - uv[t - 1, a]) + 1e-6
+            best, bd = -1, 0.35
+            for c, (ca, cb) in enumerate(SEG_MP[:8]):
+                if segN[t, c] < min_pts:
+                    continue
+                pa, pb = wbp[ca][t - 1], wbp[cb][t - 1]
+                d = min(np.linalg.norm(uv[t - 1, a] - pa) + np.linalg.norm(uv[t - 1, b] - pb),
+                        np.linalg.norm(uv[t - 1, a] - pb) + np.linalg.norm(uv[t - 1, b] - pa)) / L
+                if d < bd:
+                    best, bd = c, d
+            seg_of[t, k] = best
+    joints = sorted({j for js_ in SEG_MP for j in js_})
+    decay = 0.5 ** (1.0 / max(half_life_s * fps, 1.0))
+
+    def carry(direction):
+        est = np.full((N, 33, 2), np.nan)
+        rel = np.zeros((N, 33))
+        order = range(N) if direction > 0 else range(N - 1, -1, -1)
+        for j in joints:
+            ks = [k for k, js_ in enumerate(SEG_MP) if j in js_]
+            cur, r = None, 0.0
+            prev_t = None
+            for t in order:
+                if not valid[t]:
+                    cur, r = None, 0.0
+                    prev_t = t
+                    continue
+                if raw[t, j] >= anchor:
+                    cur, r = uv[t, j].copy(), 1.0
+                elif cur is not None and prev_t is not None:
+                    tm = t if direction > 0 else prev_t   # the step between t and prev_t
+                    cand = [k for k in ks if seg_of[tm, k] >= 0]
+                    if cand:
+                        k = max(cand, key=lambda k_: segN[tm, seg_of[tm, k_]])
+                        A = segM[tm, seg_of[tm, k]]
+                        if direction > 0:
+                            cur = A[:, :2] @ cur + A[:, 2]
+                        else:  # inverse motion
+                            cur = np.linalg.solve(A[:, :2], cur - A[:, 2])
+                        r *= decay
+                    else:
+                        cur, r = None, 0.0
+                if cur is not None:
+                    est[t, j], rel[t, j] = cur, r
+                prev_t = t
+        return est, rel
+    Ef, rf = carry(1)
+    Eb, rb = carry(-1)
+    w = rf + rb
+    E = (np.nan_to_num(Ef) * rf[..., None] + np.nan_to_num(Eb) * rb[..., None]) / np.maximum(w, 1e-9)[..., None]
+    rel = np.maximum(rf, rb)
+    # segment length (for "agrees")
+    seg_len = np.zeros((N, 33))
+    for js_ in SEG_MP[:8]:
+        a, b = js_
+        L = np.linalg.norm(uv[:, b] - uv[:, a], axis=1)
+        for j in js_:
+            seg_len[:, j] = np.maximum(seg_len[:, j], L)
+    weak = (raw < anchor) & (raw >= 0.25) & (rel >= 0.35) & valid[:, None]
+    dist = np.linalg.norm(E - uv, axis=-1)
+    good = weak & (dist < agree * np.maximum(seg_len, 1.0))
+    wgt = (rel * (1 - raw))[..., None]
+    uv = np.where(good[..., None], uv * (1 - wgt) + E * wgt, uv)
+    ok_out[good] = True
+    return uv, ok_out
 
 
 def cut_off_joints(uv, P, blen, focal, cx, cy, W, H, edge_frac=0.15, short=0.7):
