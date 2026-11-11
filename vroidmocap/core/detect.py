@@ -19,10 +19,11 @@ MODEL_FILES = {
     "hand": "hand_landmarker.task",
     "embed": "mobilenet_v3_large.tflite",
     "wholebody": "rtmw3d-x_384x288.onnx",
+    "lifter": "motionbert_3d_243.onnx",
 }
 # large models that are not packed into the exe: fetched once on first use
-DOWNLOAD_ON_USE = {"wholebody"}
-MODEL_SIZES = {"wholebody": 369330857}
+DOWNLOAD_ON_USE = {"wholebody", "lifter"}
+MODEL_SIZES = {"wholebody": 369330857, "lifter": 170049517}
 MODEL_MIRRORS = {
     "wholebody": ["https://huggingface.co/bukuroo/RTMW3D-ONNX/resolve/main/rtmw3d-x-384.onnx"],
 }
@@ -32,6 +33,7 @@ MODEL_URLS = {
     "hand": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
     "embed": "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_large/float32/latest/mobilenet_v3_large.tflite",
     "wholebody": "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx",
+    "lifter": "https://huggingface.co/bukuroo/MotionBERT-3d-ONNX/resolve/main/motionbert_3d_243.onnx",
 }
 
 

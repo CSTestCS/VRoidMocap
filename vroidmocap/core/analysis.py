@@ -28,7 +28,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 8
+ANALYSIS_VERSION = 9
 
 
 class Cancelled(Exception):
@@ -274,7 +274,7 @@ class Analyzer:
         self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
         embedder = Embedder()
 
-        scan_path = os.path.join(self.workdir, "scan_v3.pkl")
+        scan_path = os.path.join(self.workdir, "scan_v4.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:

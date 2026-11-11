@@ -53,6 +53,7 @@ SIG_Z = 0.08
 W_KNEE = 60.0
 W_FOOT = 20.0
 FOOT_CHOICE = True
+W_SHOULDER = 40.0  # upper arm far behind the chest
 W_ELBOW = 10.0
 SIG_D = 0.02    # how well a bone's apparent length is known (detection error)
 SIG_BZ = 0.05   # learned depth difference along one bone
@@ -121,6 +122,14 @@ def _facing(X):
     a = X[:, JI[L_HIP]] - X[:, JI[R_HIP]]
     up = (X[:, JI[L_SH]] + X[:, JI[R_SH]]) / 2 - (X[:, JI[L_HIP]] + X[:, JI[R_HIP]]) / 2
     return normalize(np.cross(a, up)), normalize(up)
+
+
+def _chest_facing(X):
+    """Unit vector the chest faces (cv camera frame), (n,3), from the shoulder
+    line and the spine."""
+    a = X[:, JI[L_SH]] - X[:, JI[R_SH]]
+    up = (X[:, JI[L_SH]] + X[:, JI[R_SH]]) / 2 - (X[:, JI[L_HIP]] + X[:, JI[R_HIP]]) / 2
+    return normalize(np.cross(a, up))
 
 
 _GRID = np.linspace(0.0, 1.1, 34)
@@ -210,6 +219,10 @@ def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps):
     else:
         # an elbow does not bend backwards
         unary = unary + W_ELBOW * np.maximum(-fwd - 0.3, 0.0) ** 2
+        # and an upper arm reaches at most ~35 deg behind the chest (an arm
+        # pointing at the camera is in front of the body, not straight behind it)
+        Fc = _chest_facing(X)
+        unary = unary + W_SHOULDER * np.maximum(-np.sum(d1 * Fc[:, None], -1) - 0.55, 0.0) ** 2
     k = (fps / 30.0 / 0.35) ** 2
 
     def pair(f):
@@ -355,7 +368,7 @@ def apply_torso_facing(zrel, wz, P0, torso):
         wz[ok, ia] = wz[ok, ib] = TORSO_WZ * 2
 
 
-def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None):
+def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None, z_extra_w=0.5):
     """P0: (N,33,3) rough camera-space landmarks (learned depth, metric root
     distance). uv: (N,33,2) picture positions. conf: (N,33) 0..1.
     z_extra: optional (N,33) second depth opinion relative to the hip centre
@@ -378,7 +391,7 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
     if z_extra is not None:
         ze = z_extra[:, idx]
         has = np.isfinite(ze)
-        zrel = np.where(has, 0.5 * (zrel + np.nan_to_num(ze)), zrel)
+        zrel = np.where(has, (1 - z_extra_w) * zrel + z_extra_w * np.nan_to_num(ze), zrel)
     for s, e in segments:
         if e - s >= 3:
             zrel[s:e] = gaussian_smooth(zrel[s:e], 1.5 * fps / 30.0)

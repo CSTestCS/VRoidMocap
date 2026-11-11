@@ -59,6 +59,16 @@ def polar(M):
     return U @ np.diag([1, 1, d]) @ Vt
 
 
+def spread_out(p, cx, cy, min_area=0.12):
+    """Still points that say the camera is still must be spread over the
+    picture. Captions, a logo or a watermark sit still in one small corner
+    while the camera moves; they say nothing about the camera."""
+    if len(p) < 8:
+        return False
+    lo, hi = np.percentile(p, 5, axis=0), np.percentile(p, 95, axis=0)
+    return float(np.prod(np.maximum(hi - lo, 0))) >= min_area * (2 * cx) * (2 * cy)
+
+
 def _rz_project(p1, R, f1, f2, cx, cy):
     v = np.c_[(p1 - [cx, cy]) / f1, np.ones(len(p1))] @ R.T
     return v[:, :2] / np.maximum(v[:, 2:3], 1e-9) * f2 + [cx, cy]
@@ -75,7 +85,8 @@ def rotation_zoom(p1, p2, f1, cx, cy, allow_zoom=True, zlim=(0.8, 1.25)):
     # a still camera: the background does not move. Things in the scene may
     # (balloons, hair, other people), but when a large share of the scenery is
     # perfectly still, the camera is.
-    if np.median(disp) < STILL_PX or np.mean(disp < STILL_FRAC_PX) > STILL_FRAC:
+    if (np.median(disp) < STILL_PX or np.mean(disp < STILL_FRAC_PX) > STILL_FRAC) and \
+            spread_out(p1[disp < STILL_FRAC_PX], cx, cy):
         return np.eye(3), 1.0, float(np.median(disp)), disp < 3.0
     Hm, inl = cv2.findHomography(p1, p2, cv2.RANSAC, 2.0)
     if Hm is None or inl is None or inl.sum() < 8:
@@ -156,7 +167,8 @@ def parallax_profile(obs, Rref, focal, cx, cy, win=8):
         pa, pb = _common(obs[k - win], obs[k])
         if len(pa) < 12:
             continue
-        if np.mean(np.linalg.norm(pb - pa, axis=1) < 2 * STILL_FRAC_PX) > STILL_FRAC:
+        st = np.linalg.norm(pb - pa, axis=1) < 2 * STILL_FRAC_PX
+        if np.mean(st) > STILL_FRAC and spread_out(pa[st], cx, cy):
             continue  # much of the scenery has not moved at all: a still camera
         R = Rref[k].T @ Rref[k - win]  # v_k ~ R v_{k-win}
         e = np.linalg.norm(_rz_project(pa, R, focal[k - win], focal[k], cx, cy) - pb, axis=1)

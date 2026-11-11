@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 
+import logging
 import numpy as np
 
 from . import camera as cam
@@ -38,7 +39,10 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 16
+log = logging.getLogger(__name__)
+SOLVE_VERSION = 17
+HAND_FROM_WB = True  # whole-body hand points where the hand model misses
+LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -436,10 +440,23 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # which way the torso faces, frame by frame (this also settles which body
     # side is which: detectors often swap left and right in back views)
     wb2d, wbs = capture.get("wb2d"), capture.get("wbs")
+    wbz = capture["wbz"].astype(np.float64).copy() if "wbz" in capture else None
     uv, conf, wb_sync = body_keypoints(lm2d, vis, wb2d, wbs, valid, None, W, H, return_wb=True)
     face_score = face_visibility(wbs, N)
+    # depth from the motion over time (before and after each frame): a second
+    # opinion on which way the body faces and each limb points
+    Ylift = None
+    if LIFT_W > 0 and wb_sync is not None:
+        try:
+            from . import lifter
+            progress(0.03, "Reading depth from the motion")
+            Ylift = lifter.cached_lift(workdir, capture, runs(valid, shot_of), W, H, fps)
+        except Exception:
+            log.exception("depth from motion failed")
+            Ylift = None
+    W_lift = lifter.as_mediapipe(Ylift) if Ylift is not None else None
     psi_c, psi_p, swap, bad = facing.track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid,
-                                                  shot_spans(valid, shot_of), fps)
+                                                  shot_spans(valid, shot_of), fps, W2=W_lift)
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
@@ -450,7 +467,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         arr[swap] = arr[swap][:, ::-1]
     if wb_sync is not None:
         from .detect import WB_SWAP
-        for arr in wb_sync:
+        for arr in wb_sync + ((wbz,) if wbz is not None else ()):
             arr[swap] = arr[swap][:, WB_SWAP]
     hvalid = (hs >= 0.5) & valid[:, None]
     # the pose model's 3D guess: where it reads the body the wrong way round
@@ -496,7 +513,17 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     P0 = np.full((N, 33, 3), np.nan)
     P0[valid] = Wc[valid] + T[valid][:, None]
     segs = runs(valid, shot_of)
+    # depth from the motion over time (before and after each frame): a second
+    # opinion on which way each limb points, towards or away from the camera
+    z_extra = None
+    if Ylift is not None:
+        if True:
+            from . import lifter
+            z_extra = lifter.depth_opinion(Ylift, np.nan_to_num(T[:, 2], nan=3.0), focal, W, H, N)
+            z_extra[swap] = z_extra[swap][:, LR_PERM]
+            z_extra[~valid] = np.nan
     P, blen = lift.fuse_body(np.nan_to_num(P0), uv, conf, focal, cx, cy, segs, fps, torso=(psi_c, psi_p, r3, view),
+                             z_extra=z_extra, z_extra_w=LIFT_W,
                              progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
     P[~valid] = np.nan
     T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
@@ -530,6 +557,22 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     head_w = np.einsum("nij,njk->nik", R_w, Rface)
     dbg("face_q", face_q)
 
+    # hands the hand model missed (small, blurred, half hidden): the whole-body
+    # model also places the 21 hand points, with a depth for each; use them
+    if HAND_FROM_WB and wb_sync is not None and wbz is not None:
+        for side, wi in ((0, L_WR), (1, R_WR)):
+            o = 91 if side == 0 else 112
+            kp, sc = wb_sync[0][:, o:o + 21].astype(np.float64), wb_sync[1][:, o:o + 21]
+            zz = wbz[:, o:o + 21].astype(np.float64)
+            ok = valid & ~hvalid[:, side] & (np.median(sc, 1) >= 0.5) & np.isfinite(P[:, wi, 2])
+            for f in np.where(ok)[0]:
+                Z = max(float(P[f, wi, 2]), 0.1)
+                d = kp[f] - kp[f, 0]
+                h2d[f, side] = kp[f]
+                hw[f, side] = np.c_[d / focal[f] * Z, zz[f] - zz[f, 0]]
+                hc[f, side] = (cx, cy)
+                hs[f, side] = 0.5
+                hvalid[f, side] = True
     # which way round each hand is (palm or back towards the camera), decided
     # over the whole clip from both hand detectors, with continuity
     for side in (0, 1):
@@ -718,6 +761,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
     lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of)
     root[:, 1] += lift_y
+    # and frame by frame: a planted foot is on the floor, not in it or above it
+    root[:, 1] += floor_follow(skel, Q, root, contacts, fps, shot_of)
     if foot_lock:  # pins planted feet (two-bone IK) - only legs that are seen
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
@@ -1265,6 +1310,27 @@ def settle_on_floor(skel, Q, root, contacts, fps, shot_of):
     return shift
 
 
+def floor_follow(skel, Q, root, contacts, fps, shot_of, sigma_s=0.08, max_m=0.2):
+    """Per frame vertical correction of the character (not the camera) that
+    puts the lowest planted foot exactly on the floor; between contacts (a
+    step, a jump) it moves smoothly from one to the next."""
+    low, _ = _foot_lows(skel, Q, root)
+    N = len(root)
+    out = np.zeros(N)
+    want = np.where(contacts, -low, np.inf).min(1)
+    for (a, b) in runs(np.ones(N, bool), shot_of):
+        w = want[a:b]
+        ok = np.isfinite(w)
+        if ok.sum() < 2:
+            continue
+        t = np.arange(b - a)
+        c = np.interp(t, t[ok], w[ok])
+        if b - a >= 3:
+            c = gaussian_smooth(c[:, None], sigma_s * fps)[:, 0]
+        out[a:b] = np.clip(c, -max_m, max_m)
+    return out
+
+
 BONE_LANDMARKS = {
     "hips": [L_HIP, R_HIP, L_SH, R_SH], "spine": [L_HIP, R_HIP, L_SH, R_SH], "chest": [L_HIP, R_HIP, L_SH, R_SH],
     "upperChest": [L_HIP, R_HIP, L_SH, R_SH], "neck": [NOSE, L_EAR, R_EAR, L_SH, R_SH], "head": [NOSE, L_EAR, R_EAR],
@@ -1744,10 +1810,10 @@ def world_smoothed(Q, skel, sigma):
     return out
 
 
-def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2, Q_world=None):
+def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.0, Q_world=None):
     """Per bone: keyframes only where the bone is seen; in-between motion
     where it is not (see keyframe_fill). Until a bone is first seen it is in
-    the neutral (A) pose, and it eases from there into its first seen pose.
+    the neutral (A) pose; it takes its first seen pose as soon as it is seen.
     With skel, a seen bone under a parent that is not seen keeps the direction
     it was observed in (its rotation relative to the output parent is
     recomputed)."""

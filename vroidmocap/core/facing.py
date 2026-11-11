@@ -43,6 +43,11 @@ W_FACE = 2.5
 W_KNEE = 3.0
 W_TOE = 1.5
 W_LEARN = 4.0
+W2_SHARE = 0.65    # share of the motion-over-time guess in the learned cue
+LP2_FLIP = 1.2     # its front/back mistake reading
+LP2_MIRROR = 1.5   # its depth-mirror mistake reading
+SPIN_SLOPE = 1.0   # cost slope of turning faster than 2 x SIG_V per frame
+SPIN_MAX = 5.0     # fastest turn (x SIG_V per frame) a spin reaches
 SWAP_PRIOR = 0.15   # per frame cost of reading the labels swapped
 SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
@@ -98,8 +103,12 @@ def _viterbi(unary, trans, swap_cost=None):
 def _trans_psi(fps):
     sv = SIG_V * 30.0 / fps
     d = np.abs(_DIFF) / sv
-    # quadratic for normal turning, linear beyond (fast spins stay possible)
-    return np.where(d < 2.0, d ** 2, 4.0 * d - 4.0) * 0.5
+    # quadratic for normal turning, gently linear beyond: a fast spin (two
+    # turns a second) must stay cheaper than reading the labels swapped
+    # (up to SPIN_MAX x SIG_V per frame, ~1000 deg/s); a jump faster than any
+    # spin is not a turn at all
+    c = np.where(d < 2.0, d ** 2, 2.0 + SPIN_SLOPE * (np.minimum(d, SPIN_MAX) - 2.0))
+    return (c + 4.0 * np.maximum(d - SPIN_MAX, 0.0)) * 0.5
 
 
 def _refine(unary_row, k):
@@ -125,7 +134,7 @@ def _true_width(w, ok, fallback):
     return float(np.percentile(w[ok], 95))
 
 
-def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None):
+def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
@@ -155,8 +164,24 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     # the detectors' shoulder / hip points need not be as far apart as the
     # pose model's: the real width is the widest they ever appear
     ls, lh = lat_of(L_SH, R_SH), lat_of(L_HIP, R_HIP)
-    S_w = _true_width(np.abs(ls), valid & (c_sh > 0.5), S_w)
-    H_w = _true_width(np.abs(lh), valid & (c_hp > 0.5), H_w)
+    lp_c, lp_p = learned_psi(Wc, view, lat2)
+    # a second guess read from the motion over time (W2): steadier, and right
+    # more often; where it is there, it counts for most of the learned cue
+    lp2_c = lp2_p = None
+    if W2 is not None:
+        lp2_c, lp2_p = learned_psi(np.nan_to_num(W2), view, lat2)
+        has2 = np.isfinite(W2[:, [L_SH, R_SH, L_HIP, R_HIP]]).all((1, 2))
+        lp2_c = np.where(has2, lp2_c, np.nan)
+        lp2_p = np.where(has2, lp2_p, np.nan)
+    # where the motion-over-time guess says the body is square to the camera,
+    # the widths seen then are the true widths (the widest ever seen can be a
+    # mis-detection: a shoulder point put on a hand in front of it)
+    sq_c = sq_p = np.zeros(N, bool)
+    if lp2_c is not None:
+        sq_c = valid & (np.abs(np.cos(np.nan_to_num(lp2_c, nan=np.pi / 2))) > 0.94) & (c_sh > 0.5)
+        sq_p = valid & (np.abs(np.cos(np.nan_to_num(lp2_p, nan=np.pi / 2))) > 0.94) & (c_hp > 0.5)
+    S_w = float(np.median(np.abs(ls[sq_c]))) if sq_c.sum() >= 20 else _true_width(np.abs(ls), valid & (c_sh > 0.5), S_w)
+    H_w = float(np.median(np.abs(lh[sq_p]))) if sq_p.sum() >= 20 else _true_width(np.abs(lh), valid & (c_hp > 0.5), H_w)
     w_sh = np.clip(ls / S_w, -1.4, 1.4)
     w_hp = np.clip(lh / H_w, -1.4, 1.4)
     # nose: sideways offset from the shoulder centre, relative to how far the
@@ -165,7 +190,6 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     nose_n = np.clip(np.sum((uv[:, NOSE] - shc) * lat2, 1) * s_px / (0.3 * S_w), -1.6, 1.6)
     fs = np.nan_to_num(face_score, nan=0.5)
     c_nose = np.clip(conf[:, NOSE], 0, 1) * np.clip((fs - 0.2) / 0.4, 0, 1)
-    lp_c, lp_p = learned_psi(Wc, view, lat2)
     # knees / toes: forward clues independent of the left/right labels
     fwd_c = np.zeros((N, K))
     for hip, kn, an in ((L_HIP, L_KNEE, L_ANK), (R_HIP, R_KNEE, R_ANK)):
@@ -187,7 +211,16 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     def width_cost(wm, c, sgn):
         return np.minimum(((wm[:, None] - sgn * COS[None]) / SIG_W) ** 2, 9.0) * c[:, None]
 
-    def learned_cost(lp, swapped=False):
+    def learned_cost2(lp, lp2, swapped=False):
+        c1 = learned_cost(lp, swapped)
+        if lp2 is None:
+            return c1
+        # the motion-over-time guess hardly ever mirrors the depth: its
+        # "mistake" readings cost more
+        c2 = learned_cost(np.nan_to_num(lp2), swapped, pen=(LP2_FLIP, LP2_MIRROR))
+        return np.where(np.isfinite(lp2)[:, None], (1 - W2_SHARE) * c1 + W2_SHARE * c2, c1)
+
+    def learned_cost(lp, swapped=False, pen=(0.15, 0.4)):
         # the model's guess, or the mistake it makes in back views: it reads
         # the body as facing the camera (front and back, left and right both
         # flipped: psi -> pi - psi), or, less often, only mirrors the depth
@@ -198,7 +231,7 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         d0 = 1 - np.cos(PSI[None] - lp[:, None])
         d1 = 1 - np.cos(PSI[None] - (np.pi - lp[:, None]))
         d2 = 1 - np.cos(PSI[None] + lp[:, None])
-        return W_LEARN * np.minimum(np.minimum(d0, d1 + 0.15), d2 + 0.4)
+        return W_LEARN * np.minimum(np.minimum(d0, d1 + pen[0]), d2 + pen[1])
 
     # face seen: front half; clearly not seen: back half
     face_c = W_FACE * (np.clip((fs - 0.45) / 0.25, 0, 1)[:, None] * np.maximum(0, -COS[None] - 0.25) +
@@ -221,8 +254,10 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         sl = slice(s, e)
         obs = valid[sl].astype(float)[:, None]  # frames without a detection carry no evidence
         base = face_c[sl] + nose_c[sl]
-        u0 = (base + learned_cost(lp_c[sl]) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
-        u1 = (base + learned_cost(lp_c[sl], True) + width_cost(w_sh[sl], c_sh[sl], -1.0) + SWAP_PRIOR) * obs
+        l2c = lp2_c[sl] if lp2_c is not None else None
+        l2p = lp2_p[sl] if lp2_p is not None else None
+        u0 = (base + learned_cost2(lp_c[sl], l2c) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
+        u1 = (base + learned_cost2(lp_c[sl], l2c, True) + width_cost(w_sh[sl], c_sh[sl], -1.0) + SWAP_PRIOR) * obs
         U = np.concatenate([u0, u1], 1)
         st = _viterbi(U, TR)
         sw = st >= K
@@ -239,7 +274,7 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         sgn = np.where(sw, -1.0, 1.0)
         twist = 0.5 * (_wrap(PSI[None] - pc[:, None]) / SIG_TWIST) ** 2
         up_ = (np.minimum(((w_hp[sl, None] - sgn[:, None] * COS[None]) / SIG_W) ** 2, 9.0) * c_hp[sl, None] +
-               fwd_c[sl] + np.where(sw[:, None], learned_cost(lp_p[sl], True), learned_cost(lp_p[sl]))) * obs + twist
+               fwd_c[sl] + np.where(sw[:, None], learned_cost2(lp_p[sl], l2p, True), learned_cost2(lp_p[sl], l2p))) * obs + twist
         kp = _viterbi(up_, tp)
         pp = np.array([_refine(up_[i], kp[i]) for i in range(e - s)])
         # continuous: light zero-phase smoothing
@@ -250,7 +285,7 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         psi_p[sl] = np.where(v, pps, np.nan)
         swap[sl] = sw & v
     if debug is not None:
-        debug.update(dict(w_sh=w_sh, w_hp=w_hp, nose_n=nose_n, c_nose=c_nose, fs=fs, lp_c=lp_c, lp_p=lp_p))
+        debug.update(dict(w_sh=w_sh, w_hp=w_hp, nose_n=nose_n, c_nose=c_nose, fs=fs, lp_c=lp_c, lp_p=lp_p, lp2_c=lp2_c))
     return psi_c, psi_p, swap, bad
 
 

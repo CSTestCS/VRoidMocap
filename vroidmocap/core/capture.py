@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 8
+CAPTURE_VERSION = 9
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
