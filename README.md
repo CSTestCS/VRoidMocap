@@ -107,8 +107,13 @@ known length seen at a given size leaves exactly two possible positions for
 its far end, pointing towards the camera or away from it. The solve
 (`vroidmocap/core/lift.py`) is built on that:
 
-1. **Bone lengths** are measured from the video itself, from the frames in
-   which a bone lies parallel to the picture (where it appears at full length).
+1. **Bone lengths: the proportions pass.** Before any pose is worked out,
+   every bone's length is measured over the whole video (left and right
+   equal), from the frames in which a bone lies parallel to the picture (where
+   it appears at full length). The animation knows the character's
+   proportions from its first frame; the bone trackers use them to tell how
+   long a limb can look in the picture. They are saved in the project folder
+   (`proportions_c<N>.json`) and shown under the viewer.
 2. **Distance of the character** per frame follows from how large the bones
    appear, smoothed over time.
 3. **Towards or away** is chosen per limb over the whole shot (not frame by
@@ -226,6 +231,30 @@ degrees and 17 cm, lens within 1 degree where the camera turns or travels.
   moment at the edge of the picture) that never shares the picture with a
   character seen longer, and looks like them, is part of that character.
   Anything left that is seen for less than half a second is not listed.
+* **Hidden limbs are still there.** A limb that is not seen is placed from
+  the context, not left out:
+  * a hidden **thigh** points where the depth-from-motion model reads it from
+    the motion around it (about 4 s each way; when the thigh has not been
+    seen for more than 3 s, a reading over about 8 s each way, beyond 7 s one
+    over about 20 s each way),
+  * a hidden **lower leg** (below the picture, behind something) stands on the
+    floor: the foot is put flat on the floor under the knee and the leg
+    reaches it; with no foot in view in a whole shot, the hips are at standing
+    height, so the feet are on the floor,
+  * hidden **arms** move in between their sightings (measured: better than any
+    guess for them).
+* **Hands that touch.** Palms pressed together (over the head, a clap) or a
+  palm on the head are found on the person (picture and depth agreeing) and
+  kept on the avatar: its arm is moved (IK, hand orientation kept) so its own
+  palms meet, or its palm sits on its own head. (Hands on the hips are not
+  detected: a hand hanging beside the hip looks the same.)
+* **No limbs inside each other.** The avatar's body is measured from its own
+  mesh (a capsule around each limb bone, slices across the torso, a ball for
+  the head). Forearms and hands that would pass through the body, the head,
+  the thighs or each other, and knees, shins and feet that would pass through
+  each other, are swung out at the shoulder / elbow / hip / knee until they
+  just touch, smoothly over time. (Contacts the person makes are left
+  touching.)
 * **Keyframes only where seen.** A bone gets keyframes only while it is seen.
   Where it is not (out of the picture, behind something, cut off by a zoom or
   a cut), it gets no keyframes: the motion in between is a smooth curve from
@@ -347,6 +376,18 @@ with crossing legs, a low camera at the feet):
 | legs while a post passes in front | 12.5° | 9.3° |
 | planted feet: in the floor / above it (> 3 cm) | 31% / 12% | 20% / 8% |
 | hands animated (sample dance video) | 59% of frames | 96% |
+
+**Hidden limbs, contacts, clipping** (second real-motion test: a waist-up
+close shot with the legs below the picture, the legs behind a box, palms
+clapped over the head / hands on the hips / a hand on the head):
+
+| | before | now |
+|---|---|---|
+| feet below the picture: height error / above the floor | 3.5 cm / 29% | 1.3 cm / 0% |
+| feet behind the box: height error / in the floor | 9.5 cm / 72% | 2.2 cm / 32% |
+| hidden lower legs (waist-up shot) | 41° | 30° |
+| clapped palms: distance (truth 5 cm) | 13.7 cm | 7.9 cm |
+| frames with limbs more than 1 cm inside each other | 50% | 14% |
 
 Honest limits of single-camera capture:
 * **Depth** is inferred, not measured. A limb that points only slightly
