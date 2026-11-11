@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 6
+CAPTURE_VERSION = 7
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -356,6 +356,41 @@ def segment_motion(prev_g, g, kp, sc):
     return M, nin
 
 
+MARKER_FRAC = (0.25, 0.5, 0.75)  # trackers riding each limb bone, as fractions of its length
+
+
+def update_markers(mk, prev_g, g, kp=None, sc=None, min_score=0.6, snap=0.12):
+    """Trackers that ride the limb bones (not joints: points on the bone line at
+    fixed fractions of its length). Whenever both of a limb's joints are clearly
+    detected the trackers are put (back) on the line; otherwise each one follows
+    the picture from the previous frame (forward-backward checked) and is
+    dropped when it cannot be followed. mk: (8, len(MARKER_FRAC), 2) full-res px,
+    nan = lost. Returns the updated markers."""
+    mk = mk.copy()
+    have = np.isfinite(mk[..., 0])
+    if prev_g is not None and have.any():
+        p0 = (mk[have] * SEG_SCALE).astype(np.float32).reshape(-1, 1, 2)
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, g, p0, None, winSize=(15, 15), maxLevel=2)
+        pb, st2, _ = cv2.calcOpticalFlowPyrLK(g, prev_g, p1, None, winSize=(15, 15), maxLevel=2)
+        h, w = g.shape
+        q = p1.reshape(-1, 2)
+        ok = (st.ravel() == 1) & (st2.ravel() == 1) & (np.linalg.norm((pb - p0).reshape(-1, 2), axis=1) < 0.7) & \
+             (q[:, 0] >= 0) & (q[:, 0] < w) & (q[:, 1] >= 0) & (q[:, 1] < h)
+        new = np.where(ok[:, None], q / SEG_SCALE, np.nan)
+        mk[have] = new
+    if kp is not None:
+        for k, (a, b) in enumerate(SEGMENTS[:8]):
+            if sc[a] < min_score or sc[b] < min_score:
+                continue
+            A, B = kp[a], kp[b]
+            L = np.linalg.norm(B - A)
+            if L < 4:
+                continue
+            for m, f in enumerate(MARKER_FRAC):
+                mk[k, m] = A + f * (B - A)  # the line is known: the trackers sit on it
+    return mk
+
+
 def _hand_attempts(lm2d, side):
     wr, el = (L_WR, L_EL) if side == 0 else (R_WR, R_EL)
     tips = [L_INDEX, L_PINKY, L_THUMB] if side == 0 else [R_INDEX, R_PINKY, R_THUMB]
@@ -432,13 +467,15 @@ def process_chunk(args):
     segM[:, :, 0, 0] = segM[:, :, 1, 1] = 1.0
     segN = np.zeros((n, len(SEGMENTS)), np.int16)
     prev_g, last_kp = None, None
+    markers = np.full((n, 8, len(MARKER_FRAC), 2), np.nan, np.float32)
+    mk = np.full((8, len(MARKER_FRAC), 2), np.nan)
     for i, (fi, bgr) in enumerate(rd.iter_frames(1, s, e)):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         g = cv2.cvtColor(cv2.resize(bgr, None, fx=SEG_SCALE, fy=SEG_SCALE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
         if prev_g is not None and last_kp is not None:
             # each body segment's own rigid motion since the previous frame
             segM[i], segN[i] = segment_motion(prev_g, g, *last_kp)
-        prev_g = g
+        mk = update_markers(mk, prev_g, g)  # trackers on the bones follow the picture
         b = boxes[i]
         cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
         size = max(b[2] - b[0], b[3] - b[1]) * 1.3
@@ -483,6 +520,9 @@ def process_chunk(args):
                     if sc2[5:23].mean() > wbs[i, 5:23].mean() + 0.05:
                         wb2d[i], wbs[i], wbz[i] = kp2, sc2, wbody.last_z
             last_kp = (wb2d[i].astype(np.float64), wbs[i].astype(np.float64))
+            mk = update_markers(mk, None, g, *last_kp)  # ...and sit on the line wherever it is clear
+        markers[i] = mk
+        prev_g = g
         if not ok:
             prev_hand = [None, None]
             continue
@@ -522,7 +562,7 @@ def process_chunk(args):
     if pose_img is not None:
         pose_img.close()
     np.savez_compressed(out_path + ".tmp.npz", lm2d=lm2d, vis=vis, world=world, cropc=cropc,
-                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs, wbz=wbz, seg=seg, segM=segM, segN=segN)
+                        h2d=h2d, hw=hw, hs=hs, hc=hc, wb2d=wb2d, wbs=wbs, wbz=wbz, seg=seg, segM=segM, segN=segN, markers=markers)
     os.replace(out_path + ".tmp.npz", out_path)
     return out_path
 
@@ -587,6 +627,7 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
         "seg": np.full((N, 33), -1.0, np.float32), "wbz": np.zeros((N, 133), np.float16),
         "segM": np.tile(np.array([[1, 0, 0], [0, 1, 0]], np.float32), (N, len(SEGMENTS), 1, 1)),
         "segN": np.zeros((N, len(SEGMENTS)), np.int16),
+        "markers": np.full((N, 8, len(MARKER_FRAC), 2), np.nan, np.float32),
     }
     for j in jobs:
         d = np.load(j[5])

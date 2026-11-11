@@ -705,5 +705,22 @@ class SeenRules(unittest.TestCase):
         self.assertFalse(out[1, L_KNEE])
 
 
+class BoneTrackers(unittest.TestCase):
+    def test_hidden_knee_from_hip_and_thigh_tracker(self):
+        from vroidmocap.core.detect import L_HIP, L_KNEE
+        from vroidmocap.core.retarget import infer_from_markers
+        N = 1
+        uv = np.zeros((N, 33, 2))
+        conf = np.zeros((N, 33))
+        strong = np.zeros((N, 33), bool)
+        uv[0, L_HIP] = [500, 300]
+        strong[0, L_HIP] = True               # hip seen, knee hidden
+        markers = np.full((N, 8, 3, 2), np.nan)
+        markers[0, 4, 0] = [510, 350]         # only the first tracker (25%) of the left thigh is visible
+        uv2, conf2, inf = infer_from_markers(uv, conf, strong, markers, (0.25, 0.5, 0.75), np.ones(N, bool), 1920, 1080)
+        self.assertTrue(inf[0, L_KNEE])
+        self.assertTrue(np.allclose(uv2[0, L_KNEE], [540, 500]))  # the line, carried to full length
+
+
 if __name__ == "__main__":
     unittest.main()

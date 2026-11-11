@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 12
+SOLVE_VERSION = 13
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -473,6 +473,16 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         uv, trk_ok = rigid_track(uv, raw_scores(wb_sync, vis, W, H, N), capture["wb2d"], capture["wbs"],
                                  capture["segM"].astype(np.float64), capture["segN"], valid, fps)
     dbg("trk_ok", trk_ok)
+    # trackers riding the limb bones: a limb partly in view (a knee hidden, 40%
+    # of the thigh visible) still shows its line; its hidden end is put where
+    # the line reaches at the bone's length
+    inferred = np.zeros((N, 33), bool)
+    if "markers" in capture:
+        from .capture import MARKER_FRAC
+        strong = ((raw_scores(wb_sync, vis, W, H, N) >= 0.6) | (vis >= 0.5)) if wb_sync is not None else (vis >= 0.5)
+        uv, conf, inferred = infer_from_markers(uv, conf, strong, capture["markers"].astype(np.float64),
+                                                MARKER_FRAC, valid, W, H, capture["wb2d"].astype(np.float64))
+    dbg("inferred", inferred)
     body_conf = conf.copy()
     P0 = np.full((N, 33, 3), np.nan)
     P0[valid] = Wc[valid] + T[valid][:, None]
@@ -644,7 +654,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("bad", bad)
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
     raw_plain = raw_scores(wb_sync, np.ones_like(vis), W, H, N)  # (no edge rule)
-    near_out = just_outside(lm2d, raw_plain, W, H) & (valid & ~bad)[:, None]
+    near_out = (just_outside(lm2d, raw_plain, W, H) | inferred) & (valid & ~bad)[:, None]
     seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of, near_out)
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
     conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
@@ -1329,6 +1339,69 @@ SEG_MP = [(L_SH, L_EL), (L_EL, L_WR), (R_SH, R_EL), (R_EL, R_WR), (L_HIP, L_KNEE
           (R_HIP, R_KNEE), (R_KNEE, R_ANK), (L_SH, R_SH, R_HIP, L_HIP)]
 _WB_OF_MP = {L_SH: 5, R_SH: 6, L_EL: 7, R_EL: 8, L_WR: 9, R_WR: 10, L_HIP: 11, R_HIP: 12,
              L_KNEE: 13, R_KNEE: 14, L_ANK: 15, R_ANK: 16}
+
+
+def infer_from_markers(uv, conf, strong, markers, fracs, valid, W, H, wb2d=None, min_px=8.0):
+    """The hidden end of a limb from one clearly seen end and the trackers that
+    ride the limb's line (at known fractions of its length): the line through
+    the seen end and the furthest visible tracker, carried on to the full
+    length (tracker at fraction f of the way -> the end is at 1/f of that
+    distance). Trackers are matched to the limb by position (left/right labels
+    can swap). Returns uv, conf and the (N,33) joints placed this way."""
+    N = len(uv)
+    uv, conf = uv.copy(), conf.copy()
+    out = np.zeros((N, 33), bool)
+    fr = np.asarray(fracs, float)
+    mirror = [2, 3, 0, 1, 6, 7, 4, 5]
+    inside = (markers[..., 0] >= 0) & (markers[..., 0] < W) & (markers[..., 1] >= 0) & (markers[..., 1] < H)
+    for k, (a, b) in enumerate(SEG_MP[:8]):
+        for t in np.where(valid & (strong[:, a] ^ strong[:, b]))[0]:
+            s_end, h_end = (a, b) if strong[t, a] else (b, a)
+            S = uv[t, s_end]
+            best = None
+            cands = (k, mirror[k])
+            if wb2d is not None:  # the tracker set whose limb has its joint at the seen end
+                from .capture import SEGMENTS
+                pos = 0 if s_end == a else 1
+                cands = sorted(cands, key=lambda c: np.linalg.norm(wb2d[t, SEGMENTS[c][pos]] - S))[:1]
+            for c in cands:
+                ok = inside[t, c] & np.isfinite(markers[t, c, :, 0])
+                if not ok.any():
+                    continue
+                mk = markers[t, c]
+                # the tracker line must run through (near) the seen end
+                idx = np.where(ok)[0]
+                f_far = fr[idx]
+                if s_end == a:
+                    m = idx[np.argmax(f_far)]
+                    d = mk[m] - S
+                    if np.linalg.norm(d) < min_px:
+                        continue
+                    est = S + d / fr[m]
+                else:
+                    m = idx[np.argmin(f_far)]
+                    d = mk[m] - S
+                    if np.linalg.norm(d) < min_px:
+                        continue
+                    est = S + d / (1 - fr[m])
+                # consistency: other visible trackers lie on that line
+                line = est - S
+                Ln = np.linalg.norm(line)
+                off = 0.0
+                if len(idx) > 1:
+                    u_ = line / Ln
+                    rel = mk[idx] - S
+                    off = float(np.abs(rel[:, 0] * u_[1] - rel[:, 1] * u_[0]).max()) / Ln
+                if off > 0.15:
+                    continue
+                if best is None or off < best[0]:
+                    best = (off, est)
+            if best is None:
+                continue
+            uv[t, h_end] = best[1]
+            conf[t, h_end] = max(conf[t, h_end], 0.6)
+            out[t, h_end] = True
+    return uv, conf, out
 
 
 def rigid_track(uv, raw, wb2d, wbs, segM, segN, valid, fps, anchor=0.65, half_life_s=0.4,
