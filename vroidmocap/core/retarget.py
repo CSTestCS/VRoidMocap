@@ -38,7 +38,7 @@ from .vrm import FINGER_SEGS, FINGERS
 
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
-SOLVE_VERSION = 10
+SOLVE_VERSION = 11
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
 # listed parent-first so each child is solved after its parent.
@@ -613,6 +613,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
 
     dbg("Pcam", P)
     dbg("Q_raw", Q)
+    Q_raw = Q.copy()
     # ---- 5. temporal: per-bone confidence -> hold unseen bones, reject spikes, smooth
     progress(0.55, "Filtering (hold unseen bones, remove spikes, smooth)")
     # seen / not seen per bone. A bone is animated only while all the joints
@@ -635,7 +636,9 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("valid", valid)
     dbg("bad", bad)
     face_seen = (face_q > 0.15) if np.any(face_q > 0) else None
-    seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of)
+    raw_plain = raw_scores(wb_sync, np.ones_like(vis), W, H, N)  # (no edge rule)
+    near_out = just_outside(lm2d, raw_plain, W, H) & (valid & ~bad)[:, None]
+    seen = bone_seen(skel, js, hvalid & ~bad[:, None], face_seen, fps, shot_of, near_out)
     feet_seen = np.stack([js[:, L_ANK] & js[:, L_HEEL] & js[:, L_FOOT], js[:, R_ANK] & js[:, R_HEEL] & js[:, R_FOOT]], 1)
     conf = bone_confidence(skel, np.maximum(body_conf, np.clip(vis, 0, 1)), hs, valid, hvalid)
     if face_seen is not None and skel.has("head"):
@@ -676,12 +679,15 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # ---- 7. limits, IK, hold unseen bones, then the avatar's root from what is seen
     progress(0.8, "Joint limits and limb IK")
     root0 = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
+    # directions as observed, smoothed in the world (for seen bones under a
+    # parent that is not seen: limits relative to that parent must not bend them)
+    Q_obs = world_smoothed(Q_raw, skel, 1.5 * fps / 30.0)
     Q = nat.apply(Q, root0, fps, conf)
     dbg("Q_nat", Q)
     # keyframes only where a bone is seen: in between, smooth in-between motion
     # from its last seen pose to its next; before a bone is first seen it is in
     # the A pose
-    Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
+    Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel, Q_world=Q_obs)
     root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
     lift_y = settle_on_floor(skel, Q, root, contacts, fps, shot_of)
@@ -689,7 +695,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if foot_lock:  # pins planted feet (two-bone IK) - only legs that are seen
         Q = foot_lock_ik(skel, Q, root, contacts, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
-        Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel)
+        Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel, Q_world=Q_obs)
     dbg("Q_final", Q)
 
     # ---- 8. the cloned camera: where the real camera is in the scene (it never
@@ -1353,9 +1359,31 @@ def occluded_joints(seg, vis):
     return (seg >= 0) & (seg < 0.25) & (vis < 0.6)
 
 
-def bone_seen(skel, js, hvalid, face_seen, fps, shot_of):
+LIMB_BONES = {}
+for _s, _S in (("left", "L"), ("right", "R")):
+    _l = (lambda a, b: a if _S == "L" else b)
+    LIMB_BONES.update({f"{_s}UpperLeg": (_l(L_HIP, R_HIP), _l(L_KNEE, R_KNEE)),
+                       f"{_s}LowerLeg": (_l(L_KNEE, R_KNEE), _l(L_ANK, R_ANK)),
+                       f"{_s}UpperArm": (_l(L_SH, R_SH), _l(L_EL, R_EL)),
+                       f"{_s}LowerArm": (_l(L_EL, R_EL), _l(L_WR, R_WR))})
+
+
+def just_outside(uv, raw, W, H, reach=0.25, min_score=0.5):
+    """(N,33) joints just outside the picture that the whole-body model still
+    places confidently (a limb entering the picture from that side)."""
+    x, y = uv[..., 0], uv[..., 1]
+    out = (x < 0) | (x > W) | (y < 0) | (y > H)
+    near = (x > -reach * W) & (x < W * (1 + reach)) & (y > -reach * H) & (y < H * (1 + reach))
+    return out & near & (raw >= min_score)
+
+
+def bone_seen(skel, js, hvalid, face_seen, fps, shot_of, near_out=None):
     """(N,B): every joint defining the bone is seen. Bones the solver never
-    drives (shoulders, eyes, jaw...) count as seen (they stay as they are)."""
+    drives (shoulders, eyes, jaw...) count as seen (they stay as they are).
+    With near_out: a limb with one end seen and the other just outside the
+    picture (a thigh coming in from the top edge down to a visible knee, a
+    shin running out of the bottom) counts as seen: the part in the picture
+    shows which way it points."""
     N = len(js)
     out = np.ones((N, len(skel.bones)), bool)
     head = face_seen if face_seen is not None else js[:, NOSE] & (js[:, L_EAR] | js[:, R_EAR])
@@ -1370,6 +1398,9 @@ def bone_seen(skel, js, hvalid, face_seen, fps, shot_of):
             m = js[:, L_SH] & js[:, R_SH] & head
         elif b in BONE_LANDMARKS:
             m = js[:, BONE_LANDMARKS[b]].all(1)
+            if near_out is not None and b in LIMB_BONES:
+                a_, d_ = LIMB_BONES[b]
+                m = m | (js[:, d_] & near_out[:, a_]) | (js[:, a_] & near_out[:, d_])
         else:
             continue
         out[:, i] = _min_run(m, fps, shot_of)
@@ -1461,7 +1492,30 @@ def keyframe_fill(target, sb, fps, neutral, nb):
     return col
 
 
-def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
+def world_smoothed(Q, skel, sigma):
+    """Local rotations whose world (global) rotations are those of Q, lightly
+    smoothed over time in the world (not relative to the parent: a parent that
+    was not seen must not bend its children)."""
+    N, B = Q.shape[:2]
+    R = quat_to_mat(normalize(Q).reshape(-1, 4)).reshape(N, B, 3, 3)
+    idx = {b: i for i, b in enumerate(skel.bones)}
+    G = np.zeros_like(R)
+    for i, b in enumerate(skel.bones):
+        p = skel.parent[b]
+        G[:, i] = R[:, i] if p is None else G[:, idx[p]] @ R[:, i]
+    Gs = np.zeros_like(G)
+    for i in range(B):
+        q = quat_continuity(mat_to_quat(G[:, i]))
+        Gs[:, i] = quat_to_mat(normalize(gaussian_smooth(q, sigma)))
+    out = np.zeros_like(Q)
+    for i, b in enumerate(skel.bones):
+        p = skel.parent[b]
+        Lm = Gs[:, i] if p is None else np.einsum("nji,njk->nik", Gs[:, idx[p]], Gs[:, i])
+        out[:, i] = mat_to_quat(Lm)
+    return out
+
+
+def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2, Q_world=None):
     """Per bone: keyframes only where the bone is seen; in-between motion
     where it is not (see keyframe_fill). Until a bone is first seen it is in
     the neutral (A) pose, and it eases from there into its first seen pose.
@@ -1473,7 +1527,10 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
     out = Q.copy()
     nb = max(1, int(round(blend_s * fps)))
     if skel is not None:
-        R = quat_to_mat(Q.reshape(-1, 4)).reshape(N, B, 3, 3)
+        # directions as observed: from Q_world (the solve before joint limits,
+        # which may have bent a bone against a parent that was not seen) if given
+        Qw = normalize(Q_world) if Q_world is not None else Q
+        R = quat_to_mat(Qw.reshape(-1, 4)).reshape(N, B, 3, 3)
         G_sol = np.zeros_like(R)
         G_out = np.zeros_like(R)
         idx = {x: i for i, x in enumerate(skel.bones)}
@@ -1492,8 +1549,10 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.2):
                 pi = idx[p]
                 G_sol[:, b] = G_sol[:, pi] @ R[:, b]
                 if driven[b]:
-                    # observed direction in the world, relative to the parent as it is output
-                    target = mat_to_quat(np.einsum("nji,njk->nik", G_out[:, pi], G_sol[:, b]))
+                    # under a parent that is not seen: the observed direction in the
+                    # world, relative to the parent as it is output
+                    obs = mat_to_quat(np.einsum("nji,njk->nik", G_out[:, pi], G_sol[:, b]))
+                    target = np.where(seen[:, pi:pi + 1], Q[:, b], obs) if Q_world is not None else obs
         sb = seen[:, b]
         if not sb.any():
             col = np.tile(neutral[b], (N, 1))
