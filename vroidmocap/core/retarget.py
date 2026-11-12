@@ -48,6 +48,9 @@ NO_CLIPPING = True    # limbs do not pass through the body / each other
 # hidden bones placed from the motion around them (measured: helps the thighs;
 # hidden arms do better with in-between motion; hidden shins stand on the floor)
 CONTEXT_BONES = ("leftUpperLeg", "rightUpperLeg")
+RAISED_THIGH_CONF = 0.7  # a thigh read raised (more than 60 deg from straight down) needs a knee seen at least this surely
+RAISED_THIGH_Y = -0.5
+CONTEXT_THIGH_MAX_UP = 0.0  # hidden thighs from the motion around them: not above level
 CONTEXT_LIMBS = True  # hidden arms / thighs from the motion around them
 PLANT_UNDER_HIPS = True
 HAND_STEADY_SCALE = True  # hand size steady over time (a turned hand looks narrower)
@@ -59,7 +62,12 @@ PLANT_UNSEEN = True   # hidden lower legs stand on the floor
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
 SEGMENT_BONES = True  # a limb bone is known from one joint + one tracker on it (or two trackers)
-BRIDGE_ANY = False  # frames without a MediaPipe reading are kept when the whole-body model sees the person
+WB_CALIBRATE = True  # scale up the body scores of a character the whole-body model is unsure of
+WB_SCORE_REF = 0.78  # its median body score on real people and usual 3D avatars
+WB_SCORE_MAX_GAIN = 1.5
+WB_SCORE_FLOOR = 0.35  # scores below this are guesses: not boosted
+WB_EDGE_FRAC = 0.05
+BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
@@ -414,6 +422,65 @@ def avatar_fk(skel, Q, root):
     return pos, rot
 
 
+def slipped_frames(P, S, min_score=0.2, min_torso=1.0):
+    """Frames where the whole-body reading has slipped along the body (shoulders
+    read on the face, hips on the chest, knees on the hands: a failure on some
+    drawn styles): the face's down (eyebrows -> chin) and the torso's (shoulders
+    -> hips) disagree, or the torso is shorter than one face. (A back view, where
+    the face points are the guess, can be flagged too: used only to withhold
+    the score boost.)"""
+    chin, top = P[:, 31], P[:, 50]
+    d = chin - top
+    L = np.linalg.norm(d, axis=1)
+    u = d / np.maximum(L, 1e-6)[:, None]
+    sh = (P[:, 5] + P[:, 6]) / 2
+    hp = (P[:, 11] + P[:, 12]) / 2
+    th = np.einsum("ni,ni->n", hp - sh, u) / np.maximum(L, 1e-6)
+    use = (S[:, [31, 50]].min(1) > min_score) & (S[:, [5, 6, 11, 12]].min(1) > min_score) & (L > 4)
+    return use & (th < min_torso)
+
+
+def calibrate_scores(capture, W=None, H=None):
+    """The whole-body model is less sure of itself on some drawn styles: on a
+    character whose body joints score well below what it gives real people and
+    usual 3D avatars, every body score is scaled up (by at most WB_SCORE_MAX_GAIN), so the
+    fixed thresholds keep the readings that are right. The order of the scores,
+    and so which joints and frames are the surest, is unchanged."""
+    if not WB_CALIBRATE or capture.get("wbs") is None:
+        return capture
+    wbs = np.asarray(capture["wbs"], np.float64)
+    t = np.asarray(capture.get("tracked", np.ones(len(wbs), bool)), bool)
+    body = wbs[t][:, 5:23]
+    body = body[body.max(1) > 0] if len(body) else body
+    if len(body) < 10:
+        return capture
+    med = float(np.median(body))
+    gain = float(np.clip(WB_SCORE_REF / max(med, 1e-3), 1.0, WB_SCORE_MAX_GAIN))
+    if gain <= 1.05:
+        return capture
+    out = dict(capture)
+    w2 = wbs.copy()
+    sub = w2[:, 5:23]
+    # not boosted: the unsure guesses, and the joints along the picture's edge
+    # (where the model piles the joints it cannot see)
+    p = np.asarray(capture["wb2d"], np.float64)[:, 5:23]
+    if W is not None:
+        m = WB_EDGE_FRAC * max(W, H)
+        edge = (p[..., 0] < m) | (p[..., 0] > W - m) | (p[..., 1] < m) | (p[..., 1] > H - m)
+    else:
+        edge = np.zeros(sub.shape, bool)
+    boost = (sub >= WB_SCORE_FLOOR) & ~edge
+    slip = slipped_frames(np.asarray(capture["wb2d"], np.float64), wbs)
+    boost &= ~slip[:, None]
+    sub[boost] = np.minimum(sub[boost] * gain, 0.99)
+    # on a character the model is this unsure of, a reading that slipped along
+    # the body is wrong throughout: its body joints are not used
+    sub[slip] = np.minimum(sub[slip], WB_SCORE_FLOOR * 0.5)
+    w2[:, 5:23] = sub
+    out["wbs"] = w2.astype(np.asarray(capture["wbs"]).dtype)
+    return out
+
+
 # ----------------------------------------------------------------------------- main
 def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True, debug=None):
     dbg = (lambda k, v: debug.__setitem__(k, np.array(v, copy=True))) if debug is not None else (lambda k, v: None)
@@ -429,6 +496,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for i, s in enumerate(shots):
         s["align"] = npz["shot_align"][i]
 
+    capture = calibrate_scores(capture, W, H)
     lm2d = capture["lm2d"].astype(np.float64)
     vis = capture["vis"].astype(np.float64)
     world = capture["world"].astype(np.float64)
@@ -917,6 +985,17 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # directions as observed, smoothed in the world (for seen bones under a
     # parent that is not seen: limits relative to that parent must not bend them)
     Q_obs = world_smoothed(Q_raw, skel, 1.5 * fps / 30.0)
+    if RAISED_THIGH_CONF is not None:
+        # a thigh read raised (forward or sideways, > 60 deg) from a knee the models are not sure of
+        # is a misreading (knees guessed at the hips, or on the hands): not seen
+        _, rot_o = avatar_fk(skel, Q_obs, np.zeros((N, 3)))
+        knee_c = np.maximum(raw, np.clip(vis, 0, 1))
+        for side, kn in (("left", L_KNEE), ("right", R_KNEE)):
+            iu, il = bidx[side + "UpperLeg"], bidx[side + "LowerLeg"]
+            dn = np.einsum("nij,j->ni", rot_o[:, iu], skel.rest_pos[side + "LowerLeg"] - skel.rest_pos[side + "UpperLeg"])
+            raised = (dn[:, 1] / np.maximum(np.linalg.norm(dn, axis=1), 1e-9) > RAISED_THIGH_Y) & (knee_c[:, kn] < RAISED_THIGH_CONF)
+            seen[raised, iu] = False
+            seen[raised, il] = False
     Q = nat.apply(Q, root0, fps, conf)
     dbg("Q_nat", Q)
     # keyframes only where a bone is seen: in between, smooth in-between motion
@@ -955,7 +1034,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if foot_lock:  # pins planted feet (two-bone IK) - only legs that are seen
         Q = foot_lock_ik(skel, Q, root, contacts & ~planted, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
-        Q = hold_unseen(Q, kept, fps, neutral_pose(skel), skel, Q_world=Q_obs)
+        Q = hold_unseen(Q, kept, fps, neutral_pose(skel), skel, Q_world=Q_obs, observed=seen)
     # ---- 7b. hands that touch the body touch it on the avatar too, and no
     # limb passes through another part of the body (they just touch)
     from . import body_shape, contacts as touch
@@ -2249,6 +2328,12 @@ def context_directions(Ylift, swap, R_w, seen, valid, skel, fps, shot_of, get_li
             if e - a >= 3:
                 w[a:e] = gaussian_smooth(w[a:e], 0.08 * fps)
         dirs[b] = np.where(np.isfinite(w).all(1, keepdims=True), normalize(np.nan_to_num(w)), np.nan)
+        if b.endswith("UpperLeg") and CONTEXT_THIGH_MAX_UP is not None:
+            # a thigh that is not seen raised above level is the reading of joints
+            # the model guessed (piled at the picture's edge), not a kick: kept
+            # where it was
+            up = dirs[b][:, 1] > CONTEXT_THIGH_MAX_UP
+            dirs[b][up] = np.nan
     return dirs
 
 
@@ -2427,7 +2512,7 @@ def world_smoothed(Q, skel, sigma):
     return out
 
 
-def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.0, Q_world=None):
+def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.0, Q_world=None, observed=None):
     """Per bone: keyframes only where the bone is seen; in-between motion
     where it is not (see keyframe_fill). Until a bone is first seen it is in
     the neutral (A) pose; it takes its first seen pose as soon as it is seen.
@@ -2465,6 +2550,10 @@ def hold_unseen(Q, seen, fps, neutral, skel=None, blend_s=0.0, Q_world=None):
                     # world, relative to the parent as it is output
                     obs = mat_to_quat(np.einsum("nji,njk->nik", G_out[:, pi], G_sol[:, b]))
                     target = np.where(seen[:, pi:pi + 1], Q[:, b], obs) if Q_world is not None else obs
+                    if observed is not None:
+                        # (only a bone that was itself seen: one placed from the
+                        # motion around it, or planted, keeps its placed pose)
+                        target = np.where(observed[:, b:b + 1], target, Q[:, b])
         sb = seen[:, b]
         if not sb.any():
             col = np.tile(neutral[b], (N, 1))

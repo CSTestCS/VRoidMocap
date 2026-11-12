@@ -113,7 +113,11 @@ def cached_lift(workdir, capture, spans, W, H, fps, step_mult=1):
     if not path or "wb2d" not in capture:
         return None
     sfx = "" if step_mult == 1 else f"_x{step_mult}"
-    key = f"lift_{int(np.asarray(capture.get('version', 0)))}_{len(capture['wb2d'])}{sfx}.npy"
+    import zlib
+    # (the input: which frames are lifted, and the scores the joints are weighed by)
+    h = zlib.crc32(np.asarray(spans, np.int64).tobytes())
+    h = zlib.crc32(np.ascontiguousarray(np.asarray(capture["wbs"], np.float32)).tobytes(), h)
+    key = f"lift_{int(np.asarray(capture.get('version', 0)))}_{len(capture['wb2d'])}_{h:08x}{sfx}.npy"
     cp = os.path.join(workdir, key)
     if os.path.exists(cp):
         try:
