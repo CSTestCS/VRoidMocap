@@ -24,11 +24,13 @@ import numpy as np
 from . import camera as cam
 from . import scene
 from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_HEEL, R_HIP,
-                     R_SH, Embedder, PoseDetector, box_iou, crop_square, landmark_box)
+                     R_SH, Embedder, PoseDetector, PoseResult, box_iou, crop_square, landmark_box)
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 9
+ANALYSIS_VERSION = 10
+PARALLEL_SHOTS = True
+USE_PERSON_DETECTOR = True  # person boxes from the Human-Art detector (else the pose model's own)
 
 
 class Cancelled(Exception):
@@ -47,6 +49,7 @@ class Track:
         self.embs, self.hists = [], []
         self.misses = 0
         self.vel = np.zeros(4)
+        self.det_n = 0  # frames where the person detector gave the box
 
     def add(self, fi, box, pr, cc):
         if self.boxes:
@@ -102,14 +105,23 @@ CORE = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 
 def is_human_track(t):
     """Reject tracks on objects (balloons, posters...): the pose model's
-    landmarks on non-people are low-confidence and jump around wildly."""
+    landmarks on non-people are low-confidence and jump around wildly.
+    A track the person detector found most of the time is a person (the pose
+    model can be unsure on stylised characters)."""
+    if getattr(t, "det_n", 0) >= 0.5 * len(t.frames):
+        return True
     V = np.array(t.vis, np.float64)[:, CORE]
     L = np.array(t.lm2d, np.float64)[:, CORE]
     bx = np.array(t.boxes, np.float64)
-    bh = np.maximum(bx[:, 3] - bx[:, 1], 1.0)
+    bh = np.maximum(np.maximum(bx[:, 3] - bx[:, 1], bx[:, 2] - bx[:, 0]), 1.0)
     jit = 0.0
     if len(L) > 2:
-        jit = np.median(np.linalg.norm(np.diff(L, axis=0), axis=2).mean(1) / bh[1:])
+        # only joints seen in both frames (a close-up's joints outside the
+        # picture are guesses that jump around; the person is still a person)
+        both = (V[1:] > 0.6) & (V[:-1] > 0.6)
+        d = np.linalg.norm(np.diff(L, axis=0), axis=2) / bh[1:, None]
+        per = [np.median(d[k][both[k]]) for k in range(len(d)) if both[k].sum() >= 3]
+        jit = float(np.median(per)) if per else 0.0
     # a person seen from above / from behind / partly out of frame has lower
     # landmark confidence but still moves coherently: only reject when the
     # landmarks are both unsure and unstable
@@ -120,19 +132,26 @@ def is_human_track(t):
     return True
 
 
-def part_histograms(rgb, lm2d, vis):
-    """Colour histograms of hair/head, torso and legs (hue-saturation)."""
+def part_histograms(rgb, lm2d, vis, box=None):
+    """Colour histograms of hair/head, torso and legs (hue-saturation). With
+    unsure landmarks and a person box: the box's top, middle and bottom."""
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     h, w = rgb.shape[:2]
-    sh = np.linalg.norm(lm2d[L_SH] - lm2d[R_SH])
-    unit = max(sh, 6.0)
     regions = []
-    nose = lm2d[NOSE]
-    regions.append((nose[0] - unit * 0.9, nose[1] - unit * 1.1, nose[0] + unit * 0.9, nose[1] + unit * 0.4))
-    torso = np.array([lm2d[L_SH], lm2d[R_SH], lm2d[L_HIP], lm2d[R_HIP]])
-    regions.append((*torso.min(0), *torso.max(0)))
-    legs = np.array([lm2d[L_HIP], lm2d[R_HIP], lm2d[L_ANK], lm2d[R_ANK]])
-    regions.append((*legs.min(0), *legs.max(0)))
+    if box is not None and float(np.mean(vis[[NOSE, L_SH, R_SH, L_HIP, R_HIP]])) < 0.5:
+        x0, y0, x1, y1 = box
+        bh = y1 - y0
+        for a, b in ((0.0, 0.2), (0.2, 0.55), (0.55, 1.0)):
+            regions.append((x0, y0 + a * bh, x1, y0 + b * bh))
+    else:
+        sh = np.linalg.norm(lm2d[L_SH] - lm2d[R_SH])
+        unit = max(sh, 6.0)
+        nose = lm2d[NOSE]
+        regions.append((nose[0] - unit * 0.9, nose[1] - unit * 1.1, nose[0] + unit * 0.9, nose[1] + unit * 0.4))
+        torso = np.array([lm2d[L_SH], lm2d[R_SH], lm2d[L_HIP], lm2d[R_HIP]])
+        regions.append((*torso.min(0), *torso.max(0)))
+        legs = np.array([lm2d[L_HIP], lm2d[R_HIP], lm2d[L_ANK], lm2d[R_ANK]])
+        regions.append((*legs.min(0), *legs.max(0)))
     out = []
     for (x0, y0, x1, y1) in regions:
         x0, y0 = int(np.clip(x0, 0, w - 1)), int(np.clip(y0, 0, h - 1))
@@ -251,17 +270,55 @@ class Analyzer:
         for b, pr in found:
             if all(box_iou(b, k[0]) < 0.4 for k in keep):
                 keep.append((b, pr))
+        # a "person" inside a much larger one is a part of it (frills, a sleeve,
+        # a hand: the pose model finds small people in them)
+        area = lambda b: max(b[2] - b[0], 1.0) * max(b[3] - b[1], 1.0)
+        keep = [(b, pr) for b, pr in keep
+                if not any(area(o) > 3.0 * area(b) and contains(o, b, 0.8) for o, _ in keep)]
         return keep
 
-    def _refine(self, rgb, box):
-        """Run single-person pose on a square crop around `box`."""
+    def _refine_box(self, rgb, box):
+        """Pose inside a person box from the detector (the box stays the
+        detector's; a pose model that cannot read the body gives an empty pose)."""
         cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        size = max(box[2] - box[0], box[3] - box[1]) * 1.35
+        size = max(box[2] - box[0], box[3] - box[1]) * 1.2
         crop, x0, y0, sc = crop_square(rgb, cx, cy, size, out=384)
         res = self.track_pose.detect(crop, x0, y0, sc, sc)
-        if not res or res[0].vis.mean() < 0.35:
+        if res:
+            pr = res[0]
+            # the reading must be the person in the box, not a small part of it
+            lb = landmark_box(pr.lm2d, pr.vis)
+            if (lb[3] - lb[1]) * (lb[2] - lb[0]) > 0.25 * (box[3] - box[1]) * (box[2] - box[0]):
+                return pr, (cx, cy)
+        lm = np.tile([[cx, cy]], (33, 1)).astype(np.float32)
+        return PoseResult(lm, np.zeros(33, np.float32), np.zeros((33, 3), np.float32)), (cx, cy)
+
+    def _refine(self, rgb, box):
+        """Run single-person pose on a square crop around `box`. A box that has
+        shrunk onto part of a person (a frilly skirt, a sleeve: the pose model
+        happily finds a tiny "person" in it) is checked with a wider crop as
+        well; the wider reading wins when it is a larger person that contains
+        the small one and is about as sure."""
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        bsz = max(box[2] - box[0], box[3] - box[1])
+        best = None
+        for k, mult in enumerate((1.35, 2.6)):
+            if k and bsz * mult > 1.6 * max(rgb.shape[:2]):
+                break
+            crop, x0, y0, sc = crop_square(rgb, cx, cy, bsz * mult, out=384)
+            res = self.track_pose.detect(crop, x0, y0, sc, sc)
+            if not res or res[0].vis.mean() < 0.35:
+                continue
+            pr = res[0]
+            lb = landmark_box(pr.lm2d, pr.vis)
+            area = max(lb[2] - lb[0], 1.0) * max(lb[3] - lb[1], 1.0)
+            if best is None:
+                best = (pr, area, lb)
+            elif area > 2.0 * best[1] and pr.vis.mean() > best[0].vis.mean() - 0.1 and contains(lb, best[2], 0.6):
+                best = (pr, area, lb)
+        if best is None:
             return None, None
-        return res[0], (cx, cy)
+        return best[0], (cx, cy)
 
     # -- run -------------------------------------------------------------------
     def run(self):
@@ -272,9 +329,15 @@ class Analyzer:
         scan_every = max(1, int(round(self.scan_every_s * fps / stride)))
         self.scan_pose = PoseDetector(heavy=False, num_poses=3, min_conf=0.35)
         self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
+        from .detect import PersonDetector, ensure_model
+        pdp = None
+        if USE_PERSON_DETECTOR:
+            self.progress(0.0, "Getting the person detector (one-time download, 20 MB)")
+            pdp = ensure_model("person", lambda f: self.progress(0.0, f"Downloading the person detector: {f * 100:.0f}%"))
+        self.person_det = PersonDetector(pdp) if pdp else None
         embedder = Embedder()
 
-        scan_path = os.path.join(self.workdir, "scan_v4.pkl")
+        scan_path = os.path.join(self.workdir, "scan_v6.pkl" if USE_PERSON_DETECTOR else "scan_v5.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:
@@ -347,13 +410,34 @@ class Analyzer:
                 tracks = []
                 last_scan = -10 ** 9
             # ---- people
+            dets = self.person_det.detect(bgr) if self.person_det is not None else None
+            used = set()
+            if dets is not None:
+                # tracks follow the person detector's boxes (matched by overlap)
+                pairs_ = sorted(((max(box_iou(d[0], t.predict()), box_iou(d[0], t.boxes[-1])), ti, di)
+                                 for ti, t in enumerate(tracks) for di, d in enumerate(dets)), reverse=True)
+                got = set()
+                for iou, ti, di in pairs_:
+                    if iou < 0.25 or ti in got or di in used:
+                        continue
+                    got.add(ti)
+                    used.add(di)
+                    t = tracks[ti]
+                    pr, cc = self._refine_box(rgb, dets[di][0])
+                    t.add(fi, dets[di][0], pr, cc)
+                    t.det_n += 1
             for t in tracks:
+                if t.frames and t.frames[-1] == fi:
+                    continue
                 pred = t.predict()
                 pr, cc = self._refine(rgb, pred)
                 if pr is not None and pr.vis.mean() > 0.45:
                     box = landmark_box(pr.lm2d, pr.vis)
-                    if box_iou(box, pred) > 0.15 or contains(pred, box, 0.6):
-                        t.add(fi, damp_box(t.boxes[-1], box), pr, cc)
+                    small = dets is not None and (box[3] - box[1]) * (box[2] - box[0]) < \
+                        0.5 * (t.boxes[-1][3] - t.boxes[-1][1]) * (t.boxes[-1][2] - t.boxes[-1][0])
+                    if (box_iou(box, pred) > 0.15 or contains(pred, box, 0.6)) and not small:
+                        grown = (box[3] - box[1]) * (box[2] - box[0]) > 2.0 * (pred[3] - pred[1]) * (pred[2] - pred[0])
+                        t.add(fi, box if grown else damp_box(t.boxes[-1], box), pr, cc)
                         continue
                 t.misses += 1
             # duplicates: two tracks locked onto the same person
@@ -365,10 +449,34 @@ class Analyzer:
                     continue
                 alive.append(t)
             tracks = alive
-            if k - last_scan >= scan_every or not tracks:
+            if dets is not None:
+                for di, (box, score) in enumerate(dets):
+                    if di in used or score < 0.5 or len(tracks) >= self.max_people:
+                        continue
+                    if any(box_iou(box, t.boxes[-1]) > 0.3 or contains(t.boxes[-1], box, 0.7) for t in tracks):
+                        continue
+                    pr, cc = self._refine_box(rgb, box)
+                    t = Track(len(shot_starts) - 1)
+                    t.add(fi, box, pr, cc)
+                    t.det_n += 1
+                    tracks.append(t)
+            elif k - last_scan >= scan_every or not tracks:
                 if k - last_scan >= scan_every or k % max(1, scan_every // 3) == 0:
                     last_scan = k
+                    area = lambda b: max(b[2] - b[0], 1.0) * max(b[3] - b[1], 1.0)
                     for box, pr in self._scan(rgb):
+                        # a track that shrank onto part of this person: it becomes the whole person again
+                        part = [t for t in tracks if t.misses < 3 and area(box) > 3.0 * area(t.boxes[-1])
+                                and contains(box, t.boxes[-1], 0.8)]
+                        if part:
+                            pr2, cc = self._refine(rgb, box)
+                            if pr2 is not None and pr2.vis.mean() > 0.45:
+                                t = max(part, key=lambda t: len(t.frames))
+                                if t.frames and t.frames[-1] == fi:
+                                    for lst in (t.frames, t.boxes, t.lm2d, t.vis, t.world, t.crop_c):
+                                        lst.pop()
+                                t.add(fi, landmark_box(pr2.lm2d, pr2.vis), pr2, cc)
+                            continue
                         if any(box_iou(box, t.boxes[-1]) > 0.2 or contains(t.boxes[-1], box) for t in tracks if t.misses < 3):
                             continue
                         if len(tracks) >= self.max_people:
@@ -388,7 +496,7 @@ class Analyzer:
                     if x1 - x0 > 8 and y1 - y0 > 8:
                         patch = rgb[y0:y1, x0:x1]
                         t.embs.append(embedder.embed(patch))
-                        t.hists.append(part_histograms(rgb, t.lm2d[-1], t.vis[-1]))
+                        t.hists.append(part_histograms(rgb, t.lm2d[-1], t.vis[-1], t.boxes[-1] if getattr(t, 'det_n', 0) else None))
                         area = (x1 - x0) * (y1 - y0) * t.vis[-1].mean()
                         if t.id not in thumbs or area > thumbs[t.id][0]:
                             pad = int(0.08 * (y1 - y0))
@@ -511,6 +619,39 @@ class Analyzer:
         par_a = np.zeros(nA)
         n_seg = 0
         fps_a = fps / stride
+        # the first solve of every shot, all shots at once on the CPU's cores
+        # (shots are independent; the travelling ones take long)
+        def shot_samples(si):
+            samples = []
+            for t in tracklets:
+                if t.shot != si:
+                    continue
+                step = max(1, len(t.frames) // 25)
+                for j in range(0, len(t.frames), step):
+                    if t.vis[j].mean() > 0.6:
+                        samples.append((t.world[j].astype(np.float64), t.lm2d[j].astype(np.float64),
+                                        t.vis[j].astype(np.float64), t.crop_c[j], zoom[a_index[t.frames[j]]]))
+            return samples
+        first = {}
+        jobs = []
+        for si in range(len(shots)):
+            idx = np.where(a_shot == si)[0]
+            if len(idx) == 0:
+                continue
+            vf0 = cam.estimate_vfov(shot_samples(si)[:120], W, H)
+            jobs.append((si, [None] + [H_rel[i] for i in idx[1:]], [None] + [H_ids[i] for i in idx[1:]],
+                         [False] + [bool(H_ok[i]) for i in idx[1:]], cam.focal_from_vfov(vf0, H), cx, cy, fps_a, H))
+            first[si] = vf0
+        results = {}
+        workers = max(1, min(6, (os.cpu_count() or 2) - 1))
+        if len(jobs) > 1 and workers > 1 and PARALLEL_SHOTS:
+            import multiprocessing as mpc
+            done = 0
+            with mpc.get_context("spawn").Pool(min(workers, len(jobs))) as pool:
+                for si, res in pool.imap_unordered(_solve_shot_job, jobs):
+                    results[si] = res
+                    done += 1
+                    self.progress(0.91 + 0.04 * done / len(jobs), "Solving the camera from the scenery")
         for si, sh in enumerate(shots):
             idx = np.where(a_shot == si)[0]
             vf = None
@@ -534,7 +675,10 @@ class Analyzer:
                 ids = [None] + [H_ids[i] for i in idx[1:]]
                 oks = [False] + [bool(H_ok[i]) for i in idx[1:]]
                 f0 = cam.focal_from_vfov(vf, H)
-                Rs, zs, Cs, mv, sg, par, f_used, from_scene = scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
+                if _pass == 0 and si in results and first.get(si) == vf:
+                    Rs, zs, Cs, mv, sg, par, f_used, from_scene = results[si]
+                else:
+                    Rs, zs, Cs, mv, sg, par, f_used, from_scene = scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
                 R_ref[idx], zoom[idx], C_ref[idx], par_a[idx] = Rs, zs, Cs, par
                 seg_a[idx] = np.where(sg >= 0, sg + n_seg, -1)
                 if from_scene:  # the scenery measured the lens: better than the body's guess
@@ -570,7 +714,7 @@ class Analyzer:
             sh["gravity_weight"] = float(wsum)
 
         # ---------------- identities
-        characters, char_of_track = cluster_identities(tracklets, fps)
+        characters, char_of_track = cluster_identities(tracklets, fps, frame_size=(W, H))
 
         # ---------------- per-frame camera (all video frames)
         q_ref = mat_to_quat(R_ref)
@@ -675,12 +819,20 @@ class Analyzer:
         return summary
 
 
+def _solve_shot_job(job):
+    si, pairs, ids, oks, f0, cx, cy, fps_a, H = job
+    return si, scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
+
+
 # ----------------------------------------------------------------------------- identities
 GLIMPSE_S = 1.0      # a character seen for less than this is a glimpse
 MIN_LISTED_S = 0.5   # shorter characters are not listed
 
 
-def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6):
+PARTIAL_THRESHOLD = 0.5  # how alike a close-up / partial view must look to join the main character
+
+
+def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, frame_size=None):
     """Agglomerative (average-link) clustering of tracklets with cannot-link
     constraints for tracklets visible at the same time."""
     n = len(tracklets)
@@ -784,6 +936,35 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6):
                 best[1].extend(c)
                 clusters = [x for x in clusters if x is not c]
         clusters = [c for c in clusters if seconds(c) >= MIN_LISTED_S]
+    # close-ups and other partial views (only the face, only the legs, the
+    # body running out of the picture) look unlike the same person in full
+    # view; a cluster made of them that never shares the picture with a
+    # character seen far longer, and whose nearest views look alike, is that
+    # character
+    if frame_size is not None and len(clusters) > 1:
+        Wf, Hf = frame_size
+        def partial(i):
+            b = np.asarray(tracklets[i].boxes, np.float64)
+            m = 0.02 * max(Wf, Hf)
+            edge = (b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m)
+            return float(edge.mean())
+        changed = True
+        while changed:
+            changed = False
+            clusters.sort(key=seconds, reverse=True)
+            for c in clusters[1:]:
+                pw = np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c])
+                if pw < 0.5:
+                    continue
+                cands = [o for o in clusters if o is not c and seconds(o) >= 3 * seconds(c) and not conflict(c, o)]
+                if not cands:
+                    continue
+                d, o = min(((min(Dm[i, j] for i in c for j in o_), o_) for o_ in cands), key=lambda x: x[0])
+                if d < PARTIAL_THRESHOLD:
+                    o.extend(c)
+                    clusters = [x for x in clusters if x is not c]
+                    changed = True
+                    break
     # characters ordered by screen time
     clusters.sort(key=lambda c: -sum(len(tracklets[i].frames) for i in c))
     chars, char_of = [], {}

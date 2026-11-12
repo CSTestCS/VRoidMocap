@@ -408,13 +408,27 @@ def bundle_translation(obs, R0, focal, cx, cy, iters=25, sigma_acc=0.003, max_po
     return R, C, float(np.median(np.linalg.norm(r, axis=1))), norot
 
 
-def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=90, search_focal=False):
+TRAVEL_BUDGET_S = 600.0  # time allowed for the camera's travel in one shot (a safety net)
+TRAVEL_WIN = 90        # keyframes refined together while the path grows
+MAX_KEYFRAMES = 150     # keyframes of one travel stretch (more: further apart)
+_deadline = [None]
+
+
+def _out_of_time():
+    import time
+    return _deadline[0] is not None and time.time() > _deadline[0]
+
+
+def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=TRAVEL_WIN, search_focal=False):
     """Bundle adjustment for frames [a0, b) on keyframes `step` apart, in
     overlapping windows of `win` keyframes (each continues the previous one's
     path and scale). Returns refined rotations, camera centres (relative to
     frame a0) for every frame of the stretch, and the zoom mode ("chain": the
     measured zoom, "fixed": no zoom while travelling), or None."""
     from .mathutil import mat_to_quat, quat_to_mat, slerp
+    if _out_of_time():
+        return None
+    step = max(step, int(np.ceil((b - a0) / MAX_KEYFRAMES)))
     kf = list(range(a0, b, step))
     if kf[-1] != b - 1:
         kf.append(b - 1)
@@ -492,18 +506,22 @@ def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=90, search_focal=Fa
     return Rout, Cout, zmode, fscale
 
 
-def incremental_ba(sub, Rchain, focal, cx, cy, grow=6, win=60, iters=8, upto=None):
+def incremental_ba(sub, Rchain, focal, cx, cy, grow=None, win=60, iters=8, upto=None):
     """Camera path over keyframes, grown a few keyframes at a time (each new
     camera starts from the path so far, continued at its current speed, with the
     turn measured by the rotation chain), optimising the latest `win`
     keyframes at each step; a final pass refines everything when it fits in
     one window. Returns (R, C, median residual px) or None."""
     nk = len(sub) if upto is None else upto
+    if grow is None:
+        grow = max(6, nk // 12)
     Rk = Rchain[:nk].copy()
     Ck = np.zeros((nk, 3))
     solved = 1
     med = None
     while solved < nk:
+        if _out_of_time():
+            return None
         new_end = min(nk, solved + (grow if solved > 1 else max(grow, 4)))
         last = solved - 1
         v = Ck[last] - Ck[last - 1] if last >= 1 else np.zeros(3)
@@ -644,6 +662,8 @@ def solve_shot(pairs, ids, ok, f0, cx, cy, fps_a, H=1080, par_thr=1.2, win=8):
         moving = _moving(par, par_thr, win, fps_a)
     R_chain, zoom_chain = R.copy(), zoom.copy()
     search = not calibrated
+    import time
+    _deadline[0] = time.time() + TRAVEL_BUDGET_S
     for attempt in range(4):
         R, zoom = R_chain.copy(), zoom_chain.copy()
         focal = f0 * zoom
@@ -657,6 +677,7 @@ def solve_shot(pairs, ids, ok, f0, cx, cy, fps_a, H=1080, par_thr=1.2, win=8):
             calibrated = True
             continue
         break
+    _deadline[0] = None
     calibrated = calibrated or (np.mean(seg >= 0) >= 0.25 and (seg >= 0).sum() >= 2 * fps_a)
     return R, zoom, C, moving_t, seg, par, f0, calibrated
 

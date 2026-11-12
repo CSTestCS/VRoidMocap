@@ -7,8 +7,13 @@ MMD conversions...).
 
 1. **Analysis** (once per video). Every frame is scanned to find:
    * every camera cut,
-   * every person, tracked through the shot and **re-identified** when they come
-     back (after leaving the frame, after a cut, or when the framing changes),
+   * every person, found by a person detector trained on real, drawn, anime
+     and 3D-rendered people (Human-Art) and tracked through the shot, then
+     **re-identified** when they come back (after leaving the frame, after a
+     cut, or when the framing changes). Close-ups (only the face, only the
+     legs, a tilted camera) look unlike the same person in full view: a group
+     of such partial views that never shares the picture with a character seen
+     far longer, and looks like it, is that character,
    * each character's **height relative to the scenery** (single-view
      metrology against the ground plane's horizon, linked across shots through
      shared characters),
@@ -63,7 +68,8 @@ MMD conversions...).
   [GitHub Actions build](../../actions/workflows/build-windows.yml) (artifact
   *VRoidMocap-windows*) or from Releases, and double-click it. It needs no
   install. It uses the Edge WebView2 runtime that ships with Windows 10/11.
-  The first motion capture downloads two models once, into
+  The first analysis downloads the person detector (20 MB) and the first
+  motion capture two more models, once, into
   `%LOCALAPPDATA%\VRoidMocap\models`: the whole-body model (370 MB) and the
   depth-from-motion model (MotionBERT, 170 MB). Without internet the app still
   works, using the MediaPipe body model alone (less precise).

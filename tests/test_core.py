@@ -833,6 +833,41 @@ class BlendShapeExport(unittest.TestCase):
         self.assertTrue(any(c[1][0] == b"OP" and c[1][-1] == b"DeformPercent" for c in conns[2]))
 
 
+class Identities(unittest.TestCase):
+    def _track(self, tid, shot, frames, box, emb, hist):
+        from types import SimpleNamespace
+        n = len(frames)
+        return SimpleNamespace(id=tid, shot=shot, frames=list(frames), boxes=[np.array(box, float)] * n,
+                               embs=[np.asarray(emb, float)], hists=[np.asarray(hist, float)],
+                               vis=[np.full(33, 0.9)] * n, lm2d=[np.zeros((33, 2))] * n, det_n=n)
+
+    def test_close_ups_join_the_main_character(self):
+        from vroidmocap.core.analysis import cluster_identities
+        rng = np.random.default_rng(1)
+        e0 = rng.normal(size=16); h0 = np.abs(rng.normal(size=204))
+        e1 = e0 + 0.9 * rng.normal(size=16); h1 = h0 * np.abs(1 + 0.6 * rng.normal(size=204))
+        full = [self._track(i, i, range(i * 100, i * 100 + 90), [700, 100, 1100, 1000], e0, h0) for i in range(4)]
+        # a face close-up in its own shot: the box fills the picture
+        close = self._track(9, 9, range(900, 960), [300, 0, 1500, 1080], e1, h1)
+        chars, _ = cluster_identities(full + [close], 30.0, frame_size=(1920, 1080))
+        self.assertEqual(len(chars), 1)
+        # without knowing the picture size (no partial-view rule) it may stay apart
+        chars2, _ = cluster_identities(full + [close], 30.0)
+        self.assertGreaterEqual(len(chars2), 1)
+
+    def test_detector_tracks_count_as_people(self):
+        from types import SimpleNamespace
+        from vroidmocap.core.analysis import is_human_track
+        rng = np.random.default_rng(2)
+        n = 20
+        t = SimpleNamespace(frames=list(range(n)), vis=[np.full(33, 0.3)] * n,
+                            lm2d=[rng.uniform(0, 500, (33, 2)) for _ in range(n)],
+                            boxes=[np.array([0, 0, 100, 300.0])] * n, det_n=n)
+        self.assertTrue(is_human_track(t))  # shaky pose readings, but the person detector saw a person
+        t.det_n = 0
+        self.assertFalse(is_human_track(t))
+
+
 if __name__ == "__main__":
     unittest.main()
 

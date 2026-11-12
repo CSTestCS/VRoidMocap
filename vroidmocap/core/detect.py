@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 
 import cv2
@@ -20,10 +21,13 @@ MODEL_FILES = {
     "embed": "mobilenet_v3_large.tflite",
     "wholebody": "rtmw3d-x_384x288.onnx",
     "lifter": "motionbert_3d_243.onnx",
+    "person": "yolox_tiny_humanart.onnx",
 }
 # large models that are not packed into the exe: fetched once on first use
-DOWNLOAD_ON_USE = {"wholebody", "lifter"}
-MODEL_SIZES = {"wholebody": 369330857, "lifter": 170049517}
+DOWNLOAD_ON_USE = {"wholebody", "lifter", "person"}
+MODEL_SIZES = {"wholebody": 369330857, "lifter": 170049517, "person": 20283006}
+# models published inside a zip: the member to take out of it
+MODEL_ZIP_MEMBER = {"person": "end2end.onnx"}
 MODEL_MIRRORS = {
     "wholebody": ["https://huggingface.co/bukuroo/RTMW3D-ONNX/resolve/main/rtmw3d-x-384.onnx"],
 }
@@ -34,6 +38,8 @@ MODEL_URLS = {
     "embed": "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_large/float32/latest/mobilenet_v3_large.tflite",
     "wholebody": "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx",
     "lifter": "https://huggingface.co/bukuroo/MotionBERT-3d-ONNX/resolve/main/motionbert_3d_243.onnx",
+    # person boxes (YOLOX-tiny trained on Human-Art: real, drawn, anime and 3D-rendered people)
+    "person": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_tiny_8xb8-300e_humanart-6f3252f9.zip",
 }
 
 
@@ -81,6 +87,13 @@ def download_model(key, dest, progress=None):
                     got += len(buf)
                     if progress and total:
                         progress(got / total)
+            if key in MODEL_ZIP_MEMBER:
+                import zipfile
+                with zipfile.ZipFile(tmp) as z:
+                    name = next(n for n in z.namelist() if n.endswith(MODEL_ZIP_MEMBER[key]))
+                    with z.open(name) as src, open(tmp + ".x", "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                os.replace(tmp + ".x", tmp)
             want = MODEL_SIZES.get(key)
             if want and os.path.getsize(tmp) != want:
                 raise IOError("incomplete download")
@@ -348,3 +361,34 @@ class WholeBody:
         else:
             self.last_z = np.zeros(len(kp), np.float32)
         return kp.astype(np.float32), score.astype(np.float32)
+
+
+class PersonDetector:
+    """Person boxes in the whole picture (YOLOX-tiny trained on Human-Art:
+    real, drawn, anime and 3D-rendered people). The pose models alone lose
+    stylised characters in busy scenes (a frilly skirt becomes a small
+    "person" of its own); this finds the whole body."""
+
+    def __init__(self, path, threads=2):
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
+        so.log_severity_level = 3
+        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        self.inp = self.sess.get_inputs()[0].name
+        self.size = int(self.sess.get_inputs()[0].shape[2])
+
+    def detect(self, bgr, min_score=0.45):
+        """bgr frame -> list of (box x0,y0,x1,y1 px, score), best first."""
+        h, w = bgr.shape[:2]
+        r = min(self.size / h, self.size / w)
+        pad = np.full((self.size, self.size, 3), 114, np.uint8)
+        nh, nw = int(h * r), int(w * r)
+        pad[:nh, :nw] = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        out = self.sess.run(None, {self.inp: pad.transpose(2, 0, 1)[None].astype(np.float32)})
+        d = out[0][0]
+        res = [(np.clip(d[i, :4] / r, [0, 0, 0, 0], [w, h, w, h]).astype(np.float64), float(d[i, 4]))
+               for i in range(len(d)) if d[i, 4] >= min_score]
+        res = [(b, sc) for b, sc in res if b[2] - b[0] > 8 and b[3] - b[1] > 8]
+        return sorted(res, key=lambda t: -t[1])
