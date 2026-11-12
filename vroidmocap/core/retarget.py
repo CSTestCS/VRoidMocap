@@ -40,7 +40,7 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 20
+SOLVE_VERSION = 21
 FINGERS_FROM_VIDEO = False  # fingers are set by hand afterwards (keys.py); the solve leaves them at rest
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
 HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
@@ -59,6 +59,7 @@ PLANT_UNSEEN = True   # hidden lower legs stand on the floor
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
 SEGMENT_BONES = True  # a limb bone is known from one joint + one tracker on it (or two trackers)
+BRIDGE_ANY = False  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
 # body "bones" between MediaPipe landmarks used for the length constraints,
@@ -463,7 +464,14 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         idx = np.where(has_mp)[0]
         for f in np.where(bridge)[0]:
             j = idx[np.argmin(np.abs(idx - f))]
-            if abs(j - f) <= 0.5 * fps and shot_of[j] == shot_of[f]:
+            if BRIDGE_ANY and not (abs(j - f) <= 0.5 * fps and shot_of[j] == shot_of[f]):
+                # MediaPipe misses the character for longer (some drawn styles it
+                # rarely reads at all): its nearest reading in the same shot, else
+                # anywhere, gives the starting 3D guess; the whole-body joints and
+                # the depth read from the motion over time decide the pose
+                same = idx[shot_of[idx] == shot_of[f]]
+                j = same[np.argmin(np.abs(same - f))] if len(same) else j
+            if BRIDGE_ANY or (abs(j - f) <= 0.5 * fps and shot_of[j] == shot_of[f]):
                 world[f], cropc[f] = world[j], cropc[j] + (wb2d_c[f, 11:13].mean(0) - wb2d_c[j, 11:13].mean(0))
                 lm2d[f] = lm2d[j]
                 for m, w in WB_TO_MP.items():

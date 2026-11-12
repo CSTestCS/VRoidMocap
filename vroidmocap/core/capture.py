@@ -31,7 +31,7 @@ def character_boxes(workdir, char_id):
     npz = np.load(os.path.join(workdir, "analysis.npz"))
     N = A["frames"]
     boxes = np.full((N, 4), np.nan)
-    qual = np.zeros(N)
+    qual = np.full(N, -1.0)  # (a box found by the person detector alone has no landmark score)
     shot_of = npz["shot_of"]
     for t in A["tracklets"]:
         if t["character"] != char_id:
@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 9
+CAPTURE_VERSION = 10
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
