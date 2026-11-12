@@ -62,7 +62,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 10
+CAPTURE_VERSION = 11
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -391,6 +391,67 @@ def update_markers(mk, prev_g, g, kp=None, sc=None, min_score=0.6, snap=0.12):
     return mk
 
 
+MARKER_APPEARANCE = False  # a tracker must keep looking like the limb it was put on
+MARKER_SIG_R = 3          # half-size of the patch read for a tracker's look (tracking-resolution px)
+MARKER_MAX_DE = 16.0      # largest change of its mean colour (Lab units) ...
+MARKER_MAX_DSTD = 10.0    # ... and of its texture contrast
+MARKER_LINE_TOL = 0.22    # a bone's trackers stay evenly spaced on a line (fraction of their spread)
+
+
+def marker_signature(lab, pts, r=None):
+    """The look of the picture around each point (tracking-resolution px):
+    mean L, a, b and the contrast of L in a small patch. lab: the frame in Lab
+    at tracking resolution. Returns (n, 4), nan outside the picture."""
+    r = MARKER_SIG_R if r is None else r
+    h, w = lab.shape[:2]
+    out = np.full((len(pts), 4), np.nan, np.float32)
+    for j, (x, y) in enumerate(np.asarray(pts, np.float64)):
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        xi, yi = int(round(x)), int(round(y))
+        if xi - r < 0 or yi - r < 0 or xi + r + 1 > w or yi + r + 1 > h:
+            continue
+        p = lab[yi - r:yi + r + 1, xi - r:xi + r + 1].reshape(-1, 3).astype(np.float32)
+        out[j, :3] = p.mean(0)
+        out[j, 3] = p[:, 0].std()
+    return out
+
+
+def check_markers(mk, mk_prev, sig, lab, followed):
+    """Trackers that followed the picture this frame are kept only while they
+    still look like the limb they were put on (moving cloth, hair or a skirt
+    passing over the limb drags a tracker with it: what it sits on then looks
+    different), and while a bone's trackers stay evenly spaced on a line (the
+    one moving unlike the others is dropped). mk: (8,k,2) full-res px; sig:
+    (8,k,4) their looks when put on the limb. Returns the kept trackers."""
+    mk = mk.copy()
+    idx = np.argwhere(followed & np.isfinite(mk[..., 0]) & np.isfinite(sig[..., 0]))
+    if len(idx):
+        now = marker_signature(lab, mk[idx[:, 0], idx[:, 1]] * SEG_SCALE)
+        ref = sig[idx[:, 0], idx[:, 1]]
+        de = np.linalg.norm(now[:, :3] - ref[:, :3], axis=1)
+        ds = np.abs(now[:, 3] - ref[:, 3])
+        bad = ~np.isfinite(de) | (de > MARKER_MAX_DE) | (ds > MARKER_MAX_DSTD)
+        for (b, m) in idx[bad]:
+            mk[b, m] = np.nan
+    for b in range(mk.shape[0]):
+        P = mk[b]
+        if mk.shape[1] != 3 or not np.isfinite(P[:, 0]).all() or not followed[b].any():
+            continue
+        spread = np.linalg.norm(P[2] - P[0])
+        if spread < 4:
+            continue
+        if np.linalg.norm(P[1] - (P[0] + P[2]) / 2) > MARKER_LINE_TOL * spread:
+            d = P - mk_prev[b]
+            if np.isfinite(d).all():
+                med = np.median(d, 0)
+                j = int(np.argmax(np.linalg.norm(d - med, axis=1)))
+            else:
+                j = 1
+            mk[b, j] = np.nan
+    return mk
+
+
 def _hand_attempts(lm2d, side):
     wr, el = (L_WR, L_EL) if side == 0 else (R_WR, R_EL)
     tips = [L_INDEX, L_PINKY, L_THUMB] if side == 0 else [R_INDEX, R_PINKY, R_THUMB]
@@ -437,6 +498,62 @@ def hand_plausibility(p, score, label, ctx):
     return q
 
 
+WB_KEEP_TOL = 0.0  # the size kept only while the reading is at least as sure
+WB_EXPLORE_EVERY = 0  # whole-body readings between full searches of the box size (when unsure)
+WB_SCALES = (1.0, 1.6, 2.2)
+
+
+def wb_read(wbody, rgb, bb, state, explore_every=None, tol=None):
+    """The whole-body model on the tracked box. A box that cuts the body off
+    (camera low or moving, tracker lagging) leaves the model unsure: larger
+    boxes are tried and the surest reading kept. The size that won is kept
+    for the next frames (one reading each) while it stays as sure; all sizes are
+    tried again every `explore_every` readings or when it gets less sure.
+    state: a dict kept across the frames of one stretch. Returns (kp, score, z)."""
+    explore_every = WB_EXPLORE_EVERY if explore_every is None else explore_every
+    tol = WB_KEEP_TOL if tol is None else tol
+    H_, W_ = rgb.shape[:2]
+    c = (bb[:2] + bb[2:]) / 2
+
+    def in_area(b_):
+        return max(0.0, min(b_[2], W_) - max(b_[0], 0)) * max(0.0, min(b_[3], H_) - max(b_[1], 0))
+
+    def box(k):
+        hb = (bb[2:] - bb[:2]) * k / 2
+        return np.r_[c - hb, c + hb]
+    # the sizes that show more of the picture (the box, not the picture edge, cuts the body off)
+    sizes = [1.0]
+    for k in WB_SCALES[1:]:
+        if in_area(box(k)) < 1.3 * in_area(bb):
+            break
+        sizes.append(k)
+
+    def run(k):
+        kp, sc = wbody.detect(rgb, box(k) if k != 1.0 else bb)
+        return kp, sc, wbody.last_z, float(sc[5:23].mean())
+    since = state.get("since", explore_every)
+    k0 = state.get("k", 1.0)
+    if k0 not in sizes:
+        k0, since = 1.0, explore_every
+    got = run(k0)
+    if k0 == 1.0 and got[3] >= 0.6:
+        state.update(k=1.0, since=explore_every, last=got[3])
+        return got[:3]
+    if since < explore_every and got[3] >= state.get("last", 1.0) - tol:
+        state.update(since=since + 1, last=got[3])
+        return got[:3]
+    # full search, as when nothing is known: the box itself, then larger ones
+    base = got if k0 == 1.0 else run(1.0)
+    best, best_k = base, 1.0
+    if base[3] < 0.6:
+        for k in sizes[1:]:
+            r = got if k == k0 else run(k)
+            if r[3] > best[3] + 0.05:
+                best, best_k = r, k
+    state.update(k=best_k, since=0, last=best[3])
+    return best[:3]
+
+
 def process_chunk(args):
     """Worker: landmarks for frames [s, e) given per-frame boxes."""
     video, s, e, boxes, fps, out_path, wb_path = args
@@ -455,6 +572,7 @@ def process_chunk(args):
     wbz = np.zeros((n, 133), np.float16)
     wbody = WholeBody(wb_path) if wb_path else None
     wb_stride = max(1, int(round(fps / 30.0)))
+    wb_state = {}
     hc = np.zeros((n, 2, 2), np.float32)
     seg = np.full((n, 33), -1.0, np.float32)  # person mask at each landmark (-1: unknown)
     pose = PoseDetector(heavy=True, num_poses=1, video=True, min_conf=0.3, masks=True)
@@ -470,15 +588,22 @@ def process_chunk(args):
     markers = np.full((n, 8, len(MARKER_FRAC), 2), np.nan, np.float32)
     mk = np.full((8, len(MARKER_FRAC), 2), np.nan)
     mk_age = np.zeros((8, len(MARKER_FRAC)), int)
+    mk_sig = np.full((8, len(MARKER_FRAC), 4), np.nan, np.float32)  # each tracker's look when put on the limb
     max_age = int(round(0.5 * fps))
     mask = None
     for i, (fi, bgr) in enumerate(rd.iter_frames(1, s, e)):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        g = cv2.cvtColor(cv2.resize(bgr, None, fx=SEG_SCALE, fy=SEG_SCALE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(bgr, None, fx=SEG_SCALE, fy=SEG_SCALE, interpolation=cv2.INTER_AREA)
+        g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB) if MARKER_APPEARANCE else None
         if prev_g is not None and last_kp is not None:
             # each body segment's own rigid motion since the previous frame
             segM[i], segN[i] = segment_motion(prev_g, g, *last_kp)
+        mk_prev = mk
         mk = update_markers(mk, prev_g, g)  # trackers on the bones follow the picture
+        if MARKER_APPEARANCE and prev_g is not None:
+            # ...but motion alone does not keep them: they must still look like the limb
+            mk = check_markers(mk, mk_prev, mk_sig, lab, np.isfinite(mk_prev[..., 0]))
         mk_age += 1
         mk[mk_age > max_age] = np.nan  # followed too long without seeing the limb clearly: drift
         b = boxes[i]
@@ -505,30 +630,14 @@ def process_chunk(args):
             if ok:
                 lb = landmark_box(res[0].lm2d, res[0].vis)
                 bb = np.array([min(bb[0], lb[0]), min(bb[1], lb[1]), max(bb[2], lb[2]), max(bb[3], lb[3])])
-            wb2d[i], wbs[i] = wbody.detect(rgb, bb)
-            wbz[i] = wbody.last_z
-            # a box that cuts the body off (camera low or moving, tracker lagging)
-            # leaves the model unsure: try larger boxes, keep the surest reading
-            H_, W_ = rgb.shape[:2]
-
-            def in_area(b_):
-                return max(0.0, min(b_[2], W_) - max(b_[0], 0)) * max(0.0, min(b_[3], H_) - max(b_[1], 0))
-            if wbs[i, 5:23].mean() < 0.6:
-                c = (bb[:2] + bb[2:]) / 2
-                for k in (1.6, 2.2):
-                    hb = (bb[2:] - bb[:2]) * k / 2
-                    # only where a larger box shows more of the picture (the box,
-                    # not the picture edge, cuts the body off)
-                    if in_area(np.r_[c - hb, c + hb]) < 1.3 * in_area(bb):
-                        break
-                    kp2, sc2 = wbody.detect(rgb, np.r_[c - hb, c + hb])
-                    if sc2[5:23].mean() > wbs[i, 5:23].mean() + 0.05:
-                        wb2d[i], wbs[i], wbz[i] = kp2, sc2, wbody.last_z
+            wb2d[i], wbs[i], wbz[i] = wb_read(wbody, rgb, bb, wb_state)
             last_kp = (wb2d[i].astype(np.float64), wbs[i].astype(np.float64))
             mk_new = update_markers(mk, None, g, *last_kp)  # ...and sit on the line wherever it is clear
             snapped = np.isfinite(mk_new[..., 0]) & ~(np.isfinite(mk[..., 0]) & (mk_new == mk).all(-1))
             mk_age[snapped] = 0
             mk = mk_new
+            if MARKER_APPEARANCE and snapped.any():
+                mk_sig[snapped] = marker_signature(lab, mk[snapped] * SEG_SCALE)
         if mask is not None and np.isfinite(mk[..., 0]).any():
             # a tracker that is no longer on the person (it slid onto something in
             # front of the limb, or the background) is dropped
@@ -597,7 +706,10 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     progress(0.0, "Getting the whole-body model (one-time download, 370 MB)")
     wb_path = ensure_model("wholebody", lambda f: progress(0.0, f"Downloading the whole-body model: {f * 100:.0f}%"))
     tag = (f"w{CAPTURE_VERSION}" if wb_path else f"m{CAPTURE_VERSION}")
-    workers = workers or max(1, min(6, (os.cpu_count() or 2) - 1))
+    from .detect import worker_count, gpu_wanted
+    # (each worker holds the whole-body and MediaPipe models: ~1.7 GB; with the
+    # graphics card doing the whole-body model, fewer are needed to keep it busy)
+    workers = workers or worker_count(1.7, cap=4 if gpu_wanted() else 6)
     ctx = mpc.get_context("spawn")
     extra = []
     if wb_path:

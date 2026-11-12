@@ -162,13 +162,14 @@ def selftest():
         m.close()
         print("ok", name, flush=True)
     import onnxruntime as ort
-    print("onnxruntime", ort.__version__, flush=True)
-    from .core.detect import WholeBody, model_available
+    print("onnxruntime", ort.__version__, "providers", ort.get_available_providers(), flush=True)
+    from .core.detect import WholeBody, model_available, session_on_gpu
     wb = model_available("wholebody")
     if wb:
-        kp, sc = WholeBody(wb).detect(img, (0, 0, 256, 256))
+        m = WholeBody(wb)
+        kp, sc = m.detect(img, (0, 0, 256, 256))
         assert kp.shape == (133, 2)
-        print("ok wholebody", flush=True)
+        print("ok wholebody", "(graphics card)" if session_on_gpu(m.sess) else "(CPU)", flush=True)
     else:
         print("wholebody model not present (the app downloads it on first use)", flush=True)
     import cv2

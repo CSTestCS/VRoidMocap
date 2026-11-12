@@ -36,11 +36,8 @@ def lift(wb2d, wbs, spans, W, H, fps, model_path, threads=2, step_mult=1):
     read as one motion (inside a shot). Returns (N,17,3) in the model's units
     (x right, y down, z away from the camera; units of half the shorter
     picture side), nan where not computed."""
-    import onnxruntime as ort
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = threads
-    so.log_severity_level = 3
-    sess = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
+    from .detect import onnx_session
+    sess = onnx_session(model_path, threads, inter=0)
     inp_name = sess.get_inputs()[0].name
     N = len(wb2d)
     out = np.full((N, 17, 3), np.nan)

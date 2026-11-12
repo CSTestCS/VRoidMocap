@@ -323,6 +323,136 @@ WB_SWAP[91:112], WB_SWAP[112:133] = np.arange(112, 133), np.arange(91, 112)
 Z_RANGE = 2.1744869  # RTMW3D depth range
 
 
+# ----------------------------------------------------------------------------- workers
+def available_memory_gb():
+    """Physical memory free for new work (GB), or None when it cannot be read."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return m.ullAvailPhys / 2 ** 30
+            return None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2 ** 20
+    except Exception:
+        return None
+    return None
+
+
+def worker_count(gb_each, cap=6, reserve_gb=1.5):
+    """How many worker processes to run: one per processor thread but one (at
+    most `cap`), and no more than fit in the free memory (each needs about
+    `gb_each` GB): workers that do not fit make the computer swap, which is
+    far slower than running fewer."""
+    n = max(1, min(cap, (os.cpu_count() or 2) - 1))
+    free = available_memory_gb()
+    if free is not None:
+        n = max(1, min(n, int((free - reserve_gb) // gb_each)))
+    return n
+
+
+# ----------------------------------------------------------------------------- ONNX sessions
+GPU_ENV = "VROIDMOCAP_GPU"  # set to 0 to keep every model on the CPU
+_gpu_verdict = {}
+
+
+def _gpu_cache_path():
+    return os.path.join(user_model_dir(), "gpu_check.json")
+
+
+def _test_feed(sess, seed=0):
+    """A fixed input for every model input (unknown sizes: 1)."""
+    rng = np.random.default_rng(seed)
+    feed = {}
+    for i in sess.get_inputs():
+        shape = [d if isinstance(d, int) and d > 0 else 1 for d in i.shape]
+        x = rng.standard_normal(shape).astype(np.float32)
+        if "uint8" in i.type:
+            x = rng.integers(0, 255, shape).astype(np.uint8)
+        feed[i.name] = x
+    return feed
+
+
+def onnx_session(path, threads=1, inter=1):
+    """An onnxruntime session for a model file: on the graphics card where the
+    installed onnxruntime can use it (DirectML on Windows) and it gives the same
+    answers as the CPU on a test input (checked once per model, remembered),
+    otherwise on the CPU with `threads` threads."""
+    import onnxruntime as ort
+
+    def cpu():
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = inter
+        so.log_severity_level = 3
+        return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+    if os.environ.get(GPU_ENV, "1") == "0" or "DmlExecutionProvider" not in ort.get_available_providers():
+        return cpu()
+    import json
+    key = f"{os.path.basename(path)}:{os.path.getsize(path)}:{ort.__version__}"
+    if key not in _gpu_verdict:
+        try:
+            with open(_gpu_cache_path()) as f:
+                _gpu_verdict.update(json.load(f))
+        except Exception:
+            pass
+    if _gpu_verdict.get(key) is False:
+        return cpu()
+    try:
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        so.enable_mem_pattern = False  # (required by DirectML)
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        g = ort.InferenceSession(path, so, providers=["DmlExecutionProvider", "CPUExecutionProvider"])
+        if "DmlExecutionProvider" not in g.get_providers():
+            raise RuntimeError("DirectML not used")
+        if key not in _gpu_verdict:
+            c = cpu()
+            feed = _test_feed(c)
+            a, b = c.run(None, feed), g.run(None, feed)
+            ok = all(np.allclose(x, y, rtol=2e-3, atol=2e-3 * max(1.0, float(np.abs(x).max()))) for x, y in zip(a, b))
+            _gpu_verdict[key] = bool(ok)
+            try:
+                with open(_gpu_cache_path(), "w") as f:
+                    json.dump(_gpu_verdict, f)
+            except Exception:
+                pass
+            if not ok:
+                import logging
+                logging.getLogger("vroidmocap").warning("graphics card gives different answers for %s: using the CPU", path)
+                return c
+        return g
+    except Exception:
+        import logging
+        logging.getLogger("vroidmocap").warning("graphics card not usable for %s: using the CPU", path, exc_info=True)
+        _gpu_verdict[key] = False
+        return cpu()
+
+
+def gpu_wanted():
+    """The installed onnxruntime can use the graphics card (and it is not turned off)."""
+    try:
+        import onnxruntime as ort
+        return os.environ.get(GPU_ENV, "1") != "0" and "DmlExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+def session_on_gpu(sess):
+    return "DmlExecutionProvider" in sess.get_providers()
+
+
 class WholeBody:
     """RTMW whole-body keypoints (ONNX). Much more precise in the picture than
     the MediaPipe body model; used for where the joints are in 2D."""
@@ -331,12 +461,7 @@ class WholeBody:
     STD = np.array([58.395, 57.12, 57.375], np.float32)
 
     def __init__(self, path, threads=1):
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
-        so.inter_op_num_threads = 1
-        so.log_severity_level = 3
-        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        self.sess = onnx_session(path, threads)
         self.inp = self.sess.get_inputs()[0].name
 
     def detect(self, rgb, box, pad=1.25):
@@ -370,12 +495,7 @@ class PersonDetector:
     "person" of its own); this finds the whole body."""
 
     def __init__(self, path, threads=2):
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
-        so.inter_op_num_threads = 1
-        so.log_severity_level = 3
-        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        self.sess = onnx_session(path, threads)
         self.inp = self.sess.get_inputs()[0].name
         self.size = int(self.sess.get_inputs()[0].shape[2])
 

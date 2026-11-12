@@ -327,15 +327,11 @@ class Analyzer:
         N, fps, W, H = rd.frame_count, rd.fps, rd.width, rd.height
         stride = self.stride_override or max(1, int(round(fps / 30.0)))
         scan_every = max(1, int(round(self.scan_every_s * fps / stride)))
-        self.scan_pose = PoseDetector(heavy=False, num_poses=3, min_conf=0.35)
-        self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
-        from .detect import PersonDetector, ensure_model
+        from .detect import ensure_model
         pdp = None
         if USE_PERSON_DETECTOR:
             self.progress(0.0, "Getting the person detector (one-time download, 20 MB)")
             pdp = ensure_model("person", lambda f: self.progress(0.0, f"Downloading the person detector: {f * 100:.0f}%"))
-        self.person_det = PersonDetector(pdp) if pdp else None
-        embedder = Embedder()
 
         scan_path = os.path.join(self.workdir, "scan_v6.pkl" if USE_PERSON_DETECTOR else "scan_v5.pkl")
         if os.path.exists(scan_path):
@@ -343,26 +339,79 @@ class Analyzer:
             with open(scan_path, "rb") as fh:
                 sc = pickle.load(fh)
             if sc.get("stride") == stride and sc.get("frames") == N:
-                self.scan_pose.close()
-                self.track_pose.close()
-                embedder.close()
                 rd.close()
                 return self._finish(t_start, N, fps, W, H, stride, sc)
+        rd.close()
         cut_frames = detect_cuts(self.video_path, self.progress, self.cancel)
+        ranges = scan_ranges(N, stride, cut_frames, SCAN_PIECES_PER_WORKER * self._scan_workers())
+        if len(ranges) > 1 and PARALLEL_SCAN:
+            parts = self._scan_parallel(ranges, N, stride, scan_every, cut_frames, pdp, t_start)
+        else:
+            parts = [self._scan_range(0, N, stride, scan_every, cut_frames, pdp, t_start=t_start)]
+        sc = merge_scans(parts, stride, N, cut_frames)
+        import pickle
+        with open(scan_path + ".tmp", "wb") as fh:
+            pickle.dump(sc, fh, protocol=4)
+        os.replace(scan_path + ".tmp", scan_path)
+        return self._finish(t_start, N, fps, W, H, stride, sc)
+
+    def _scan_workers(self):
+        from .detect import worker_count
+        return worker_count(0.8) if PARALLEL_SCAN else 1
+
+    def _scan_parallel(self, ranges, N, stride, scan_every, cut_frames, pdp, t_start):
+        """The scan of every range at once on the CPU's cores (shots are scanned
+        independently: tracks and the scenery points start afresh at every cut)."""
+        import multiprocessing as mpc
+        ctx = mpc.get_context("spawn")
+        counter = ctx.Value("i", 0)
+        jobs = [(self.video_path, self.workdir, self.stride_override, self.scan_every_s, self.max_people,
+                 a, b, stride, scan_every, cut_frames, pdp) for (a, b) in ranges]
+        parts = [None] * len(jobs)
+        with ctx.Pool(min(len(jobs), self._scan_workers()), initializer=_scan_init, initargs=(counter,)) as pool:
+            res = [pool.apply_async(_scan_range_job, (j,)) for j in jobs]
+            while not all(r.ready() for r in res):
+                if self.cancel():
+                    pool.terminate()
+                    raise Cancelled()
+                done = counter.value
+                el = time.time() - t_start
+                frac = done / max(N, 1)
+                eta = el / max(frac, 1e-6) * (1 - frac)
+                self.progress(0.08 + frac * 0.82, f"Scanning frame {done}/{N} - ~{eta / 60:.1f} min left")
+                time.sleep(0.5)
+            for i, r in enumerate(res):
+                parts[i] = r.get()
+        return parts
+
+    def _scan_range(self, start, end, stride, scan_every, cut_frames, pdp, t_start=None, counter=None):
+        """Scan analysed frames [start, end) (start: a cut, or 0): people tracks,
+        the scenery's motion and appearance samples. Returns this range's part."""
+        from .detect import PersonDetector
+        N = end
+        self.scan_pose = PoseDetector(heavy=False, num_poses=3, min_conf=0.35)
+        self.track_pose = PoseDetector(heavy=False, num_poses=1, min_conf=0.3)
+        self.person_det = PersonDetector(pdp, threads=1 if counter is not None else 2) if pdp else None
+        embedder = Embedder()
+        rd = VideoReader(self.video_path)
+        W, H, fps = rd.width, rd.height, rd.fps
+        N_all = rd.frame_count
         cut_set = set(cut_frames)
         cam_scale = 640.0 / W
         cw, ch = 640, int(round(H * cam_scale))
         prev_gray = prev_mask = None
         bg_pts, bg_ids, next_bg_id = None, np.zeros(0, np.int64), 0
         tracks, finished = [], []
-        shot_starts = [0]
+        # (the cuts this range starts at: a scan of the whole video records them here)
+        shot_starts = [c for c in cut_frames if start - stride < c <= start] or [start]
         frame_ids, H_rel, H_ok, H_ids = [], [], [], []
         last_scan = -10 ** 9
         lost_limit = max(2, int(round(0.6 * fps / stride)))
         thumbs = {}
-        k = 0
+        k = start // stride  # (as when the whole video is scanned in one go)
         prev_fi = -1
-        for fi, bgr in rd.iter_frames(stride):
+        next_bg_id = start * 1000  # (unique across ranges)
+        for fi, bgr in rd.iter_frames(stride, start, end):
             if self.cancel():
                 raise Cancelled()
             cuts_here = [c for c in range(prev_fi + 1, fi + 1) if c in cut_set] if prev_fi >= 0 else []
@@ -538,25 +587,21 @@ class Analyzer:
             H_ok.append(ok)
             prev_gray = gray
             k += 1
-            if k % 5 == 0:
+            if counter is not None:
+                with counter.get_lock():
+                    counter.value += stride
+            elif k % 5 == 0:
                 el = time.time() - t_start
-                frac = fi / max(N - 1, 1)
+                frac = fi / max(N_all - 1, 1)
                 eta = el / max(frac, 1e-6) * (1 - frac)
-                self.progress(0.08 + frac * 0.82, f"Scanning frame {fi + 1}/{N} - {len(tracks)} people in view - ~{eta / 60:.1f} min left")
+                self.progress(0.08 + frac * 0.82, f"Scanning frame {fi + 1}/{N_all} - {len(tracks)} people in view - ~{eta / 60:.1f} min left")
         finished.extend(tracks)
         rd.close()
         self.scan_pose.close()
         self.track_pose.close()
         embedder.close()
-
-        sc = {"stride": stride, "frames": N, "frame_ids": frame_ids, "H_rel": H_rel, "H_ok": H_ok, "H_ids": H_ids,
-              "cuts": cut_frames,
-              "shot_starts": shot_starts, "tracks": finished, "thumbs": thumbs}
-        import pickle
-        with open(scan_path + ".tmp", "wb") as fh:
-            pickle.dump(sc, fh, protocol=4)
-        os.replace(scan_path + ".tmp", scan_path)
-        return self._finish(t_start, N, fps, W, H, stride, sc)
+        return {"start": start, "frame_ids": frame_ids, "H_rel": H_rel, "H_ok": H_ok, "H_ids": H_ids,
+                "shot_starts": shot_starts, "tracks": finished, "thumbs": thumbs}
 
     def _finish(self, t_start, N, fps, W, H, stride, sc):
         self.progress(0.91, "Solving cameras and identities")
@@ -643,7 +688,8 @@ class Analyzer:
                          [False] + [bool(H_ok[i]) for i in idx[1:]], cam.focal_from_vfov(vf0, H), cx, cy, fps_a, H))
             first[si] = vf0
         results, results2, second = {}, {}, {}
-        workers = max(1, min(6, (os.cpu_count() or 2) - 1))
+        from .detect import worker_count
+        workers = worker_count(0.4)
         if len(jobs) > 1 and workers > 1 and PARALLEL_SHOTS:
             import multiprocessing as mpc
             done = 0
@@ -838,6 +884,66 @@ class Analyzer:
         with open(os.path.join(self.workdir, "analysis.json"), "w") as f:
             json.dump(summary, f)
         return summary
+
+
+PARALLEL_SCAN = False  # the person scan of the video's shots on several cores at once
+SCAN_PIECES_PER_WORKER = 3  # ranges per worker (an even load where shots differ in length)
+_scan_counter = None
+
+
+def _scan_init(counter):
+    global _scan_counter
+    _scan_counter = counter
+
+
+def _scan_range_job(job):
+    (video, workdir, stride_o, scan_every_s, max_people, a, b, stride, scan_every, cut_frames, pdp) = job
+    an = Analyzer(video, workdir, stride=stride_o, scan_every_s=scan_every_s, max_people=max_people)
+    return an._scan_range(a, b, stride, scan_every, cut_frames, pdp, counter=_scan_counter)
+
+
+def scan_ranges(N, stride, cuts, pieces):
+    """Split the analysed frames at cuts into about `pieces` ranges of similar
+    length. A range starts on the first analysed frame at or after its cut
+    (where a scan of the whole video starts afresh too)."""
+    if pieces <= 1 or not cuts:
+        return [(0, N)]
+    starts = sorted({((c + stride - 1) // stride) * stride for c in cuts if 0 < c < N})
+    starts = [x for x in starts if 0 < x < N]
+    if not starts:
+        return [(0, N)]
+    bounds = [0]
+    for i in range(1, pieces):
+        want = N * i / pieces
+        best = min(starts, key=lambda x: abs(x - want))
+        if best > bounds[-1]:
+            bounds.append(best)
+    bounds = sorted(set(bounds))
+    return [(a, b) for a, b in zip(bounds, bounds[1:] + [N]) if b > a]
+
+
+def merge_scans(parts, stride, N, cut_frames):
+    """One scan from the ranges' parts (in order): track ids made unique."""
+    sc = {"stride": stride, "frames": N, "frame_ids": [], "H_rel": [], "H_ok": [], "H_ids": [],
+          "cuts": cut_frames, "shot_starts": [], "tracks": [], "thumbs": {}}
+    nid = 0
+    for p in sorted(parts, key=lambda p: p["start"]):
+        for k in ("frame_ids", "H_rel", "H_ok", "H_ids"):
+            sc[k].extend(p[k])
+        for st in p["shot_starts"]:
+            if st not in sc["shot_starts"]:
+                sc["shot_starts"].append(st)
+        remap = {}
+        for t in sorted(p["tracks"], key=lambda t: t.id):
+            remap[t.id] = nid
+            t.id = nid
+            nid += 1
+        for old, v in p["thumbs"].items():
+            if old in remap:
+                sc["thumbs"][remap[old]] = v
+        sc["tracks"].extend(p["tracks"])
+    Track._next = max(Track._next, nid)
+    return sc
 
 
 def _solve_shot_job(job):
