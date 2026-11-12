@@ -642,7 +642,7 @@ class Analyzer:
             jobs.append((si, [None] + [H_rel[i] for i in idx[1:]], [None] + [H_ids[i] for i in idx[1:]],
                          [False] + [bool(H_ok[i]) for i in idx[1:]], cam.focal_from_vfov(vf0, H), cx, cy, fps_a, H))
             first[si] = vf0
-        results = {}
+        results, results2, second = {}, {}, {}
         workers = max(1, min(6, (os.cpu_count() or 2) - 1))
         if len(jobs) > 1 and workers > 1 and PARALLEL_SHOTS:
             import multiprocessing as mpc
@@ -651,7 +651,26 @@ class Analyzer:
                 for si, res in pool.imap_unordered(_solve_shot_job, jobs):
                     results[si] = res
                     done += 1
-                    self.progress(0.91 + 0.04 * done / len(jobs), "Solving the camera from the scenery")
+                    self.progress(0.91 + 0.03 * done / len(jobs), "Solving the camera from the scenery")
+                # the second solve (where the zoom found changes the lens estimate),
+                # also all at once
+                jobs2 = []
+                for (si, pairs_, ids_, oks_, _f, *_r) in jobs:
+                    if results[si][7]:  # the scenery measured the lens itself
+                        continue
+                    idx = np.where(a_shot == si)[0]
+                    keep_z = zoom[idx].copy()
+                    zoom[idx] = results[si][1]
+                    vf1 = cam.estimate_vfov(shot_samples(si)[:120], W, H)
+                    zoom[idx] = keep_z
+                    if abs(vf1 - first[si]) >= 0.1 * first[si]:
+                        second[si] = vf1
+                        jobs2.append((si, pairs_, ids_, oks_, cam.focal_from_vfov(vf1, H), cx, cy, fps_a, H))
+                done = 0
+                for si, res in pool.imap_unordered(_solve_shot_job, jobs2):
+                    results2[si] = res
+                    done += 1
+                    self.progress(0.94 + 0.01 * done / max(len(jobs2), 1), "Solving the camera from the scenery")
         for si, sh in enumerate(shots):
             idx = np.where(a_shot == si)[0]
             vf = None
@@ -677,6 +696,8 @@ class Analyzer:
                 f0 = cam.focal_from_vfov(vf, H)
                 if _pass == 0 and si in results and first.get(si) == vf:
                     Rs, zs, Cs, mv, sg, par, f_used, from_scene = results[si]
+                elif _pass == 1 and si in results2 and second.get(si) == vf:
+                    Rs, zs, Cs, mv, sg, par, f_used, from_scene = results2[si]
                 else:
                     Rs, zs, Cs, mv, sg, par, f_used, from_scene = scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
                 R_ref[idx], zoom[idx], C_ref[idx], par_a[idx] = Rs, zs, Cs, par

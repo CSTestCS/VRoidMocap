@@ -222,7 +222,7 @@ def calibrate_focal(obs, use, cx, cy, H, zoom=None, gap=12):
 
 
 # ----------------------------------------------------------------------------- bundle adjustment
-def bundle_translation(obs, R0, focal, cx, cy, iters=25, sigma_acc=0.003, max_points=600, seed=0,
+def bundle_translation(obs, R0, focal, cx, cy, iters=25, sigma_acc=0.003, max_points=None, seed=0,
                        C0=None, n_fix=1):
     """Camera centres C (K,3) and refined rotations R (K,3,3) for one stretch of
     frames, from the background's parallax. Camera 0 is fixed at the origin with
@@ -232,6 +232,7 @@ def bundle_translation(obs, R0, focal, cx, cy, iters=25, sigma_acc=0.003, max_po
     Points are parameterised by inverse depth along their first sighting.
     Returns (R, C, cost per obs in px) or None."""
     K = len(obs)
+    max_points = max_points or BA_POINTS
     # tracks with enough sightings
     rows = []
     for k, (ii, pp) in enumerate(obs):
@@ -409,6 +410,9 @@ def bundle_translation(obs, R0, focal, cx, cy, iters=25, sigma_acc=0.003, max_po
 
 
 TRAVEL_BUDGET_S = 600.0  # time allowed for the camera's travel in one shot (a safety net)
+BA_POINTS = 600        # scenery points per bundle adjustment
+LENS_SCALES = (0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.42)  # lens guesses tried against the parallax
+LENS_ATTEMPTS = 3     # times the lens may be re-measured in one shot
 TRAVEL_WIN = 90        # keyframes refined together while the path grows
 MAX_KEYFRAMES = 150     # keyframes of one travel stretch (more: further apart)
 _deadline = [None]
@@ -444,7 +448,7 @@ def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=TRAVEL_WIN, search_
         n_s = len(sel)
         if n_s >= 6:
             sub = [obs[k] for k in kf[sel]]
-            scs = np.array([0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.42])
+            scs = np.array(LENS_SCALES)
             costs = np.full(len(scs), np.inf)
             for i, sc in enumerate(scs):
                 out = incremental_ba(sub, Rk[sel], np.full(n_s, focal[a0] * sc), cx, cy, upto=n_s)
@@ -452,6 +456,7 @@ def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=TRAVEL_WIN, search_
                     costs[i] = out[2]
             if np.isfinite(costs).any():
                 j = int(np.argmin(costs))
+                i1 = int(np.argmin(np.abs(scs - 1.0)))
                 ls = np.log(scs)
                 fs_ = ls[j]
                 if 0 < j < len(scs) - 1 and np.isfinite(costs[j - 1:j + 2]).all():
@@ -459,7 +464,7 @@ def travel_stretch(obs, R, focal, cx, cy, a0, b, step=3, win=TRAVEL_WIN, search_
                     den = a_ - 2 * b_ + c_
                     if den > 1e-9:
                         fs_ = ls[j] + float(np.clip(0.5 * (a_ - c_) / den, -1, 1)) * (ls[j + 1] - ls[j])
-                if costs[3] - costs[j] > 0.03:
+                if costs[i1] - costs[j] > 0.03:
                     fscale = float(np.exp(fs_))
         focal = focal * fscale
     focal_chain = focal_in
@@ -664,14 +669,14 @@ def solve_shot(pairs, ids, ok, f0, cx, cy, fps_a, H=1080, par_thr=1.2, win=8):
     search = not calibrated
     import time
     _deadline[0] = time.time() + TRAVEL_BUDGET_S
-    for attempt in range(4):
+    for attempt in range(LENS_ATTEMPTS + 1):
         R, zoom = R_chain.copy(), zoom_chain.copy()
         focal = f0 * zoom
-        out = _travel(obs, R, zoom, focal, moving.copy(), cx, cy, fps_a, win, search_focal=search and attempt < 3)
+        out = _travel(obs, R, zoom, focal, moving.copy(), cx, cy, fps_a, win, search_focal=search and attempt < LENS_ATTEMPTS)
         R, zoom, C, moving_t, seg, fscale = out
         if np.mean(seg >= 0) < 0.25 or (seg >= 0).sum() < 2 * fps_a:
             fscale = 1.0  # too little travel in this shot to measure the lens by
-        if search and attempt < 3 and abs(fscale - 1) > 0.03:
+        if search and attempt < LENS_ATTEMPTS and abs(fscale - 1) > 0.03:
             f0 *= fscale
             R_chain, zoom_chain = _chain(pairs, ok, f0, cx, cy)
             calibrated = True
