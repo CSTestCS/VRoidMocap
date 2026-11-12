@@ -1118,7 +1118,11 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, fr
                 pw = np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c])
                 if pw < 0.5:
                     continue
-                cands = [o for o in clusters if o is not c and seconds(o) >= 3 * seconds(c) and not conflict(c, o)]
+                # (the only character seen whole: the close-ups can be nobody
+                # else, however long they last)
+                cands = [o for o in clusters if o is not c and not conflict(c, o) and
+                         (seconds(o) >= 3 * seconds(c) or
+                          (len(whole) == 1 and o is whole[0] and seconds(o) >= seconds(c)))]
                 if not cands:
                     continue
                 d, o = min(((min(Dm[i, j] for i in c for j in o_), o_) for o_ in cands), key=lambda x: x[0])

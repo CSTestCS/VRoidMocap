@@ -52,6 +52,7 @@ SWAP_PRIOR = 0.15   # per frame cost of reading the labels swapped
 SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
 SIG_TWIST = np.radians(28.0)  # pelvis vs chest
+W_FRONT = 3.0       # front/back voted over a moment from the hips' left/right labels (close-ups)
 W_PRIOR = 3.0       # a facing carried over from the surrounding shots (close-ups), per frame
 BAD_MARGIN = 6.0    # cost by which a frame must contradict its tracked reading to be dropped
 
@@ -135,7 +136,8 @@ def _true_width(w, ok, fallback):
     return float(np.percentile(w[ok], 95))
 
 
-def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None):
+def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None,
+                 front=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
@@ -145,7 +147,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     frames whose detection contradicts the tracked facing (better not used).
     prior: optional (N,) facing (psi, radians) known from elsewhere (carried
     over from the surrounding shots), nan where none: it counts as one more
-    clue, so what the picture shows can still overrule it."""
+    clue, so what the picture shows can still overrule it.
+    front: optional (N,) -1..1, + = facing the camera, - = turned away (nan
+    = no opinion): a front/back clue, weighted by its size."""
     N = len(uv)
     psi_c = np.full(N, np.nan)
     psi_p = np.full(N, np.nan)
@@ -258,6 +262,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         sl = slice(s, e)
         obs = valid[sl].astype(float)[:, None]  # frames without a detection carry no evidence
         base = face_c[sl] + nose_c[sl]
+        if front is not None:
+            fv = np.nan_to_num(front[sl])
+            base = base + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
         if prior is not None:
             pr = prior[sl]
             base = base + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
@@ -282,6 +289,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         twist = 0.5 * (_wrap(PSI[None] - pc[:, None]) / SIG_TWIST) ** 2
         up_ = (np.minimum(((w_hp[sl, None] - sgn[:, None] * COS[None]) / SIG_W) ** 2, 9.0) * c_hp[sl, None] +
                fwd_c[sl] + np.where(sw[:, None], learned_cost2(lp_p[sl], l2p, True), learned_cost2(lp_p[sl], l2p))) * obs + twist
+        if front is not None:
+            fv = np.nan_to_num(front[sl])
+            up_ = up_ + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
         if prior is not None:
             pr = prior[sl]
             up_ = up_ + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)

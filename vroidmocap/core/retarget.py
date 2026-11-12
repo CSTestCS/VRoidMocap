@@ -70,6 +70,8 @@ WB_EDGE_FRAC = 0.05
 BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 CLOSEUP_GAIN = 1.0  # legs running out of the picture (close-ups): hip and knee scores scaled by this (1 = off)
 CLOSEUP_GAIN_FLOOR = 0.45  # ... from this score up
+CLOSEUP_FRONT_VOTE = False  # close-ups: front/back voted over half a second from the hips' left/right labels
+CLOSEUP_VOTE_S = 0.5
 CARRY_FACING = False  # close-ups: her facing carried over from the surrounding shots (cameras placed by the background)
 CARRY_MAX_S = 5.0  # ... from clear sightings at most this far away
 CLOSEUP_FACING = False  # close-ups without shoulders or feet: facing from the hips' labels and the knees, not the learned 3D
@@ -496,6 +498,33 @@ def closeup_frames(wbs, unsure=0.45, mid=0.35):
     return (s[:, 15:17].max(1) < unsure) & (s[:, 11:15].max(1) >= mid)
 
 
+def closeup_front_vote(wb_sync, valid, shot_of, fps, min_vote=0.3):
+    """(N,) in close-ups of the hips and thighs (no shoulders, no feet): +1..
+    facing the camera, -1.. turned away, nan elsewhere. The whole-body model's
+    left/right labels of the hips say which way she faces (her left hip on
+    the picture's right: towards the camera); they are right in 72% of such
+    frames, and a vote over half a second (inside the shot) in 82% where it
+    is clear (|vote| >= min_vote). Measured on rendered close-ups; where the
+    picture shows no shoulders and no feet the learned 3D had her the wrong
+    way round in a third to two thirds of frames."""
+    wb2d, wbs = (np.asarray(x, np.float64) for x in wb_sync)
+    N = len(wbs)
+    cu = valid & closeup_frames(wbs) & (wbs[:, 5:7].max(1) < 0.45)
+    if not cu.any():
+        return None
+    w = np.minimum(wbs[:, 11], wbs[:, 12])
+    sg = np.where(cu & (w >= 0.3), np.sign(wb2d[:, 11, 0] - wb2d[:, 12, 0]) * w, 0.0)
+    half = max(1, int(round(CLOSEUP_VOTE_S * fps)))
+    out = np.full(N, np.nan)
+    for f in np.where(cu)[0]:
+        a, b = max(0, f - half), min(N, f + half + 1)
+        sel = shot_of[a:b] == shot_of[f]
+        tot, nrm = np.sum(sg[a:b][sel]), np.sum(np.abs(sg[a:b][sel]))
+        if nrm > 0 and abs(tot / nrm) >= min_vote:
+            out[f] = tot / nrm
+    return out
+
+
 def shot_links(npz):
     """Camera links across cuts saved by the analysis (shotlink), as tuples."""
     if "link_ab" not in npz or len(npz["link_ab"]) == 0:
@@ -735,14 +764,17 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 uv_f[f, L_SH] = uv[f, L_HIP] + u2 * 2.5 * d
                 uv_f[f, R_SH] = uv[f, R_HIP] + u2 * 2.5 * d
                 conf_f[f, [L_SH, R_SH, NOSE]] = 0.0
+    front_v = closeup_front_vote(wb_sync, valid, shot_of, fps) if (CLOSEUP_FRONT_VOTE and wb_sync is not None) else None
+    dbg("front_vote", front_v if front_v is not None else np.full(N, np.nan))
     psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
-                                                  shot_spans(valid, shot_of), fps, W2=W2_f)
+                                                  shot_spans(valid, shot_of), fps, W2=W2_f, front=front_v)
     if CARRY_FACING and wb_sync is not None:
         prior = carried_facing(psi_p, bad, valid, uv, wb_sync[1], focal, cx, cy, shot_of, shots, npz, W, H, fps)
         dbg("facing_prior", prior)
         if prior is not None and np.isfinite(prior).any():
             psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
-                                                          shot_spans(valid, shot_of), fps, W2=W2_f, prior=prior)
+                                                          shot_spans(valid, shot_of), fps, W2=W2_f, prior=prior,
+                                                          front=front_v)
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
