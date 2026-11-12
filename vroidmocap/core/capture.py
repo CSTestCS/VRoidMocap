@@ -71,7 +71,7 @@ def character_boxes(workdir, char_id):
     return A, boxes, segs
 
 
-CAPTURE_VERSION = 11
+CAPTURE_VERSION = 12
 
 
 def stabilize_boxes(boxes, segs, fps, ratio=0.6, win_s=1.5):
@@ -510,6 +510,20 @@ def hand_plausibility(p, score, label, ctx):
 WB_KEEP_TOL = 0.0  # the size kept only while the reading is at least as sure
 WB_EXPLORE_EVERY = 0  # whole-body readings between full searches of the box size (when unsure)
 WB_SCALES = (1.0, 1.6, 2.2)
+WB_VIRTUAL = False  # close-ups: boxes reaching past the picture edge (the picture shows part of a taller person)
+WB_VIRTUAL_K = (2.0, 3.0)  # their height, in box heights ...
+WB_VIRTUAL_UP = (0.25, 0.5, 0.75)  # ... and the share of the extra height above the box
+WB_VIRTUAL_REEXPLORE = 8  # readings a kept virtual box is used before all are tried again
+
+
+def in_picture_quality(kp, sc, W, H, n=4):
+    """How sure a reading is of the body joints that are in the picture (the
+    mean of its n surest): a close-up shows a few joints, the rest are guesses
+    outside the picture."""
+    k = np.arange(5, 17)
+    inside = (kp[k, 0] >= 0) & (kp[k, 0] < W) & (kp[k, 1] >= 0) & (kp[k, 1] < H)
+    v = np.sort(sc[k][inside])
+    return float(v[-n:].mean()) if len(v) >= n else 0.0
 
 
 def wb_read(wbody, rgb, bb, state, explore_every=None, tol=None):
@@ -560,7 +574,53 @@ def wb_read(wbody, rgb, bb, state, explore_every=None, tol=None):
             if r[3] > best[3] + 0.05:
                 best, best_k = r, k
     state.update(k=best_k, since=0, last=best[3])
+    if WB_VIRTUAL and best[3] < 0.6:
+        vb = virtual_read(wbody, rgb, bb, best, state)
+        if vb is not None:
+            return vb
     return best[:3]
+
+
+def virtual_read(wbody, rgb, bb, best, state):
+    """A box that fills the picture from top to bottom (waist to thighs, the
+    chest to the knees) is a close-up of a taller person: the whole-body model,
+    trained on whole people, is lost in it. Boxes 2-3x as tall reaching past
+    the picture's top and bottom edges show the visible part where it would be
+    in a whole person; the reading that is surest of the joints in the picture
+    wins over the plain one when it is clearly surer. The shape that won is
+    kept for the next readings (re-checked every WB_VIRTUAL_REEXPLORE)."""
+    H_, W_ = rgb.shape[:2]
+    m = 0.02 * H_
+    if not (bb[1] <= m or bb[3] >= H_ - m):
+        state.pop("vk", None)
+        return None
+    bh = bb[3] - bb[1]
+
+    def vbox(k, up):
+        extra = (k - 1) * bh
+        return np.array([bb[0], bb[1] - up * extra, bb[2], bb[3] + (1 - up) * extra])
+
+    def run(kv):
+        kp, sc = wbody.detect(rgb, vbox(*kv))
+        return kp, sc, wbody.last_z, in_picture_quality(kp, sc, W_, H_)
+    q0 = in_picture_quality(best[0], best[1], W_, H_)
+    kept, n_kept = state.get("vk"), state.get("vk_n", 0)
+    if kept is not None and n_kept < WB_VIRTUAL_REEXPLORE:
+        r = run(kept)
+        if r[3] > q0 + 0.05 and r[3] >= state.get("vk_q", 1.0) - 0.05:
+            state.update(vk_n=n_kept + 1, vk_q=r[3])
+            return r[:3]
+    win, win_kv = None, None
+    for k in WB_VIRTUAL_K:
+        for up in WB_VIRTUAL_UP:
+            r = run((k, up))
+            if win is None or r[3] > win[3]:
+                win, win_kv = r, (k, up)
+    if win[3] > q0 + 0.05:
+        state.update(vk=win_kv, vk_n=0, vk_q=win[3])
+        return win[:3]
+    state.pop("vk", None)
+    return None
 
 
 def process_chunk(args):
