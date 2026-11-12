@@ -70,6 +70,8 @@ WB_EDGE_FRAC = 0.05
 BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 CLOSEUP_GAIN = 1.0  # legs running out of the picture (close-ups): hip and knee scores scaled by this (1 = off)
 CLOSEUP_GAIN_FLOOR = 0.45  # ... from this score up
+CARRY_FACING = False  # close-ups: her facing carried over from the surrounding shots (cameras placed by the background)
+CARRY_MAX_S = 5.0  # ... from clear sightings at most this far away
 CLOSEUP_FACING = False  # close-ups without shoulders or feet: facing from the hips' labels and the knees, not the learned 3D
 WB_ONLY_WEAK = False  # frames MediaPipe does not read at all: the whole-body model's 0.4 is a weak sighting on its own
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
@@ -494,6 +496,63 @@ def closeup_frames(wbs, unsure=0.45, mid=0.35):
     return (s[:, 15:17].max(1) < unsure) & (s[:, 11:15].max(1) >= mid)
 
 
+def shot_links(npz):
+    """Camera links across cuts saved by the analysis (shotlink), as tuples."""
+    if "link_ab" not in npz or len(npz["link_ab"]) == 0:
+        return []
+    ab, R = npz["link_ab"], npz["link_R"]
+    return [(int(a), int(b), int(fa), int(fb), R[k].astype(np.float64), int(n)) for k, (a, b, fa, fb, n) in enumerate(ab)]
+
+
+def carried_facing(psi, bad, valid, uv, wbs, focal, cx, cy, shot_of, shots, npz, W, H, fps):
+    """(N,) facing (psi, camera-relative) for close-ups of the hips and thighs
+    (no shoulders, no feet), carried over from the frames around them where
+    she is seen clearly: her facing in the world there, between the last
+    clear frame before and the first after (the shorter way round, so a turn
+    between them carries over too), seen from the close-up's camera. The
+    cameras are placed in one world from the background (shotlink); a
+    close-up whose camera could not be placed gets none (nan)."""
+    from .analysis import world_cameras
+    N = len(psi)
+    s_ = np.asarray(wbs, np.float64)
+    cu = valid & closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45)
+    if not cu.any():
+        return None
+    r3, view = facing.lateral_axes(uv, focal, cx, cy)
+    F_c = np.sin(np.nan_to_num(psi))[:, None] * r3 - np.cos(np.nan_to_num(psi))[:, None] * view
+    R_rel = quat_to_mat(npz["cam_q"].astype(np.float64))
+    good = valid & ~cu & ~bad & np.isfinite(psi)
+    yaw0 = {}
+    for f in np.where(good)[0]:
+        Fw = shots[shot_of[f]]["align"] @ R_rel[f] @ F_c[f]
+        yaw0[f] = float(np.arctan2(Fw[0], Fw[2]))
+    R_w, placed = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H,
+                                facing=yaw0, links=shot_links(npz), return_placed=True)
+    Fw = np.einsum("nij,nj->ni", R_w, F_c)
+    Y = np.arctan2(Fw[:, 0], Fw[:, 2])
+    gi = np.where(good)[0]
+    if len(gi) == 0:
+        return None
+    out = np.full(N, np.nan)
+    gap = CARRY_MAX_S * fps
+    for f in np.where(cu)[0]:
+        if not placed[shot_of[f]]:
+            continue
+        k = np.searchsorted(gi, f)
+        tp = gi[k - 1] if k > 0 and f - gi[k - 1] <= gap else None
+        tn = gi[k] if k < len(gi) and gi[k] - f <= gap else None
+        if tp is None and tn is None:
+            continue
+        if tp is not None and tn is not None:
+            w = (f - tp) / max(tn - tp, 1)
+            y = Y[tp] + w * float(np.angle(np.exp(1j * (Y[tn] - Y[tp]))))
+        else:
+            y = Y[tp if tp is not None else tn]
+        Fc = R_w[f].T @ np.array([np.sin(y), 0.0, np.cos(y)])
+        out[f] = np.arctan2(Fc @ r3[f], -(Fc @ view[f]))
+    return out
+
+
 def closeup_scores(capture, W, H):
     """Measured on rendered ground truth (close-ups of the waist to the knees,
     and every other benchmark): where the legs run out of the picture, a
@@ -678,6 +737,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 conf_f[f, [L_SH, R_SH, NOSE]] = 0.0
     psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
                                                   shot_spans(valid, shot_of), fps, W2=W2_f)
+    if CARRY_FACING and wb_sync is not None:
+        prior = carried_facing(psi_p, bad, valid, uv, wb_sync[1], focal, cx, cy, shot_of, shots, npz, W, H, fps)
+        dbg("facing_prior", prior)
+        if prior is not None and np.isfinite(prior).any():
+            psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
+                                                          shot_spans(valid, shot_of), fps, W2=W2_f, prior=prior)
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
@@ -801,7 +866,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for f in np.where(valid)[0]:
         Rw0 = shots[shot_of[f]]["align"] @ R_rel[f]
         yaw_at[f] = cam.hips_yaw(P[f], Rw0)
-    R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at)
+    R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at,
+                        links=shot_links(npz))
 
     # head: fitted to the face points (turn, nod, tilt), in world space
     Rface, face_q = headfit.head_from_face(wb2d, wbs, focal, cx, cy, valid)

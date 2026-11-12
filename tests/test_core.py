@@ -999,3 +999,39 @@ class ScanRanges(unittest.TestCase):
         self.assertEqual(sc["frame_ids"], [0, 10])
         self.assertEqual(sc["shot_starts"], [0, 10])
         self.assertEqual(sorted(sc["thumbs"]), list(range(5)))
+
+
+class ShotLink(unittest.TestCase):
+    def test_rotation_between_two_views_of_the_background(self):
+        import cv2
+        from vroidmocap.core.shotlink import relative_rotation, _features
+        from vroidmocap.core.camera import yaw_matrix
+        rng = np.random.default_rng(0)
+        W, H, f = 1280, 720, 900.0
+        # a textured scene far away, seen by a camera that then turns 12 deg
+        big = np.zeros((2000, 3000, 3), np.uint8)
+        for _ in range(900):
+            x, y = rng.integers(0, 3000), rng.integers(0, 2000)
+            cv2.rectangle(big, (int(x), int(y)), (int(x + rng.integers(10, 80)), int(y + rng.integers(10, 80))),
+                          tuple(int(c) for c in rng.integers(0, 255, 3)), -1)
+        K = np.array([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1]])
+        Kb = np.array([[f, 0, 1500], [0, f, 1000], [0, 0, 1]])
+        R = yaw_matrix(np.radians(12))
+        A = cv2.warpPerspective(big, K @ np.linalg.inv(Kb), (W, H))
+        B = cv2.warpPerspective(big, K @ R @ np.linalg.inv(Kb), (W, H))
+        sift = cv2.SIFT_create(nfeatures=2500)
+        r = relative_rotation(_features(sift, A, [], 0.75), _features(sift, B, [], 0.75), f, f, W / 2, H / 2)
+        self.assertIsNotNone(r)
+        ang = np.degrees(np.arccos(np.clip((np.trace(r[0] @ R.T) - 1) / 2, -1, 1)))
+        self.assertLess(ang, 1.5)
+
+    def test_yaw_from_link(self):
+        from vroidmocap.core.shotlink import yaw_from_link
+        from vroidmocap.core.camera import yaw_matrix
+        A_a, A_b = yaw_matrix(0.3), yaw_matrix(-0.2)
+        off_b = 1.1
+        R_a, R_b = A_a, yaw_matrix(off_b) @ A_b
+        R_link = R_b.T @ R_a  # x_b = R x_a
+        yaw, tilt = yaw_from_link(R_a, R_link, A_b)
+        self.assertAlmostEqual(yaw, off_b, places=6)
+        self.assertLess(tilt, 1e-4)

@@ -822,6 +822,24 @@ class Analyzer:
         for c in characters:
             c.update(heights.get(c["id"], {}))
 
+        links = []
+        if LINK_SHOTS and len(shots) > 1:
+            from .shotlink import link_shots
+            self.progress(0.97, "Matching the background across cuts")
+            boxes_at = {}
+            for t in tracklets:
+                fr = np.asarray(t.frames)
+                for s_ in (shots[t.shot]["start"], shots[t.shot]["end"]):
+                    for f in range(s_ - 4, s_ + 4):
+                        k = int(np.argmin(np.abs(fr - f)))
+                        if abs(fr[k] - f) <= 2 * stride:
+                            boxes_at.setdefault(f, []).append(t.boxes[k])
+            try:
+                links = link_shots(self.video_path, shots, shot_of, boxes_at, focal, W, H, cancel=self.cancel)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("matching the background across cuts failed")
+                links = []
         # ---------------- save
         tl_dump = {}
         for t in tracklets:
@@ -846,7 +864,9 @@ class Analyzer:
                             cam_C=cam_C.astype(np.float32), cam_seg=cam_seg.astype(np.int32),
                             cam_zoom=cam_zoom.astype(np.float32),
                             focal=focal.astype(np.float32), shot_of=shot_of,
-                            shot_align=np.array([s["align"] for s in shots]), **tl_dump)
+                            shot_align=np.array([s["align"] for s in shots]),
+                            link_ab=np.array([[l[0], l[1], l[2], l[3], l[5]] for l in links], np.int32).reshape(-1, 5),
+                            link_R=np.array([l[4] for l in links], np.float64).reshape(-1, 3, 3), **tl_dump)
         thumb_dir = os.path.join(self.workdir, "thumbs")
         os.makedirs(thumb_dir, exist_ok=True)
         for c in characters:
@@ -862,7 +882,7 @@ class Analyzer:
                 c["thumb_frame"] = int(best[2])
         # per-frame camera report (yaw relative to the main character's facing at shot starts)
         main = characters[0]["id"] if characters else None
-        R_w = world_cameras(cam_q, shot_of, shots, tracklets, char_of_track, main, focal, W, H)
+        R_w = world_cameras(cam_q, shot_of, shots, tracklets, char_of_track, main, focal, W, H, links=links)
         cam_rows = []
         for f in range(N):
             y, p, r = cam.camera_euler(R_w[f])
@@ -884,6 +904,425 @@ class Analyzer:
         with open(os.path.join(self.workdir, "analysis.json"), "w") as f:
             json.dump(summary, f)
         return summary
+
+
+LINK_SHOTS = False  # camera directions across cuts from the background (shotlink)
+PARALLEL_SCAN = True  # the person scan of the video's shots on several cores at once
+SCAN_PIECES_PER_WORKER = 3  # ranges per worker (an even load where shots differ in length)
+_scan_counter = None
+
+
+def _scan_init(counter):
+    global _scan_counter
+    _scan_counter = counter
+
+
+def _scan_range_job(job):
+    (video, workdir, stride_o, scan_every_s, max_people, a, b, stride, scan_every, cut_frames, pdp) = job
+    an = Analyzer(video, workdir, stride=stride_o, scan_every_s=scan_every_s, max_people=max_people)
+    return an._scan_range(a, b, stride, scan_every, cut_frames, pdp, counter=_scan_counter)
+
+
+def scan_ranges(N, stride, cuts, pieces):
+    """Split the analysed frames at cuts into about `pieces` ranges of similar
+    length. A range starts on the first analysed frame at or after its cut
+    (where a scan of the whole video starts afresh too)."""
+    if pieces <= 1 or not cuts:
+        return [(0, N)]
+    starts = sorted({((c + stride - 1) // stride) * stride for c in cuts if 0 < c < N})
+    starts = [x for x in starts if 0 < x < N]
+    if not starts:
+        return [(0, N)]
+    bounds = [0]
+    for i in range(1, pieces):
+        want = N * i / pieces
+        best = min(starts, key=lambda x: abs(x - want))
+        if best > bounds[-1]:
+            bounds.append(best)
+    bounds = sorted(set(bounds))
+    return [(a, b) for a, b in zip(bounds, bounds[1:] + [N]) if b > a]
+
+
+def merge_scans(parts, stride, N, cut_frames):
+    """One scan from the ranges' parts (in order): track ids made unique."""
+    sc = {"stride": stride, "frames": N, "frame_ids": [], "H_rel": [], "H_ok": [], "H_ids": [],
+          "cuts": cut_frames, "shot_starts": [], "tracks": [], "thumbs": {}}
+    nid = 0
+    for p in sorted(parts, key=lambda p: p["start"]):
+        for k in ("frame_ids", "H_rel", "H_ok", "H_ids"):
+            sc[k].extend(p[k])
+        for st in p["shot_starts"]:
+            if st not in sc["shot_starts"]:
+                sc["shot_starts"].append(st)
+        remap = {}
+        for t in sorted(p["tracks"], key=lambda t: t.id):
+            remap[t.id] = nid
+            t.id = nid
+            nid += 1
+        for old, v in p["thumbs"].items():
+            if old in remap:
+                sc["thumbs"][remap[old]] = v
+        sc["tracks"].extend(p["tracks"])
+    Track._next = max(Track._next, nid)
+    return sc
+
+
+def _solve_shot_job(job):
+    si, pairs, ids, oks, f0, cx, cy, fps_a, H = job
+    return si, scene.solve_shot(pairs, ids, oks, f0, cx, cy, fps_a, H=H)
+
+
+# ----------------------------------------------------------------------------- identities
+GLIMPSE_S = 1.0      # a character seen for less than this is a glimpse
+MIN_LISTED_S = 0.5   # shorter characters are not listed
+
+
+PARTIAL_THRESHOLD = 0.5  # how alike a close-up / partial view must look to join the main character
+PARTIAL_THRESHOLD_ALONE = 0.7  # ... when that character is the only one ever seen whole (nobody else it could be)
+
+
+def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, frame_size=None):
+    """Agglomerative (average-link) clustering of tracklets with cannot-link
+    constraints for tracklets visible at the same time."""
+    n = len(tracklets)
+    if n == 0:
+        return [], {}
+    E = np.array([normalize(np.mean(t.embs, axis=0)) for t in tracklets])
+    Hh = np.array([np.mean(t.hists, axis=0) for t in tracklets])
+    # Bhattacharyya distance per body part (3 parts of 68 bins)
+    def hist_d(a, b):
+        ds = []
+        for p in range(3):
+            x, y = a[p * 68:(p + 1) * 68], b[p * 68:(p + 1) * 68]
+            bc = np.sum(np.sqrt(np.maximum(x, 0) * np.maximum(y, 0))) / max(np.sqrt(x.sum() * y.sum()), 1e-9)
+            ds.append(np.sqrt(max(0.0, 1 - bc)))
+        return float(np.average(ds, weights=[1.4, 1.0, 0.8]))
+    Dm = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            de = 1 - float(np.dot(E[i], E[j]))
+            dh = hist_d(Hh[i], Hh[j])
+            d = 0.45 * min(1.0, de * 2.0) + 0.55 * dh
+            Dm[i, j] = Dm[j, i] = d
+    # tracklets alive at the same time: either duplicates of one body (boxes overlap
+    # -> must merge) or two different people (-> may never merge)
+    fidx = [{f: j for j, f in enumerate(t.frames)} for t in tracklets]
+    cannot = np.zeros((n, n), bool)
+    must = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            common = set(fidx[i]) & set(fidx[j])
+            if len(common) <= 1:
+                continue
+            ious = [max(box_iou(tracklets[i].boxes[fidx[i][f]], tracklets[j].boxes[fidx[j][f]]),
+                        1.0 if contains(tracklets[i].boxes[fidx[i][f]], tracklets[j].boxes[fidx[j][f]], 0.5) else 0.0)
+                    for f in common]
+            if np.mean(np.array(ious) > 0.3) > 0.5:
+                must.append((i, j))
+            else:
+                cannot[i, j] = cannot[j, i] = True
+    # fragments of one track inside a shot (short gap, end box near start box)
+    for i in range(n):
+        for j in range(n):
+            ti, tj = tracklets[i], tracklets[j]
+            if i == j or ti.shot != tj.shot or cannot[i, j]:
+                continue
+            gap = tj.frames[0] - ti.frames[-1]
+            if not (-6 <= gap <= 0.6 * fps):
+                continue
+            k = next((x for x in range(len(tj.frames)) if tj.frames[x] >= ti.frames[-1]), 0)
+            bi, bj = ti.boxes[-1], tj.boxes[k]
+            hgt = max(bi[3] - bi[1], bj[3] - bj[1], 1.0)
+            dc = np.linalg.norm(((bi[:2] + bi[2:]) - (bj[:2] + bj[2:])) / 2)
+            if dc < 0.6 * hgt and Dm[i, j] < threshold * 1.4:
+                must.append((i, j))
+    clusters = [[i] for i in range(n)]
+    for i, j in must:
+        ci = next(c for c in clusters if i in c)
+        cj = next(c for c in clusters if j in c)
+        if ci is not cj and not any(cannot[a, b] for a in ci for b in cj):
+            ci.extend(cj)
+            clusters.remove(cj)
+
+    def conflict(a, b):
+        return any(cannot[i, j] for i in a for j in b)
+
+    while len(clusters) > 1:
+        best = None
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                pair = [Dm[i, j] for i in clusters[a] for j in clusters[b]]
+                # blend of average and best-match linkage: robust to a few blurry
+                # or badly lit appearances inside an otherwise clear identity
+                d = 0.5 * (float(np.mean(pair)) + float(np.min(pair)))
+                if best is None or d < best[0]:
+                    if not conflict(clusters[a], clusters[b]):
+                        best = (d, a, b)
+        if best is None or best[0] > threshold:
+            break
+        _, a, b = best
+        clusters[a] = clusters[a] + clusters[b]
+        del clusters[b]
+    # brief glimpses (a fast cut, a moment at the edge of the picture) are much
+    # less certain in appearance than a long track: one that never shares the
+    # picture with a longer-seen character and looks reasonably like it is that
+    # character. What is left that is shorter than half a second is not listed
+    # (nobody wants to capture a 0.2 s glimpse, and it looks like a duplicate).
+    def seconds(c):
+        fr = sorted({f for i in c for f in tracklets[i].frames})
+        return len(fr) * (float(np.median(np.diff(fr))) if len(fr) > 1 else 1.0) / fps
+    if any(seconds(c) >= GLIMPSE_S for c in clusters):
+        for c in sorted([c for c in clusters if seconds(c) < GLIMPSE_S], key=seconds):
+            best = None
+            for o in clusters:
+                if o is c or seconds(o) < GLIMPSE_S or conflict(c, o):
+                    continue
+                pair = [Dm[i, j] for i in c for j in o]
+                d = 0.5 * (float(np.mean(pair)) + float(np.min(pair)))
+                if best is None or d < best[0]:
+                    best = (d, o)
+            if best is not None and best[0] < glimpse_threshold:
+                best[1].extend(c)
+                clusters = [x for x in clusters if x is not c]
+        clusters = [c for c in clusters if seconds(c) >= MIN_LISTED_S]
+    # close-ups and other partial views (only the face, only the legs, the
+    # body running out of the picture) look unlike the same person in full
+    # view; a cluster made of them that never shares the picture with a
+    # character seen far longer, and whose nearest views look alike, is that
+    # character
+    if frame_size is not None and len(clusters) > 1:
+        Wf, Hf = frame_size
+        def partial(i):
+            b = np.asarray(tracklets[i].boxes, np.float64)
+            m = 0.02 * max(Wf, Hf)
+            edge = (b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m)
+            return float(edge.mean())
+        # the characters seen whole for a while (the box clear of the picture's
+        # edges for at least GLIMPSE_S): any other cluster could only be them
+        def seconds_whole(c):
+            m = 0.02 * max(Wf, Hf)
+            n = 0
+            for i in c:
+                b = np.asarray(tracklets[i].boxes, np.float64)
+                fr = np.asarray(tracklets[i].frames)
+                step = float(np.median(np.diff(fr))) if len(fr) > 1 else 1.0
+                n += step * int((~((b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m))).sum())
+            return n / fps
+        changed = True
+        while changed:
+            changed = False
+            clusters.sort(key=seconds, reverse=True)
+            whole = [c for c in clusters if seconds_whole(c) >= GLIMPSE_S]
+            thr = PARTIAL_THRESHOLD_ALONE if len(whole) == 1 else PARTIAL_THRESHOLD
+            for c in clusters[1:]:
+                pw = np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c])
+                if pw < 0.5:
+                    continue
+                cands = [o for o in clusters if o is not c and seconds(o) >= 3 * seconds(c) and not conflict(c, o)]
+                if not cands:
+                    continue
+                d, o = min(((min(Dm[i, j] for i in c for j in o_), o_) for o_ in cands), key=lambda x: x[0])
+                if d < (thr if any(o is w for w in whole) else PARTIAL_THRESHOLD):
+                    o.extend(c)
+                    clusters = [x for x in clusters if x is not c]
+                    changed = True
+                    break
+    # characters ordered by screen time
+    clusters.sort(key=lambda c: -sum(len(tracklets[i].frames) for i in c))
+    chars, char_of = [], {}
+    for ci, c in enumerate(clusters):
+        frames = sorted({f for i in c for f in tracklets[i].frames})
+        for i in c:
+            char_of[tracklets[i].id] = ci
+        chars.append({
+            "id": ci,
+            "name": f"Character {ci + 1}",
+            "tracklets": [tracklets[i].id for i in c],
+            "appearances": len(c),
+            "shots": sorted({int(tracklets[i].shot) for i in c}),
+            "first_frame": int(frames[0]), "last_frame": int(frames[-1]),
+            "screen_time_s": round(len(frames) * (float(np.median(np.diff(frames))) if len(frames) > 1 else 1.0) / fps, 2),
+        })
+    return chars, char_of
+
+
+# ----------------------------------------------------------------------------- heights
+def estimate_heights(tracklets, char_of, characters, shots, shot_of, a_index, R_ref, zoom, H, W):
+    """Height of each character relative to the camera height (horizon method),
+    combined over shots with a log-space least squares so characters that are
+    never on screen together are still comparable through shared shots."""
+    cx, cy = W / 2, H / 2
+    obs = {}  # (char, shot) -> list of log ratios
+    for t in tracklets:
+        c = char_of.get(t.id)
+        sh = shots[t.shot]
+        f0 = cam.focal_from_vfov(sh["vfov"], H)
+        for j in range(len(t.frames)):
+            ai = a_index[t.frames[j]]
+            f = f0 * zoom[ai]
+            Rw = sh["align"] @ R_ref[ai]
+            Rray = cam.ray_rotation(f, cx, cy, *t.crop_c[j])
+            Wc = t.world[j].astype(np.float64) @ Rray.T
+            up, w = cam.body_up_vector(Wc, t.vis[j])
+            if up is None or w < 0.15:
+                continue
+            lm, vis = t.lm2d[j], t.vis[j]
+            # how tall the body currently stands vs its full standing height (handles bent knees etc.)
+            upv = -g_cv(Rw)
+            stand = standing_height(Wc)
+            cur = float(np.max(Wc @ upv) - np.min(Wc[[L_HEEL, R_HEEL, L_FOOT, R_FOOT]] @ upv)) + 0.12 * stand
+            if stand <= 0 or cur <= 0.3 * stand:
+                continue
+            corr = stand / max(cur, 1e-6)
+            if min(vis[L_HEEL], vis[R_HEEL], vis[NOSE]) < 0.5:
+                continue
+            foot_y = max(lm[L_HEEL, 1], lm[R_HEEL, 1], lm[L_FOOT, 1], lm[R_FOOT, 1])
+            foot_x = (lm[L_HEEL, 0] + lm[R_HEEL, 0]) / 2
+            # crown of head ~ nose + 0.55 * (nose - shoulder centre) upward
+            shc = (lm[L_SH] + lm[R_SH]) / 2
+            top_y = lm[NOSE, 1] - 0.55 * abs(shc[1] - lm[NOSE, 1])
+            hy = cam.horizon_y(Rw, f, cx, cy, foot_x)
+            if hy is None or foot_y - hy < 5:
+                continue
+            ratio = (foot_y - top_y) / (foot_y - hy) * corr
+            if 0.05 < ratio < 20:
+                obs.setdefault((c, t.shot), []).append(np.log(ratio))
+    if not obs:
+        return {}
+    keys = list(obs.keys())
+    cids = sorted({k[0] for k in keys})
+    sids = sorted({k[1] for k in keys})
+    ci = {c: i for i, c in enumerate(cids)}
+    si = {s: i for i, s in enumerate(sids)}
+    nC, nS = len(cids), len(sids)
+    A, b, wts = [], [], []
+    for (c, s), v in obs.items():
+        row = np.zeros(nC + nS)
+        row[ci[c]] = 1
+        row[nC + si[s]] = -1
+        A.append(row)
+        b.append(float(np.median(v)))
+        wts.append(np.sqrt(len(v)))
+    # gauge: mean camera log-height = 0
+    row = np.zeros(nC + nS)
+    row[nC:] = 1.0 / nS
+    A.append(row)
+    b.append(0.0)
+    wts.append(10.0)
+    A, b, wts = np.array(A), np.array(b), np.array(wts)
+    x, *_ = np.linalg.lstsq(A * wts[:, None], b * wts, rcond=None)
+    hc = np.exp(x[:nC])
+    tallest = hc.max()
+    out = {}
+    for c in cids:
+        h = float(hc[ci[c]])
+        out[c] = {
+            "height_vs_camera": round(h, 3),
+            "relative_height": round(h / tallest, 3),
+            "height_samples": int(sum(len(v) for (cc, s), v in obs.items() if cc == c)),
+            "height_by_shot": {int(s): round(float(np.exp(np.median(v))), 3) for (cc, s), v in obs.items() if cc == c},
+        }
+    return out
+
+
+def g_cv(Rw):
+    """World 'down' direction expressed in camera (cv) coordinates."""
+    return Rw.T @ np.array([0, -1.0, 0])
+
+
+def standing_height(Wc):
+    """Approximate standing height (heel to crown) from MediaPipe world landmarks."""
+    from .detect import L_KNEE, R_KNEE
+    def d(a, b):
+        return float(np.linalg.norm(Wc[a] - Wc[b]))
+    shin = (d(L_ANK, L_KNEE) + d(R_ANK, R_KNEE)) / 2
+    thigh = (d(L_KNEE, L_HIP) + d(R_KNEE, R_HIP)) / 2
+    torso = float(np.linalg.norm((Wc[L_SH] + Wc[R_SH]) / 2 - (Wc[L_HIP] + Wc[R_HIP]) / 2))
+    neck_nose = float(np.linalg.norm(Wc[NOSE] - (Wc[L_SH] + Wc[R_SH]) / 2))
+    heel = (d(L_HEEL, L_ANK) + d(R_HEEL, R_ANK)) / 2
+    return shin + thigh + torso + neck_nose * 1.55 + heel * 0.6
+
+
+# ----------------------------------------------------------------------------- world cameras
+def world_cameras(cam_q, shot_of, shots, tracklets, char_of, char_id, focal, W, H, facing=None, links=None,
+                  return_placed=False):
+    """World rotation of the camera for every frame.
+
+    Inside a shot the rotation comes from background tracking. Across a cut,
+    where the two shots show the same background (links: see shotlink), the
+    new camera's direction comes from it. Otherwise each shot's yaw is chosen
+    so the reference character keeps facing the same way across the cut
+    (180-degree-rule continuity); the first shot defines yaw 0.
+    return_placed: also (n_shots,) whether each shot's direction is known
+    (from the background, or from the character's facing)."""
+    from .shotlink import LINK_MAX_TILT_DEG, yaw_from_link
+    N = len(cam_q)
+    R_rel = quat_to_mat(cam_q)
+    cx, cy = W / 2, H / 2
+    # facing angle per frame of the reference character, in the shot-aligned frame
+    yaw_at = {}
+    if facing is not None:
+        yaw_at = facing
+    else:
+        for t in tracklets:
+            if char_of.get(t.id) != char_id:
+                continue
+            for j, f in enumerate(t.frames):
+                if t.vis[j].mean() < 0.6:
+                    continue
+                Rw = shots[shot_of[f]]["align"] @ R_rel[f]
+                Rray = cam.ray_rotation(focal[f], cx, cy, *t.crop_c[j])
+                yaw_at[f] = cam.hips_yaw(t.world[j].astype(np.float64) @ Rray.T, Rw)
+    n = len(shots)
+    offsets = np.zeros(n)
+    placed = np.zeros(n, bool)
+    links = list(links or [])
+
+    def A(si, f):
+        return shots[si]["align"] @ R_rel[f]
+
+    def from_links(si):
+        best = None
+        for (a, b, fa, fb, R, n_in) in links:
+            if b == si and placed[a]:
+                yaw, tilt = yaw_from_link(cam.yaw_matrix(offsets[a]) @ A(a, fa), R, A(b, fb))
+            elif a == si and placed[b]:
+                yaw, tilt = yaw_from_link(cam.yaw_matrix(offsets[b]) @ A(b, fb), R.T, A(a, fa))
+            else:
+                continue
+            if tilt <= LINK_MAX_TILT_DEG and (best is None or n_in > best[1]):
+                best = (yaw, n_in)
+        return None if best is None else best[0]
+    last_yaw = None
+    for si, sh in enumerate(shots):
+        fs = [f for f in range(sh["start"], sh["end"]) if f in yaw_at]
+        y = from_links(si)
+        if y is not None:
+            offsets[si], placed[si] = y, True
+        elif fs:
+            head = fs[: max(1, min(len(fs), 10))]
+            first = np.angle(np.mean(np.exp(1j * np.array([yaw_at[f] for f in head]))))
+            offsets[si] = (last_yaw - first) if last_yaw is not None else 0.0
+            placed[si] = True
+        elif si > 0:
+            offsets[si] = offsets[si - 1]  # nothing known: as the previous camera
+        if fs:
+            tail = fs[-max(1, min(len(fs), 10)):]
+            last_yaw = np.angle(np.mean(np.exp(1j * np.array([yaw_at[f] for f in tail])))) + offsets[si]
+    # shots placed by neither, linked to a shot placed later on
+    changed = True
+    while changed:
+        changed = False
+        for si in range(n):
+            if not placed[si]:
+                y = from_links(si)
+                if y is not None:
+                    offsets[si], placed[si], changed = y, True, True
+    out = np.zeros((N, 3, 3))
+    for f in range(N):
+        si = shot_of[f]
+        out[f] = cam.yaw_matrix(offsets[si]) @ shots[si]["align"] @ R_rel[f]
+    return (out, placed) if return_placed else out
 
 
 PARALLEL_SCAN = True  # the person scan of the video's shots on several cores at once

@@ -52,6 +52,7 @@ SWAP_PRIOR = 0.15   # per frame cost of reading the labels swapped
 SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
 SIG_TWIST = np.radians(28.0)  # pelvis vs chest
+W_PRIOR = 3.0       # a facing carried over from the surrounding shots (close-ups), per frame
 BAD_MARGIN = 6.0    # cost by which a frame must contradict its tracked reading to be dropped
 
 
@@ -134,14 +135,17 @@ def _true_width(w, ok, fallback):
     return float(np.percentile(w[ok], 95))
 
 
-def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None):
+def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
     hip centre. segments: (start, end) spans to track through (each within one
     shot; frames inside that are not valid are bridged). Returns (psi_chest,
     psi_pelvis, swap, bad) per frame: nan / False outside valid frames; bad =
-    frames whose detection contradicts the tracked facing (better not used)."""
+    frames whose detection contradicts the tracked facing (better not used).
+    prior: optional (N,) facing (psi, radians) known from elsewhere (carried
+    over from the surrounding shots), nan where none: it counts as one more
+    clue, so what the picture shows can still overrule it."""
     N = len(uv)
     psi_c = np.full(N, np.nan)
     psi_p = np.full(N, np.nan)
@@ -254,6 +258,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         sl = slice(s, e)
         obs = valid[sl].astype(float)[:, None]  # frames without a detection carry no evidence
         base = face_c[sl] + nose_c[sl]
+        if prior is not None:
+            pr = prior[sl]
+            base = base + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
         l2c = lp2_c[sl] if lp2_c is not None else None
         l2p = lp2_p[sl] if lp2_p is not None else None
         u0 = (base + learned_cost2(lp_c[sl], l2c) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
@@ -275,6 +282,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         twist = 0.5 * (_wrap(PSI[None] - pc[:, None]) / SIG_TWIST) ** 2
         up_ = (np.minimum(((w_hp[sl, None] - sgn[:, None] * COS[None]) / SIG_W) ** 2, 9.0) * c_hp[sl, None] +
                fwd_c[sl] + np.where(sw[:, None], learned_cost2(lp_p[sl], l2p, True), learned_cost2(lp_p[sl], l2p))) * obs + twist
+        if prior is not None:
+            pr = prior[sl]
+            up_ = up_ + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
         kp = _viterbi(up_, tp)
         pp = np.array([_refine(up_[i], kp[i]) for i in range(e - s)])
         # continuous: light zero-phase smoothing
