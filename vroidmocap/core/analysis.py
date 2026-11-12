@@ -957,6 +957,7 @@ MIN_LISTED_S = 0.5   # shorter characters are not listed
 
 
 PARTIAL_THRESHOLD = 0.5  # how alike a close-up / partial view must look to join the main character
+PARTIAL_THRESHOLD_ALONE = 0.7  # ... when that character is the only one ever seen whole (nobody else it could be)
 
 
 def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, frame_size=None):
@@ -1075,6 +1076,11 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, fr
             m = 0.02 * max(Wf, Hf)
             edge = (b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m)
             return float(edge.mean())
+        # the characters seen whole (not only in close-ups / partial views)
+        def mostly_partial(c):
+            return np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c]) >= 0.5
+        whole = [c for c in clusters if not mostly_partial(c) and seconds(c) >= GLIMPSE_S]
+        thr = PARTIAL_THRESHOLD_ALONE if len(whole) == 1 else PARTIAL_THRESHOLD
         changed = True
         while changed:
             changed = False
@@ -1087,7 +1093,7 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, fr
                 if not cands:
                     continue
                 d, o = min(((min(Dm[i, j] for i in c for j in o_), o_) for o_ in cands), key=lambda x: x[0])
-                if d < PARTIAL_THRESHOLD:
+                if d < (thr if o in whole else PARTIAL_THRESHOLD):
                     o.extend(c)
                     clusters = [x for x in clusters if x is not c]
                     changed = True
