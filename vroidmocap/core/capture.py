@@ -510,7 +510,7 @@ def hand_plausibility(p, score, label, ctx):
 WB_KEEP_TOL = 0.0  # the size kept only while the reading is at least as sure
 WB_EXPLORE_EVERY = 0  # whole-body readings between full searches of the box size (when unsure)
 WB_SCALES = (1.0, 1.6, 2.2)
-WB_VIRTUAL = False  # close-ups: boxes reaching past the picture edge (the picture shows part of a taller person)
+WB_VIRTUAL = os.environ.get("VROIDMOCAP_WB_VIRTUAL", "0") != "0"  # close-ups: boxes reaching past the picture edge (the picture shows part of a taller person)
 WB_VIRTUAL_K = (2.0, 3.0)  # their height, in box heights ...
 WB_VIRTUAL_UP = (0.25, 0.5, 0.75)  # ... and the share of the extra height above the box
 WB_VIRTUAL_REEXPLORE = 8  # readings a kept virtual box is used before all are tried again

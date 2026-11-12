@@ -68,6 +68,10 @@ WB_SCORE_MAX_GAIN = 1.5
 WB_SCORE_FLOOR = 0.35  # scores below this are guesses: not boosted
 WB_EDGE_FRAC = 0.05
 BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
+CLOSEUP_GAIN = 1.0  # legs running out of the picture (close-ups): hip and knee scores scaled by this (1 = off)
+CLOSEUP_GAIN_FLOOR = 0.45  # ... from this score up
+CLOSEUP_FACING = False  # close-ups without shoulders or feet: facing from the hips' labels and the knees, not the learned 3D
+WB_ONLY_WEAK = False  # frames MediaPipe does not read at all: the whole-body model's 0.4 is a weak sighting on its own
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 LIFT_W_LEGS = 0.4  # ... for the knees and ankles: it reads leg depth the wrong way round for low and close cameras (benchmarks: thighs 12% better overall, a low camera over a skirt 23 -> 13 deg)
 
@@ -482,6 +486,39 @@ def calibrate_scores(capture, W=None, H=None):
     return out
 
 
+def closeup_frames(wbs, unsure=0.45, mid=0.35):
+    """(N,) frames where the legs run out of the picture (both ankles unsure:
+    the waist to the thighs or knees in a close-up, a waist-up shot) while the
+    whole-body model reads a hip or knee."""
+    s = np.asarray(wbs, np.float64)
+    return (s[:, 15:17].max(1) < unsure) & (s[:, 11:15].max(1) >= mid)
+
+
+def closeup_scores(capture, W, H):
+    """Measured on rendered ground truth (close-ups of the waist to the knees,
+    and every other benchmark): where the legs run out of the picture, a
+    thigh whose hip and knee the whole-body model scores 0.45-0.6 points the
+    right way in the picture (more than 30 deg off in 0-4% of frames), but
+    such scores are below the "seen" level, so close-up legs were not
+    animated. There the hips and knees in the picture scored from
+    CLOSEUP_GAIN_FLOOR up are scaled by CLOSEUP_GAIN."""
+    if CLOSEUP_GAIN <= 1.0 or capture.get("wbs") is None:
+        return capture
+    wb2d = np.asarray(capture["wb2d"], np.float64)
+    cu = closeup_frames(capture["wbs"])
+    if not cu.any():
+        return capture
+    out = dict(capture)
+    w2 = np.asarray(capture["wbs"], np.float64).copy()
+    for j in (11, 12, 13, 14):
+        p = wb2d[:, j]
+        inside = (p[:, 0] > 0) & (p[:, 0] < W) & (p[:, 1] > 0) & (p[:, 1] < H)
+        b = cu & inside & (w2[:, j] >= CLOSEUP_GAIN_FLOOR)
+        w2[b, j] = np.minimum(w2[b, j] * CLOSEUP_GAIN, 0.99)
+    out["wbs"] = w2.astype(np.asarray(capture["wbs"]).dtype)
+    return out
+
+
 # ----------------------------------------------------------------------------- main
 def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True, debug=None):
     dbg = (lambda k, v: debug.__setitem__(k, np.array(v, copy=True))) if debug is not None else (lambda k, v: None)
@@ -498,6 +535,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         s["align"] = npz["shot_align"][i]
 
     capture = calibrate_scores(capture, W, H)
+    capture = closeup_scores(capture, W, H)
     lm2d = capture["lm2d"].astype(np.float64)
     vis = capture["vis"].astype(np.float64)
     world = capture["world"].astype(np.float64)
@@ -515,6 +553,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     wbs_c = capture.get("wbs")
     n_mp = (vis > 0.5).sum(1)
     n_wb = np.zeros(N, int)
+    n_wb_weak = np.zeros(N, int)
     if wbs_c is not None and np.any(wbs_c):
         from .detect import WB_TO_MP
         wb2d_c = capture["wb2d"]
@@ -523,10 +562,25 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 p_ = wb2d_c[:, w]
                 ins = (p_[:, 0] > 0) & (p_[:, 0] < W) & (p_[:, 1] > 0) & (p_[:, 1] < H)
                 n_wb += (ins & (wbs_c[:, w] >= 0.6)).astype(int)
+                n_wb_weak += (ins & (wbs_c[:, w] >= 0.4)).astype(int)
+    # the model's scores flicker around the bar from frame to frame (close-ups:
+    # sure readings come one frame at a time): a stretch of fairly sure frames
+    # that runs into a sure one is usable throughout
+    wb_ok = n_wb >= 4
+    if wbs_c is not None and np.any(wbs_c) and CLOSEUP_GAIN > 1.0:
+        # a close-up shows the hips and knees only: one leg read surely (its hip
+        # and knee) is enough to use the frame
+        s_ = np.asarray(wbs_c, np.float64)
+        cu_ = closeup_frames(s_)
+        wb_ok |= cu_ & (((s_[:, 11] >= 0.6) & (s_[:, 13] >= 0.6)) | ((s_[:, 12] >= 0.6) & (s_[:, 14] >= 0.6)))
+    if WB_ONLY_WEAK:
+        for a_, b_ in runs(capture["tracked"] & (n_wb_weak >= 4), shot_of):
+            if wb_ok[a_:b_].any():
+                wb_ok[a_:b_] = True
     has_mp = np.abs(world).sum((1, 2)) > 0
     # short MediaPipe dropouts while the whole-body model still sees the person:
     # its 3D guess and landmarks are carried over from the nearest frame it had
-    bridge = capture["tracked"] & ~has_mp & (n_wb >= 4)
+    bridge = capture["tracked"] & ~has_mp & wb_ok
     t_w = None
     if bridge.any() and has_mp.any():
         t_w = vis ** 2
@@ -549,7 +603,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                         t_w[f, m] = float(wbs_c[f, w]) ** 2
                 vis[f] = 0.0  # nothing seen by MediaPipe itself: the whole-body model decides
                 has_mp[f] = True
-    valid = capture["tracked"] & ((n_mp >= 4) | (n_wb >= 4)) & has_mp
+    valid = capture["tracked"] & ((n_mp >= 4) | wb_ok) & has_mp
     hvalid = (hs >= 0.5) & valid[:, None]
 
     # ---- 1. orient landmarks into the real camera; translation
@@ -595,8 +649,35 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             log.exception("depth from motion failed")
             Ylift = None
     W_lift = lifter.as_mediapipe(Ylift) if Ylift is not None else None
-    psi_c, psi_p, swap, bad = facing.track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid,
-                                                  shot_spans(valid, shot_of), fps, W2=W_lift)
+    Wc_f, W2_f, uv_f, conf_f = Wc, W_lift, uv, conf
+    if CLOSEUP_FACING and wb_sync is not None:
+        # a close-up of the hips and thighs (no shoulders, no feet): the pose
+        # model's 3D there is carried over from another moment and the motion
+        # model guesses the rest of the body; measured on rendered close-ups both
+        # put the body the wrong way round (facing more than 90 deg off in
+        # 32-72% of frames). There the facing comes from the hips' left/right
+        # labels and the knees.
+        s_ = np.asarray(wb_sync[1], np.float64)
+        cu_f = valid & closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45)
+        uv_f, conf_f = uv, conf
+        if cu_f.any():
+            Wc_f = Wc.copy()
+            Wc_f[cu_f] = np.nan
+            if W_lift is not None:
+                W2_f = W_lift.copy()
+                W2_f[cu_f] = np.nan
+            # the shoulders are guesses outside the picture: "up" in the picture
+            # is the camera's (from the scenery), not hips -> guessed shoulders
+            uv_f, conf_f = uv.copy(), conf.copy()
+            for f in np.where(cu_f)[0]:
+                up3 = shots[shot_of[f]]["align"].T @ np.array([0, 1.0, 0])
+                u2 = up3[:2] / max(np.linalg.norm(up3[:2]), 1e-6)
+                d = max(float(np.linalg.norm(uv[f, L_HIP] - uv[f, R_HIP])), 10.0)
+                uv_f[f, L_SH] = uv[f, L_HIP] + u2 * 2.5 * d
+                uv_f[f, R_SH] = uv[f, R_HIP] + u2 * 2.5 * d
+                conf_f[f, [L_SH, R_SH, NOSE]] = 0.0
+    psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
+                                                  shot_spans(valid, shot_of), fps, W2=W2_f)
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
@@ -931,7 +1012,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     mp_in = (mp2d[..., 0] > 2) & (mp2d[..., 0] < W - 2) & (mp2d[..., 1] > 2) & (mp2d[..., 1] < H - 2)
     edge_ok = mp_in & (vis >= 0.5) & (raw >= 0.6)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
-                    weak=(vis >= 0.3) | ((raw >= 0.4) & (vis >= 0.1)),
+                    weak=(vis >= 0.3) | ((raw >= 0.4) & ((vis >= 0.1) | (bridged[:, None] & WB_ONLY_WEAK))),
                     both=((raw >= 0.45) & (vis >= 0.25)) | trk_ok, edge_ok=edge_ok)
     dbg("js", js)
     dbg("raw", raw)
