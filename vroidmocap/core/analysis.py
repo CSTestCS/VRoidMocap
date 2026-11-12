@@ -886,7 +886,7 @@ class Analyzer:
         return summary
 
 
-PARALLEL_SCAN = False  # the person scan of the video's shots on several cores at once
+PARALLEL_SCAN = True  # the person scan of the video's shots on several cores at once
 SCAN_PIECES_PER_WORKER = 3  # ranges per worker (an even load where shots differ in length)
 _scan_counter = None
 

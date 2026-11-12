@@ -22,6 +22,15 @@ from .mathutil import gaussian_smooth
 from .video import VideoReader
 
 CHUNK = 450
+_WB = {}
+
+
+def whole_body(path):
+    """The whole-body model, loaded once per worker process (loading it takes
+    longer than reading a short shot; it keeps no state between frames)."""
+    if path not in _WB:
+        _WB[path] = WholeBody(path)
+    return _WB[path]
 
 
 def character_boxes(workdir, char_id):
@@ -163,7 +172,7 @@ def follow_job(args):
     (video, seed, box, direction, stop, cam_R, focal, W, H, fps, wb_path, out_path) = args
     if os.path.exists(out_path):
         return out_path
-    wbody = WholeBody(wb_path)
+    wbody = whole_body(wb_path)
     rd = VideoReader(video)
     step = max(1, int(round(fps / 30.0)))
     lost_max = max(2, int(round(0.3 * fps / step)))
@@ -391,7 +400,7 @@ def update_markers(mk, prev_g, g, kp=None, sc=None, min_score=0.6, snap=0.12):
     return mk
 
 
-MARKER_APPEARANCE = False  # a tracker must keep looking like the limb it was put on
+MARKER_APPEARANCE = os.environ.get("VROIDMOCAP_MARKER_CHECK", "0") != "0"  # a tracker must keep looking like the limb it was put on
 MARKER_SIG_R = 3          # half-size of the patch read for a tracker's look (tracking-resolution px)
 MARKER_MAX_DE = 16.0      # largest change of its mean colour (Lab units) ...
 MARKER_MAX_DSTD = 10.0    # ... and of its texture contrast
@@ -570,7 +579,7 @@ def process_chunk(args):
     wb2d = np.zeros((n, 133, 2), np.float32)
     wbs = np.zeros((n, 133), np.float32)
     wbz = np.zeros((n, 133), np.float16)
-    wbody = WholeBody(wb_path) if wb_path else None
+    wbody = whole_body(wb_path) if wb_path else None
     wb_stride = max(1, int(round(fps / 30.0)))
     wb_state = {}
     hc = np.zeros((n, 2, 2), np.float32)

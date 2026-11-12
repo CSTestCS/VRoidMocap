@@ -932,3 +932,36 @@ class BodyContacts(unittest.TestCase):
         self.assertTrue(planted[:, 0].all())
         lows, _ = _foot_lows(skel, Q2, root)
         self.assertLess(np.abs(lows[:, 0]).max(), 0.02)
+
+
+class ScanRanges(unittest.TestCase):
+    def test_ranges_start_at_cuts_on_the_frame_grid(self):
+        from vroidmocap.core.analysis import scan_ranges
+        r = scan_ranges(1000, 2, [101, 333, 500, 777], 4)
+        self.assertEqual(r[0][0], 0)
+        self.assertEqual(r[-1][1], 1000)
+        for (a, b), (c, d) in zip(r, r[1:]):
+            self.assertEqual(b, c)
+        for a, _ in r[1:]:
+            self.assertEqual(a % 2, 0)
+            self.assertTrue(any(a - 2 < c <= a for c in (101, 333, 500, 777)))
+        self.assertEqual(scan_ranges(1000, 2, [], 4), [(0, 1000)])
+        self.assertEqual(scan_ranges(1000, 2, [500], 1), [(0, 1000)])
+
+    def test_merge_makes_track_ids_unique(self):
+        from vroidmocap.core.analysis import merge_scans, Track
+        def part(start, n):
+            ts = []
+            for _ in range(n):
+                t = Track(0)
+                t.id = 0 if not ts else ts[-1].id + 1  # (ids repeat across parts, as in separate processes)
+                t.frames = [start]
+                ts.append(t)
+            return {"start": start, "frame_ids": [start], "H_rel": [None], "H_ok": [False], "H_ids": [None],
+                    "shot_starts": [start], "tracks": ts, "thumbs": {t.id: (1.0, None, start) for t in ts}}
+        sc = merge_scans([part(10, 2), part(0, 3)], 2, 20, [10])
+        ids = [t.id for t in sc["tracks"]]
+        self.assertEqual(sorted(ids), list(range(5)))
+        self.assertEqual(sc["frame_ids"], [0, 10])
+        self.assertEqual(sc["shot_starts"], [0, 10])
+        self.assertEqual(sorted(sc["thumbs"]), list(range(5)))
