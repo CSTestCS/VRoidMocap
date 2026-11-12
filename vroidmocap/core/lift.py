@@ -384,7 +384,10 @@ def _prepare(P0, uv, conf, segments, fps, z_extra, torso, z_extra_w):
     if z_extra is not None:
         ze = z_extra[:, idx]
         has = np.isfinite(ze)
-        zrel = np.where(has, (1 - z_extra_w) * zrel + z_extra_w * np.nan_to_num(ze), zrel)
+        w_ = np.asarray(z_extra_w, np.float64)
+        if w_.ndim:  # per joint (33,) or per frame and joint (N,33)
+            w_ = w_[..., idx]
+        zrel = np.where(has, (1 - w_) * zrel + w_ * np.nan_to_num(ze), zrel)
     for s, e in segments:
         if e - s >= 3:
             zrel[s:e] = gaussian_smooth(zrel[s:e], 1.5 * fps / 30.0)
