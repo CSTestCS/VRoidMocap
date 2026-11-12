@@ -67,6 +67,7 @@ WB_SCORE_REF = 0.78  # its median body score on real people and usual 3D avatars
 WB_SCORE_MAX_GAIN = 1.5
 WB_SCORE_FLOOR = 0.35  # scores below this are guesses: not boosted
 WB_EDGE_FRAC = 0.05
+MP_VOUCH_TOL = 0.0  # MediaPipe's "visible" counts for a limb joint the whole-body model is unsure of only when both put it within this fraction of the limb's length (0 = always counts)
 BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 LIFT_W = 0.75  # weight of the depth read from the motion over time (vs the pose model's own)
 
@@ -581,6 +582,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     wb2d, wbs = capture.get("wb2d"), capture.get("wbs")
     wbz = capture["wbz"].astype(np.float64).copy() if "wbz" in capture else None
     uv, conf, wb_sync = body_keypoints(lm2d, vis, wb2d, wbs, valid, None, W, H, return_wb=True)
+    if MP_VOUCH_TOL > 0 and wb_sync is not None:
+        vis = vouched_visibility(vis, lm2d, wb_sync, valid)
     face_score = face_visibility(wbs, N)
     # depth from the motion over time (before and after each frame): a second
     # opinion on which way the body faces and each limb points
@@ -1703,6 +1706,33 @@ def joint_seen(uv, conf, valid, W, H, fps, shot_of, hidden=None, weak=None, both
             if shot_of[a] == shot_of[b] and (inside[a:b, j] & valid[a:b]).all():
                 col[a:b] = True
     return np.stack([_min_run(s[:, j], fps, shot_of) for j in range(s.shape[1])], 1)
+
+
+def vouched_visibility(vis, lm2d, wb_sync, valid, tol=None, lo=0.35, hi=0.6):
+    """MediaPipe calls a joint visible even where cloth (a skirt over the
+    knees) or the body hides it, and says so with high confidence; measured on
+    rendered ground truth, where the whole-body model is unsure of a limb joint
+    (score lo..hi) and MediaPipe calls it visible, both readings are wrong (more
+    than 30% of a limb length off) in 30-80% of frames. There MediaPipe's
+    visibility only counts when the two models put the joint in the same place;
+    otherwise it is lowered below the "seen" level, so the joint is not taken as
+    clearly seen (it is bridged from the frames around it instead). Elbows,
+    wrists, knees and ankles."""
+    tol = MP_VOUCH_TOL if tol is None else tol
+    wb2d, wbs = wb_sync
+    vis = vis.copy()
+    sh = (lm2d[:, L_SH] + lm2d[:, R_SH]) / 2
+    hp = (lm2d[:, L_HIP] + lm2d[:, R_HIP]) / 2
+    torso = np.linalg.norm(sh - hp, axis=1)
+    # joint: its parent (for the limb length)
+    par = {L_EL: L_SH, R_EL: R_SH, L_WR: L_EL, R_WR: R_EL, L_KNEE: L_HIP, R_KNEE: R_HIP, L_ANK: L_KNEE, R_ANK: R_KNEE}
+    for j, pj in par.items():
+        w, wp = _WB_OF_MP[j], _WB_OF_MP[pj]
+        L = np.maximum(np.linalg.norm(wb2d[:, w] - wb2d[:, wp], axis=1), 0.3 * torso)
+        d = np.linalg.norm(wb2d[:, w] - lm2d[:, j], axis=1)
+        unsure = valid & (wbs[:, w] >= lo) & (wbs[:, w] < hi)
+        vis[:, j] = np.where(unsure & ~(d < tol * np.maximum(L, 1.0)), np.minimum(vis[:, j], 0.2), vis[:, j])
+    return vis
 
 
 def raw_scores(wb_sync, vis, W, H, N):
