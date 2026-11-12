@@ -28,7 +28,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 10
+ANALYSIS_VERSION = 11
 PARALLEL_SHOTS = True
 USE_PERSON_DETECTOR = True  # person boxes from the Human-Art detector (else the pose model's own)
 
@@ -1076,15 +1076,23 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, fr
             m = 0.02 * max(Wf, Hf)
             edge = (b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m)
             return float(edge.mean())
-        # the characters seen whole (not only in close-ups / partial views)
-        def mostly_partial(c):
-            return np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c]) >= 0.5
-        whole = [c for c in clusters if not mostly_partial(c) and seconds(c) >= GLIMPSE_S]
-        thr = PARTIAL_THRESHOLD_ALONE if len(whole) == 1 else PARTIAL_THRESHOLD
+        # the characters seen whole for a while (the box clear of the picture's
+        # edges for at least GLIMPSE_S): any other cluster could only be them
+        def seconds_whole(c):
+            m = 0.02 * max(Wf, Hf)
+            n = 0
+            for i in c:
+                b = np.asarray(tracklets[i].boxes, np.float64)
+                fr = np.asarray(tracklets[i].frames)
+                step = float(np.median(np.diff(fr))) if len(fr) > 1 else 1.0
+                n += step * int((~((b[:, 0] < m) | (b[:, 1] < m) | (b[:, 2] > Wf - m) | (b[:, 3] > Hf - m))).sum())
+            return n / fps
         changed = True
         while changed:
             changed = False
             clusters.sort(key=seconds, reverse=True)
+            whole = [c for c in clusters if seconds_whole(c) >= GLIMPSE_S]
+            thr = PARTIAL_THRESHOLD_ALONE if len(whole) == 1 else PARTIAL_THRESHOLD
             for c in clusters[1:]:
                 pw = np.average([partial(i) for i in c], weights=[len(tracklets[i].frames) for i in c])
                 if pw < 0.5:
@@ -1093,7 +1101,7 @@ def cluster_identities(tracklets, fps, threshold=0.42, glimpse_threshold=0.6, fr
                 if not cands:
                     continue
                 d, o = min(((min(Dm[i, j] for i in c for j in o_), o_) for o_ in cands), key=lambda x: x[0])
-                if d < (thr if o in whole else PARTIAL_THRESHOLD):
+                if d < (thr if any(o is w for w in whole) else PARTIAL_THRESHOLD):
                     o.extend(c)
                     clusters = [x for x in clusters if x is not c]
                     changed = True

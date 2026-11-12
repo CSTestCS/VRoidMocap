@@ -855,6 +855,40 @@ class Identities(unittest.TestCase):
         chars2, _ = cluster_identities(full + [close], 30.0)
         self.assertGreaterEqual(len(chars2), 1)
 
+    def _dist(self, ea, ha, eb, hb):
+        # the clustering's appearance distance (embedding + part histograms)
+        from vroidmocap.core.mathutil import normalize
+        de = 1 - float(np.dot(normalize(ea), normalize(eb)))
+        ds = []
+        for p in range(3):
+            x, y = ha[p * 68:(p + 1) * 68], hb[p * 68:(p + 1) * 68]
+            bc = np.sum(np.sqrt(x * y)) / max(np.sqrt(x.sum() * y.sum()), 1e-9)
+            ds.append(np.sqrt(max(0.0, 1 - bc)))
+        return 0.45 * min(1.0, de * 2.0) + 0.55 * float(np.average(ds, weights=[1.4, 1.0, 0.8]))
+
+    def test_unlike_close_up_joins_only_when_nobody_else_is_seen(self):
+        from vroidmocap.core.analysis import cluster_identities, PARTIAL_THRESHOLD, PARTIAL_THRESHOLD_ALONE
+        rng = np.random.default_rng(3)
+        e0 = rng.normal(size=16); h0 = np.abs(rng.normal(size=204))
+        # a close-up that looks only fairly like her (between the two limits)
+        for k in range(200):
+            e1 = e0 + rng.uniform(0.3, 2.0) * rng.normal(size=16)
+            h1 = h0 * np.abs(1 + rng.uniform(0.3, 1.5) * rng.normal(size=204))
+            d = self._dist(e0, h0, e1, h1)
+            if PARTIAL_THRESHOLD + 0.03 < d < PARTIAL_THRESHOLD_ALONE - 0.03:
+                break
+        else:
+            self.fail("no test appearance in range")
+        full = [self._track(i, i, range(i * 100, i * 100 + 90), [700, 100, 1100, 1000], e0, h0) for i in range(4)]
+        close = self._track(9, 9, range(900, 960), [300, 0, 1500, 1080], e1, h1)
+        chars, _ = cluster_identities(full + [close], 30.0, frame_size=(1920, 1080))
+        self.assertEqual(len(chars), 1)
+        # a second person, seen whole (at the same time as her, looking unlike both): the close-up could be either
+        e2 = rng.normal(size=16); h2 = np.abs(rng.normal(size=204)) ** 3
+        other = [self._track(20 + i, i, range(i * 100, i * 100 + 90), [1300, 100, 1700, 1000], e2, h2) for i in range(4)]
+        chars2, _ = cluster_identities(full + other + [close], 30.0, frame_size=(1920, 1080))
+        self.assertEqual(len(chars2), 3)
+
     def test_detector_tracks_count_as_people(self):
         from types import SimpleNamespace
         from vroidmocap.core.analysis import is_human_track
