@@ -1035,3 +1035,22 @@ class ShotLink(unittest.TestCase):
         yaw, tilt = yaw_from_link(R_a, R_link, A_b)
         self.assertAlmostEqual(yaw, off_b, places=6)
         self.assertLess(tilt, 1e-4)
+
+
+class FacingMarks(unittest.TestCase):
+    def test_marks_cover_the_shot_between_cuts(self):
+        import tempfile, json as js
+        from vroidmocap.server import AppState
+        from vroidmocap.core.retarget import load_facing_hints
+        st = AppState()
+        st.workdir = tempfile.mkdtemp()
+        st.analysis = {"frames": 300, "cuts": [80, 156, 203], "shots": [{"start": 0}, {"start": 40}, {"start": 80}]}
+        r = st.set_facing(0, 120, "back")
+        self.assertEqual(r["shot"], (80, 156) if isinstance(r["shot"], tuple) else [80, 156])
+        st.set_facing(0, 230, "front")
+        st.set_facing(0, 10, "front")
+        st.set_facing(0, 10, "auto")
+        h = st.facing_hints(0)["hints"]
+        self.assertEqual([(x["start"], x["end"], x["facing"]) for x in h], [(80, 156, "back"), (203, 300, "front")])
+        v = load_facing_hints(st.workdir, 0, 300)
+        self.assertTrue(np.all(v[80:156] == -1) and np.all(v[203:] == 1) and np.isnan(v[:80]).all() and np.isnan(v[156:203]).all())

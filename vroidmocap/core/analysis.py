@@ -605,6 +605,7 @@ class Analyzer:
 
     def _finish(self, t_start, N, fps, W, H, stride, sc):
         self.progress(0.91, "Solving cameras and identities")
+        self._cut_frames = sorted(int(c) for c in sc.get("cuts", []))
         merged = set(sc["shot_starts"]) | {0}
         # where camera tracking failed inside a shot (heavy blur, fast snap), the
         # camera orientation is re-established afterwards: start a new shot there
@@ -898,6 +899,7 @@ class Analyzer:
             "characters": characters,
             "tracklets": [{"id": t.id, "shot": t.shot, "start": int(t.frames[0]), "end": int(t.frames[-1]),
                            "character": char_of_track.get(t.id)} for t in tracklets],
+            "cuts": getattr(self, "_cut_frames", []),  # the video's own cuts (the shots above also split where the camera tracking restarts)
             "camera_columns": ["yaw_deg", "pitch_deg", "roll_deg", "vfov_deg", "zoom", "shot"],
             "camera": cam_rows,
         }

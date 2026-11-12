@@ -304,6 +304,45 @@ class AppState:
                 "defaults": {c: keys.default_value(c) for c in chans},
                 "ranges": {"curl": list(keys.CURL_RANGE), "splay": list(keys.SPLAY_RANGE), "expr": [0, 100]}}
 
+    def _facing_path(self, char_id):
+        return os.path.join(self.workdir, f"facing_hints_c{char_id}.json")
+
+    def facing_hints(self, char_id):
+        p = self._facing_path(char_id)
+        hints = []
+        if os.path.exists(p):
+            try:
+                with open(p) as fh:
+                    hints = json.load(fh)
+            except (OSError, ValueError):
+                hints = []
+        return {"hints": hints}
+
+    def shot_bounds(self, frame):
+        """[start, end) of the shot (between the video's cuts) holding frame."""
+        A = self.analysis
+        N = int(A["frames"])
+        cuts = A.get("cuts") or [s["start"] for s in A["shots"]]
+        b = sorted({0, N, *[int(c) for c in cuts if 0 < int(c) < N]})
+        frame = max(0, min(N - 1, int(frame)))
+        i = max(k for k in range(len(b) - 1) if b[k] <= frame)
+        return b[i], b[i + 1]
+
+    def set_facing(self, char_id, frame, facing):
+        """Front / back (or auto) for the shot holding `frame` (video frames)."""
+        if self.analysis is None:
+            raise ValueError("Analyse the video first")
+        if facing not in ("front", "back", "auto"):
+            raise ValueError("facing must be front, back or auto")
+        a, b = self.shot_bounds(frame)
+        hints = [h for h in self.facing_hints(char_id)["hints"] if h["end"] <= a or h["start"] >= b]
+        if facing != "auto":
+            hints.append({"start": a, "end": b, "facing": facing})
+        hints.sort(key=lambda h: h["start"])
+        with open(self._facing_path(char_id), "w") as fh:
+            json.dump(hints, fh)
+        return {"hints": hints, "shot": [a, b]}
+
     def save_keys(self, char_id, channels):
         from .core import keys
         return keys.save_keys(self.workdir, char_id, channels)
@@ -451,6 +490,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, blob, "application/octet-stream")
             if p.startswith("/api/keys/"):
                 return self._send(200, STATE.keys_info(int(p.split("/")[3])))
+            if p.startswith("/api/facing/"):
+                return self._send(200, STATE.facing_hints(int(p.split("/")[3])))
             if p == "/api/export.fbx":
                 cid = int(q["character"])
                 fd, tmp = tempfile.mkstemp(suffix=".fbx")
@@ -513,6 +554,8 @@ class Handler(BaseHTTPRequestHandler):
                              int(body.get("fps", 30)), bool(body.get("model", True)),
                              start=body.get("start"), end=body.get("end"))
                 return self._send(200, {"ok": True, "path": path})
+            if p.startswith("/api/facing/"):
+                return self._send(200, STATE.set_facing(int(p.split("/")[3]), int(body["frame"]), str(body["facing"])))
             if p.startswith("/api/keys/"):
                 ch = STATE.save_keys(int(p.split("/")[3]), body.get("channels", {}))
                 return self._send(200, {"ok": True, "channels": ch})

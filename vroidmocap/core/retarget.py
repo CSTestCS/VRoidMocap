@@ -40,7 +40,7 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 22
+SOLVE_VERSION = 23
 FINGERS_FROM_VIDEO = False  # fingers are set by hand afterwards (keys.py); the solve leaves them at rest
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
 HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
@@ -69,9 +69,12 @@ WB_SCORE_FLOOR = 0.35  # scores below this are guesses: not boosted
 WB_EDGE_FRAC = 0.05
 BRIDGE_ANY = True  # frames without a MediaPipe reading are kept when the whole-body model sees the person
 CLOSEUP_GAIN = 1.0  # legs running out of the picture (close-ups): hip and knee scores scaled by this (1 = off)
+CLOSEUP_HINT_GAIN = 1.35  # ... in shots whose facing the user set (the facing is then known)
 CLOSEUP_GAIN_FLOOR = 0.45  # ... from this score up
 CLOSEUP_FRONT_VOTE = False  # close-ups: front/back voted over half a second from the hips' left/right labels
 CLOSEUP_VOTE_S = 0.5
+CLOSEUP_PELVIS = "hinted"  # close-ups (no shoulders): the pelvis from the hips + gravity, not held ("hinted" shots only, "all", "off")
+HINT_STRENGTH = 3.0  # a front/back the user set for a shot: weight against what the picture shows (x W_FRONT)
 CARRY_FACING = False  # close-ups: her facing carried over from the surrounding shots (cameras placed by the background)
 CARRY_MAX_S = 5.0  # ... from clear sightings at most this far away
 CLOSEUP_FACING = False  # close-ups without shoulders or feet: facing from the hips' labels and the knees, not the learned 3D
@@ -498,6 +501,46 @@ def closeup_frames(wbs, unsure=0.45, mid=0.35):
     return (s[:, 15:17].max(1) < unsure) & (s[:, 11:15].max(1) >= mid)
 
 
+def upright_uv(uv, mask, shots, shot_of):
+    """uv with the shoulders put straight above the hips (along the camera's
+    'up' from the scenery) in the frames of mask: in a close-up of the hips
+    the shoulders are guesses outside the picture, and 'up' and the sideways
+    axis in the picture (which the facing angle is measured against) must not
+    come from them."""
+    if mask is None or not np.any(mask):
+        return uv
+    out = uv.copy()
+    for f in np.where(mask)[0]:
+        up3 = shots[shot_of[f]]["align"].T @ np.array([0, 1.0, 0])
+        u2 = up3[:2] / max(np.linalg.norm(up3[:2]), 1e-6)
+        d = max(float(np.linalg.norm(uv[f, L_HIP] - uv[f, R_HIP])), 10.0)
+        out[f, L_SH] = uv[f, L_HIP] + u2 * 2.5 * d
+        out[f, R_SH] = uv[f, R_HIP] + u2 * 2.5 * d
+    return out
+
+
+def load_facing_hints(workdir, char_id, N):
+    """(N,) front/back the user set per shot in the editor: +1 facing the
+    camera, -1 turned away, nan = not set (facing_hints_c<id>.json: a list of
+    {"start", "end", "facing": "front"|"back"})."""
+    out = np.full(N, np.nan)
+    path = os.path.join(workdir, f"facing_hints_c{char_id}.json")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as fh:
+            hints = json.load(fh)
+    except (OSError, ValueError):
+        return out
+    for h in hints:
+        v = {"front": 1.0, "back": -1.0}.get(h.get("facing"))
+        if v is None:
+            continue
+        a, b = max(0, int(h["start"])), min(N, int(h["end"]))
+        out[a:b] = v
+    return out
+
+
 def closeup_front_vote(wb_sync, valid, shot_of, fps, min_vote=0.3):
     """(N,) in close-ups of the hips and thighs (no shoulders, no feet): +1..
     facing the camera, -1.. turned away, nan elsewhere. The whole-body model's
@@ -582,7 +625,7 @@ def carried_facing(psi, bad, valid, uv, wbs, focal, cx, cy, shot_of, shots, npz,
     return out
 
 
-def closeup_scores(capture, W, H):
+def closeup_scores(capture, W, H, extra=None):
     """Measured on rendered ground truth (close-ups of the waist to the knees,
     and every other benchmark): where the legs run out of the picture, a
     thigh whose hip and knee the whole-body model scores 0.45-0.6 points the
@@ -590,10 +633,12 @@ def closeup_scores(capture, W, H):
     such scores are below the "seen" level, so close-up legs were not
     animated. There the hips and knees in the picture scored from
     CLOSEUP_GAIN_FLOOR up are scaled by CLOSEUP_GAIN."""
-    if CLOSEUP_GAIN <= 1.0 or capture.get("wbs") is None:
+    on = np.ones(len(capture["wbs"]), bool) if CLOSEUP_GAIN > 1.0 else (extra if extra is not None else None)
+    if on is None or not np.any(on) or capture.get("wbs") is None:
         return capture
+    gain = CLOSEUP_GAIN if CLOSEUP_GAIN > 1.0 else CLOSEUP_HINT_GAIN
     wb2d = np.asarray(capture["wb2d"], np.float64)
-    cu = closeup_frames(capture["wbs"])
+    cu = closeup_frames(capture["wbs"]) & on
     if not cu.any():
         return capture
     out = dict(capture)
@@ -602,7 +647,7 @@ def closeup_scores(capture, W, H):
         p = wb2d[:, j]
         inside = (p[:, 0] > 0) & (p[:, 0] < W) & (p[:, 1] > 0) & (p[:, 1] < H)
         b = cu & inside & (w2[:, j] >= CLOSEUP_GAIN_FLOOR)
-        w2[b, j] = np.minimum(w2[b, j] * CLOSEUP_GAIN, 0.99)
+        w2[b, j] = np.minimum(w2[b, j] * gain, 0.99)
     out["wbs"] = w2.astype(np.asarray(capture["wbs"]).dtype)
     return out
 
@@ -623,7 +668,9 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         s["align"] = npz["shot_align"][i]
 
     capture = calibrate_scores(capture, W, H)
-    capture = closeup_scores(capture, W, H)
+    hint = load_facing_hints(workdir, char_id, N)
+    hinted = np.isfinite(hint)
+    capture = closeup_scores(capture, W, H, extra=hinted)
     lm2d = capture["lm2d"].astype(np.float64)
     vis = capture["vis"].astype(np.float64)
     world = capture["world"].astype(np.float64)
@@ -655,14 +702,15 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # sure readings come one frame at a time): a stretch of fairly sure frames
     # that runs into a sure one is usable throughout
     wb_ok = n_wb >= 4
-    if wbs_c is not None and np.any(wbs_c) and CLOSEUP_GAIN > 1.0:
+    if wbs_c is not None and np.any(wbs_c) and (CLOSEUP_GAIN > 1.0 or hinted.any()):
         # a close-up shows the hips and knees only: one leg read surely (its hip
         # and knee) is enough to use the frame
         s_ = np.asarray(wbs_c, np.float64)
-        cu_ = closeup_frames(s_)
+        cu_ = closeup_frames(s_) & (hinted | (CLOSEUP_GAIN > 1.0))
         wb_ok |= cu_ & (((s_[:, 11] >= 0.6) & (s_[:, 13] >= 0.6)) | ((s_[:, 12] >= 0.6) & (s_[:, 14] >= 0.6)))
-    if WB_ONLY_WEAK:
-        for a_, b_ in runs(capture["tracked"] & (n_wb_weak >= 4), shot_of):
+    weak_on = np.full(N, WB_ONLY_WEAK) | hinted
+    if weak_on.any():
+        for a_, b_ in runs(capture["tracked"] & (n_wb_weak >= 4) & weak_on, shot_of):
             if wb_ok[a_:b_].any():
                 wb_ok[a_:b_] = True
     has_mp = np.abs(world).sum((1, 2)) > 0
@@ -738,6 +786,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             Ylift = None
     W_lift = lifter.as_mediapipe(Ylift) if Ylift is not None else None
     Wc_f, W2_f, uv_f, conf_f = Wc, W_lift, uv, conf
+    cu_axes = np.zeros(N, bool)
+    if wb_sync is not None and (hinted.any() or CLOSEUP_PELVIS == "all"):
+        s_ = np.asarray(wb_sync[1], np.float64)
+        cu_axes = valid & closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45)
+        if CLOSEUP_PELVIS != "all":
+            cu_axes &= hinted
     if CLOSEUP_FACING and wb_sync is not None:
         # a close-up of the hips and thighs (no shoulders, no feet): the pose
         # model's 3D there is carried over from another moment and the motion
@@ -764,7 +818,10 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 uv_f[f, L_SH] = uv[f, L_HIP] + u2 * 2.5 * d
                 uv_f[f, R_SH] = uv[f, R_HIP] + u2 * 2.5 * d
                 conf_f[f, [L_SH, R_SH, NOSE]] = 0.0
+    uv_f = upright_uv(uv_f, cu_axes, shots, shot_of)
     front_v = closeup_front_vote(wb_sync, valid, shot_of, fps) if (CLOSEUP_FRONT_VOTE and wb_sync is not None) else None
+    if hinted.any():
+        front_v = np.where(hinted, hint * HINT_STRENGTH, front_v if front_v is not None else np.nan)
     dbg("front_vote", front_v if front_v is not None else np.full(N, np.nan))
     psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
                                                   shot_spans(valid, shot_of), fps, W2=W2_f, front=front_v)
@@ -778,7 +835,27 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
+    if hinted.any() and wb_sync is not None:
+        # close-ups whose facing the user set: which hip is which follows from
+        # the picture (facing the camera, her left hip is on the picture's
+        # right); the shoulders that otherwise settle it are guesses here
+        s_ = np.asarray(wb_sync[1], np.float64)
+        cu_h = hinted & valid & closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45) & np.isfinite(psi_p)
+        lat_px = uv[:, L_HIP, 0] - uv[:, R_HIP, 0]
+        clear = np.abs(lat_px) > 0.04 * W
+        fr = np.cos(np.nan_to_num(psi_p))
+        set_ = cu_h & clear & (np.abs(fr) > 0.3)
+        swap = np.where(set_, (lat_px > 0) != (fr > 0), swap)
     psi_c[bad] = psi_p[bad] = np.nan
+    # close-ups of the hips and thighs whose facing is known: the pelvis is
+    # set from the hips (and gravity), not held from an earlier shot
+    cu_pelvis = np.zeros(N, bool)
+    if CLOSEUP_PELVIS != "off" and wb_sync is not None:
+        s_ = np.asarray(wb_sync[1], np.float64)
+        cu_pelvis = valid & closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45) & np.isfinite(psi_p)
+        if CLOSEUP_PELVIS == "hinted":
+            cu_pelvis &= hinted
+    dbg("cu_pelvis", cu_pelvis)
     for arr in (Wc, lm2d, vis, uv, conf, vis_raw) + ((seg,) if seg is not None else ()):
         arr[swap] = arr[swap][:, LR_PERM]
     for arr in (h2d, hw, hs, hc):
@@ -792,7 +869,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # (its usual mistake in back views, psi -> pi - psi, or a plain depth mirror,
     # psi -> -psi) its depths are reversed: mirror them. Face and hand points
     # ride along with it.
-    r3, view = facing.lateral_axes(uv, focal, cx, cy)
+    r3, view = facing.lateral_axes(upright_uv(uv, cu_axes, shots, shot_of), focal, cx, cy)
     lp_c, _ = facing.learned_psi(Wc, view, r3[:, :2])
     pc0 = np.nan_to_num(psi_c)
     mirror = valid & (np.cos(np.pi - lp_c - pc0) > np.cos(lp_c - pc0))
@@ -826,8 +903,14 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # animation knows the character's proportions from its first frame
     progress(0.04, "Measuring the character's proportions (whole video)")
     torso_facing = (psi_c, psi_p, r3, view)
+    # (the bone lengths leave the close-ups of the hips out: little of the body
+    # and no depth worth the name; the distance is still read everywhere)
     L_prop, zroot_prop = lift.measure_proportions(np.nan_to_num(P0), uv, conf, focal, segs, fps, z_extra=z_extra,
                                                   torso=torso_facing, z_extra_w=lift_w)
+    if cu_axes.any():
+        L_full, _ = lift.measure_proportions(np.nan_to_num(P0), uv, conf, focal, runs(valid & ~cu_axes, shot_of), fps,
+                                             z_extra=z_extra, torso=torso_facing, z_extra_w=lift_w)
+        L_prop = np.where(np.isfinite(L_full), L_full, L_prop)
     proportions = proportion_report(L_prop)
     try:
         with open(os.path.join(workdir, f"proportions_c{char_id}.json"), "w") as fh:
@@ -1041,6 +1124,35 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             solver.reset_continuity()
         prev_f = f
         J = {k: Pw[f, i] for k, i in names.items()}
+        if cu_pelvis[f]:
+            # the hips' line from the tracked facing (in such a close-up the
+            # surest thing known about the pelvis), around their centre; the
+            # shoulders are guesses outside the picture: an upright torso
+            mid = (J["hipL"] + J["hipR"]) / 2
+            wdt = max(float(np.linalg.norm(J["hipL"] - J["hipR"])), 0.1)
+            ax_c = np.cos(psi_p[f]) * r3[f] + np.sin(psi_p[f]) * view[f]  # right -> left hip, camera
+            ax_w = R_w[f] @ ax_c
+            ax_w[1] = 0.0
+            ax_w = ax_w / max(np.linalg.norm(ax_w), 1e-6)
+            J["hipL"], J["hipR"] = mid + 0.5 * wdt * ax_w, mid - 0.5 * wdt * ax_w
+            # a thigh pointing into or out of the picture could go either way in
+            # depth; with the facing known the knee goes in front of the body
+            # (a hip bends forward far more than back)
+            fwd_c = np.sin(psi_p[f]) * r3[f] - np.cos(psi_p[f]) * view[f]
+            for hk, kk, ak in (("hipL", "knL", "anL"), ("hipR", "knR", "anR")):
+                hip_c, kn_c = P[f, names[hk]], P[f, names[kk]]
+                t_c = kn_c - hip_c
+                ln = np.linalg.norm(t_c)
+                if not np.isfinite(ln) or ln < 1e-6 or abs(t_c[2]) / ln < 0.3:
+                    continue
+                if np.dot(t_c, fwd_c) < 0:
+                    t_m = t_c * np.array([1, 1, -1.0])
+                    if np.dot(t_m, fwd_c) > 0:
+                        d_w = R_w[f] @ (t_m - t_c)
+                        J[kk] = J[kk] + d_w
+                        J[ak] = J[ak] + d_w
+            up_w = np.array([0, 0.45, 0])
+            J["shL"], J["shR"] = J["hipL"] + up_w, J["hipR"] + up_w
         hands = []
         for side in (0, 1):
             if hvalid[f, side] and np.isfinite(Phw[f, side]).all():
@@ -1110,7 +1222,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     mp_in = (mp2d[..., 0] > 2) & (mp2d[..., 0] < W - 2) & (mp2d[..., 1] > 2) & (mp2d[..., 1] < H - 2)
     edge_ok = mp_in & (vis >= 0.5) & (raw >= 0.6)
     js = joint_seen(lm2d, np.maximum(raw - 0.1, vis), valid & ~bad, W, H, fps, shot_of, hidden,
-                    weak=(vis >= 0.3) | ((raw >= 0.4) & ((vis >= 0.1) | (bridged[:, None] & WB_ONLY_WEAK))),
+                    weak=(vis >= 0.3) | ((raw >= 0.4) & ((vis >= 0.1) | (bridged & (WB_ONLY_WEAK | hinted))[:, None])),
                     both=((raw >= 0.45) & (vis >= 0.25)) | trk_ok, edge_ok=edge_ok)
     dbg("js", js)
     dbg("raw", raw)
@@ -1128,6 +1240,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if face_seen is not None and skel.has("head"):
         conf[:, skel.bones.index("head")] = np.where(face_seen, 0.5 + 0.5 * face_q, 0.0)
     conf = np.where(seen, np.maximum(conf, 0.55), 0.0)
+    if cu_pelvis.any() and skel.has("hips"):
+        seen[:, skel.bones.index("hips")] |= cu_pelvis & js[:, L_HIP] & js[:, R_HIP]
     dbg("seen", seen)
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)

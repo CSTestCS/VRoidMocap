@@ -260,6 +260,7 @@ async function openAnimation(cid) {
     $("steps").children[2].disabled = false;
     $("steps").children[3].disabled = false;
     await loadKeys(cid);
+    await loadFacing(cid);
     const c = S.analysis.characters.find((x) => x.id === cid);
     $("viewerChar").textContent = c ? c.name : "";
     $("scrub").max = meta.frames - 1;
@@ -272,6 +273,38 @@ async function openAnimation(cid) {
     seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
+// ------------------------------------------------------------------ facing per shot (close-ups)
+const F = { hints: [], dirty: false };
+async function loadFacing(cid) {
+  try { F.hints = (await api(`/api/facing/${cid}`)).hints || []; } catch (e) { F.hints = []; }
+  F.dirty = false;
+  $("facingApply").disabled = true;
+  refreshFacing();
+}
+function facingAt(src) {
+  const h = F.hints.find((x) => x.start <= src && src < x.end);
+  return h ? h.facing : "auto";
+}
+function refreshFacing() {
+  if (!S.anim) return;
+  const cur = facingAt(S.anim.src[S.frame]);
+  document.querySelectorAll("#facingSeg button").forEach((b) => b.classList.toggle("active", b.dataset.facing === cur));
+  const n = F.hints.length;
+  $("facingInfo").textContent = (n ? `${n} shot${n > 1 ? "s" : ""} set` : "") + (F.dirty ? " · changed: apply to re-solve" : "");
+}
+document.querySelectorAll("#facingSeg button").forEach((b) => (b.onclick = async () => {
+  if (S.character == null || !S.anim) return;
+  try {
+    const r = await api(`/api/facing/${S.character}`, { frame: S.anim.src[S.frame], facing: b.dataset.facing });
+    F.hints = r.hints || [];
+    F.dirty = true;
+    $("facingApply").disabled = false;
+    refreshFacing();
+    drawTrack();
+  } catch (e) { toast(e.message, true); }
+}));
+$("facingApply").onclick = () => { if (S.character != null) startCapture(S.character); };
+
 // ------------------------------------------------------------------ step 4: fingers & face keys
 const K = { channels: {}, rig: [], expressions: [], defaults: {}, tab: "hands", saveTimer: null, cid: null };
 const FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Little"];
@@ -487,6 +520,7 @@ function seek(f) {
   if (S.layout !== "3d") loadFrameImage(f);
   else sizeLm();
   refreshKeyPanel();
+  refreshFacing();
 }
 $("scrub").oninput = (e) => { S.playing = false; updatePlay(); seek(Number(e.target.value)); };
 $("stepBack").onclick = () => { S.playing = false; updatePlay(); seek(S.frame - 1); };
@@ -609,6 +643,10 @@ function drawTrack() {
     const h = (A.hs[f * 2] >= 0.5) + (A.hs[f * 2 + 1] >= 0.5);
     ctx.fillStyle = ["#2a2f36", "#7b5a2a", "#c98a3a"][h];
     ctx.fillRect(x, 10, 1, 6);
+    if (F.hints.length && A.src) {  // shots whose facing was set: blue = front, purple = back
+      const fc = facingAt(A.src[f]);
+      if (fc !== "auto") { ctx.fillStyle = fc === "front" ? "#5aa9e6" : "#a77be6"; ctx.fillRect(x, 16, 1, 2); }
+    }
   }
   if (K.cid === S.character) {  // hand-set keys: amber ticks (bright in step 4)
     ctx.fillStyle = $("keyPanel").hidden ? "rgba(246,173,85,.45)" : "#f6ad55";

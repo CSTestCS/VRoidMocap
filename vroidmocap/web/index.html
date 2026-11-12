@@ -172,6 +172,14 @@
     </div>
     <div class="track"><canvas id="trackCanvas" height="18"></canvas></div>
     <div class="muted small" id="frameInfo"></div>
+    <div class="facingrow" title="In shots that show only part of her (the hips and thighs), which way she faces cannot be read from the picture. Set it here for the shot under the playhead; the whole shot (from cut to cut) takes it.">
+      <span class="small">She faces, in this shot:</span>
+      <div class="seg" id="facingSeg">
+        <button data-facing="auto" class="active">Auto</button><button data-facing="front">Front (towards the camera)</button><button data-facing="back">Back (away)</button>
+      </div>
+      <button id="facingApply" class="small" disabled>Apply (re-solve)</button>
+      <span class="muted small" id="facingInfo"></span>
+    </div>
     <div class="muted small" id="propInfo"></div>
   </section>
 </main>

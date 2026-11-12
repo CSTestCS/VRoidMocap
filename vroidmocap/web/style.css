@@ -113,3 +113,6 @@ dialog .actions { justify-content: flex-end; margin: 6px 0 0; }
 .kp-help { margin: 4px 0 0; }
 body.keys-mode .stage.only3d #paneVideo, body.keys-mode .stage.overlay #paneVideo { display: none; }
 @media (max-width: 1100px) { .keypanel { width: 300px; } }
+
+.facingrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.facingrow .seg button { padding: 4px 9px; }
