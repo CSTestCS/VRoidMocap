@@ -40,7 +40,7 @@ from .vrm import FINGER_SEGS, FINGERS
 X, Y, Z = np.eye(3)
 # animations saved by an older solver are solved again (the capture is kept)
 log = logging.getLogger(__name__)
-SOLVE_VERSION = 23
+SOLVE_VERSION = 24
 FINGERS_FROM_VIDEO = False  # fingers are set by hand afterwards (keys.py); the solve leaves them at rest
 HAND_FROM_WB = True  # whole-body hand points where the hand model misses
 HAND_CONTACTS = True  # palms touching (each other, the head, a hip) kept on the avatar
@@ -59,6 +59,7 @@ HAND_PNP = True  # hand rotation from the avatar's rigid palm fitted to the pict
 HEAD_GAIN = (1.0, 1.0, 1.5)  # turn, nod, tilt of the head (relative to the chest) as read from the face, scaled
 STAND_HIPS = 0.95  # hips height (share of the rest height) when no foot is seen in a whole shot
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
+NECK_MAX_DEG = 90.0  # a face fit turned further than this from the chest is not used
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
 SEGMENT_BONES = True  # a limb bone is known from one joint + one tracker on it (or two trackers)
@@ -992,7 +993,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     fz = Rface[:, :, 2]
     yaw_h = np.arctan2(np.sum(fz * r3, 1), -np.sum(fz * view, 1))
     turned_away = ~np.isfinite(psi_c) | (np.cos(np.nan_to_num(psi_c)) < np.cos(np.radians(110)))
-    neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(75))
+    neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(NECK_MAX_DEG))
     face_q = np.where(turned_away | ~neck_ok, 0.0, face_q)
     if not HEAD_FACE_FIT:
         face_q = np.zeros_like(face_q)

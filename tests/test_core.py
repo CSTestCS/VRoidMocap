@@ -1080,3 +1080,20 @@ class RotateAnimation(unittest.TestCase):
         ya, yb = np.degrees(np.arctan2(fa[0], fa[2])), np.degrees(np.arctan2(fb[0], fb[2]))
         self.assertAlmostEqual(((yb - ya + 180) % 360) - 180, 75.0, places=4)
         self.assertTrue(np.allclose(b["quats"][:, 1:], a["quats"][:, 1:]))
+
+
+class HeadTurn(unittest.TestCase):
+    def test_saturated_face_turn_is_expanded(self):
+        from vroidmocap.core.head import calibrated_yaw
+        def face(y0, nod=0.1):
+            t = np.radians(y0)
+            fwd = np.array([np.sin(t), nod, -np.cos(t)]); fwd /= np.linalg.norm(fwd)
+            x = np.cross(np.array([0, -1.0, 0]), fwd); x /= np.linalg.norm(x)
+            return np.stack([x, np.cross(fwd, x), fwd], 1)
+        yaw = lambda R: np.degrees(np.arctan2(R[0, 2], -R[2, 2]))
+        self.assertAlmostEqual(yaw(calibrated_yaw(face(20))), 20 * 33 / 35, delta=0.5)   # small turns: about as fitted
+        self.assertGreater(yaw(calibrated_yaw(face(54))), 70)                            # a saturated 54 deg is ~73
+        self.assertLess(yaw(calibrated_yaw(face(-54))), -70)
+        R = calibrated_yaw(face(50, nod=0.3))
+        self.assertTrue(np.allclose(R.T @ R, np.eye(3), atol=1e-9))
+        self.assertAlmostEqual(R[1, 2], face(50, nod=0.3)[1, 2], places=9)               # the nod is kept

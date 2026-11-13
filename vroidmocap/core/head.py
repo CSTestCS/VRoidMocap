@@ -32,12 +32,56 @@ FACE_TEMPLATE = np.array([
     [2.187, 0.957, 10.600], [0.962, 0.727, 11.170], [0.000, 0.639, 11.537], [-0.962, 0.727, 11.170],
 ]) / 100.0
 
+# The whole-body model's face points saturate when the face turns towards
+# profile: they stay close to a frontal layout, so the fitted turn tops out
+# near 55 deg when the head is turned 90 deg. Measured on rendered ground truth
+# (heads turned up to 95 deg, two benchmarks, 1 075 frames): fitted turn ->
+# true turn (median), degrees from facing the camera. Below ~40 deg the fit is right.
+import os as _os
+YAW_CAL = _os.environ.get("VROIDMOCAP_YAW_CAL", "1") != "0"
+YAW_CAL_FIT = np.array([0.0, 35.0, 42.0, 46.0, 50.0, 54.0, 59.0, 66.0, 90.0])
+YAW_CAL_TRUE = np.array([0.0, 33.0, 39.0, 52.0, 62.0, 73.0, 86.0, 100.0, 120.0])
+
+
+def calibrated_yaw(R):
+    """Head rotation (cv camera frame) with its turn away from the camera
+    corrected by YAW_CAL; the nod and tilt are kept (the correction is a turn
+    about the camera's vertical)."""
+    fwd = R[:, 2]
+    yaw = np.degrees(np.arctan2(fwd[0], -fwd[2]))  # 0 = facing the camera, + = towards picture right
+    a = abs(yaw)
+    if a > 90:
+        return R
+    target = np.sign(yaw) * np.interp(a, YAW_CAL_FIT, YAW_CAL_TRUE)
+    d = np.radians(target - yaw)
+    c, s_ = np.cos(d), np.sin(d)
+    # turn about the camera's vertical (cv: y down) so that the yaw above grows by d
+    Ry = np.array([[c, 0, -s_], [0, 1, 0], [s_, 0, c]])
+    return Ry @ R
+
+
 # points used: jaw line, nose bridge / tip / base, eye corners, mouth corners
 USE = np.array([0, 2, 4, 6, 8, 10, 12, 14, 16, 27, 30, 31, 33, 35, 36, 39, 42, 45, 48, 54, 51, 57])
 FACE0 = 23  # first face point in the 133 whole-body points
 
 
-def head_from_face(wb2d, wbs, focal, cx, cy, valid, min_score=0.5):
+FACE_SCORE_REF = 0.88  # the face points' 90th-percentile score on real people and usual 3D avatars
+FACE_SCORE_MAX_GAIN = 1.4
+
+
+def face_score_gain(wbs, valid):
+    """Some drawn styles get lower face-point scores throughout (video 3: 0.73
+    at the 90th percentile vs 0.85-0.92): their scores are scaled so the
+    character's surest faces score as usual (at most FACE_SCORE_MAX_GAIN)."""
+    j = FACE0 + USE
+    fs = np.asarray(wbs, np.float64)[np.asarray(valid, bool)][:, j].mean(1)
+    fs = fs[fs > 0]
+    if len(fs) < 30:
+        return 1.0
+    return float(np.clip(FACE_SCORE_REF / max(np.percentile(fs, 90), 1e-3), 1.0, FACE_SCORE_MAX_GAIN))
+
+
+def head_from_face(wb2d, wbs, focal, cx, cy, valid, min_score=0.5, calibrate=True):
     """Returns (R (N,3,3) head rotation in the cv camera frame, quality (N,) 0..1;
     0 = no usable face)."""
     import cv2
@@ -46,10 +90,11 @@ def head_from_face(wb2d, wbs, focal, cx, cy, valid, min_score=0.5):
     qual = np.zeros(N)
     if wb2d is None or not np.any(wbs):
         return R, qual
+    gain = face_score_gain(wbs, valid) if calibrate else 1.0
     obj = FACE_TEMPLATE[USE]
     for f in np.where(valid)[0]:
         j = FACE0 + USE
-        sc = wbs[f, j]
+        sc = np.minimum(wbs[f, j] * gain, 0.99)
         ok = sc > min_score
         if ok.sum() < 8:
             continue
@@ -72,7 +117,7 @@ def head_from_face(wb2d, wbs, focal, cx, cy, valid, min_score=0.5):
         fwd = Rm[:, 2]
         if np.dot(fwd, tv[:, 0]) > 0.2 * np.linalg.norm(tv):
             continue
-        R[f] = Rm
+        R[f] = calibrated_yaw(Rm) if YAW_CAL else Rm
         qual[f] = float(np.clip(1.0 - err / 0.12, 0, 1) * np.clip((sc[ok].mean() - 0.55) / 0.3, 0, 1)
                         * np.clip((size - 12) / 25, 0, 1))
     return R, qual
