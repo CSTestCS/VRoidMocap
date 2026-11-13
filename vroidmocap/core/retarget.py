@@ -3087,6 +3087,32 @@ def resample_anim(anim, fps_out):
     return out
 
 
+def rotate_anim(anim, degrees):
+    """The whole animation turned about the world's vertical axis (through
+    the origin) by `degrees`: the character's path and facing and the video
+    camera together, so the view through the camera is unchanged."""
+    a = float(degrees)
+    if abs(a) < 1e-9:
+        return anim
+    t = np.radians(a)
+    c, s_ = np.cos(t), np.sin(t)
+    R = np.array([[c, 0, s_], [0, 1, 0], [-s_, 0, c]])
+    qy = np.array([0, np.sin(t / 2), 0, np.cos(t / 2)])
+    out = dict(anim)
+    out["root"] = (np.asarray(anim["root"], np.float64) @ R.T).astype(np.asarray(anim["root"]).dtype)
+    q = np.asarray(anim["quats"], np.float64).copy()
+    hi = list(anim["bones"]).index("hips")
+    q[:, hi] = _qmul(np.broadcast_to(qy, q[:, hi].shape), q[:, hi])
+    out["quats"] = q.astype(np.asarray(anim["quats"]).dtype)
+    if "cam_pos" in anim:
+        out["cam_pos"] = (np.asarray(anim["cam_pos"], np.float64) @ R.T).astype(np.asarray(anim["cam_pos"]).dtype)
+    if "cam_quat" in anim:
+        cq = np.asarray(anim["cam_quat"], np.float64)
+        out["cam_quat"] = _qmul(np.broadcast_to(qy, cq.shape), cq).astype(np.asarray(anim["cam_quat"]).dtype)
+    out["rotation_deg"] = a
+    return out
+
+
 def crop_anim(anim, start, end):
     """Frames start..end (inclusive) of an animation, as an animation of its own."""
     n = int(anim["frames"])

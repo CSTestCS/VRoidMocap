@@ -249,6 +249,7 @@ class AppState:
                  ("lm2d", a["lm2d"]), ("vis", a["vis"]), ("h2d", a["h2d"]), ("hs", a["hs"]),
                  ("shot_of", a["shot_of"].astype(np.float32))]
         meta = {k: a[k] for k in ("fps", "frames", "width", "height", "character", "bones", "scale", "src_fps")}
+        meta["rotation_deg"] = self.rotation(char_id)  # applied by the viewer (live), and by the export
         if "proportions" in a:
             meta["proportions"] = a["proportions"]
         if self.skel is not None and self.skel.version == "fbx":
@@ -271,7 +272,8 @@ class AppState:
         from .core.fbx_writer import export_animation_fbx
         from .core.retarget import crop_anim
         tex_dir = os.path.splitext(path)[0] + ".fbm" if (include_model and write_textures) else None
-        anim = self.with_keys(char_id, self.anim_at(char_id, fps))
+        from .core.retarget import rotate_anim
+        anim = rotate_anim(self.with_keys(char_id, self.anim_at(char_id, fps)), self.rotation(char_id))
         if start is not None and end is not None:
             anim = crop_anim(anim, int(start), int(end))
         if self.skel.version == "fbx":  # the FBX avatar's own file, with the animation added
@@ -342,6 +344,22 @@ class AppState:
         with open(self._facing_path(char_id), "w") as fh:
             json.dump(hints, fh)
         return {"hints": hints, "shot": [a, b]}
+
+    def rotation(self, char_id):
+        """The turn (degrees about the vertical) set for a character's animation in step 3."""
+        p = os.path.join(self.workdir, f"rotation_c{char_id}.json")
+        try:
+            with open(p) as fh:
+                return float(json.load(fh).get("degrees", 0.0))
+        except (OSError, ValueError, AttributeError):
+            return 0.0
+
+    def set_rotation(self, char_id, degrees):
+        d = float(degrees)
+        d = (d + 180.0) % 360.0 - 180.0
+        with open(os.path.join(self.workdir, f"rotation_c{char_id}.json"), "w") as fh:
+            json.dump({"degrees": d}, fh)
+        return d
 
     def save_keys(self, char_id, channels):
         from .core import keys
@@ -554,6 +572,8 @@ class Handler(BaseHTTPRequestHandler):
                              int(body.get("fps", 30)), bool(body.get("model", True)),
                              start=body.get("start"), end=body.get("end"))
                 return self._send(200, {"ok": True, "path": path})
+            if p.startswith("/api/rotation/"):
+                return self._send(200, {"degrees": STATE.set_rotation(int(p.split("/")[3]), body["degrees"])})
             if p.startswith("/api/facing/"):
                 return self._send(200, STATE.set_facing(int(p.split("/")[3]), int(body["frame"]), str(body["facing"])))
             if p.startswith("/api/keys/"):

@@ -112,6 +112,10 @@
       <label class="check" title="Output frame rate: the animation is resampled to exactly this rate (viewer playback and export)">Frame rate
         <select id="fpsSel"><option value="12">12 fps</option><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
       <div class="spacer"></div>
+      <label class="rot" title="Turn the whole animation (and the video camera with it) about the vertical, to line it up for export. Saved with the character; the export uses it.">Rotate
+        <input type="range" id="rotSlider" min="-180" max="180" step="1" value="0">
+        <input type="number" id="rotNum" min="-180" max="180" step="1" value="0">°
+        <button id="rotReset" class="ghost small" title="Back to 0°">0°</button></label>
       <span class="muted" id="viewerChar"></span>
       <button id="otherChar" class="ghost">Choose another character</button>
       <button id="exportBtn" class="primary">Export .fbx</button>

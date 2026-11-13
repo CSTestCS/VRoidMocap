@@ -116,3 +116,7 @@ body.keys-mode .stage.only3d #paneVideo, body.keys-mode .stage.overlay #paneVide
 
 .facingrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
 .facingrow .seg button { padding: 4px 9px; }
+
+.rot { display: inline-flex; align-items: center; gap: 6px; }
+.rot input[type=range] { width: 120px; }
+.rot input[type=number] { width: 56px; }

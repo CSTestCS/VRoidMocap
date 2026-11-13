@@ -250,6 +250,7 @@ async function openAnimation(cid) {
     const buf = await (await fetch(`/api/anim/${cid}/bin?fps=${fps}`)).arrayBuffer();
     S.viewer.setAnimation(meta, buf);
     S.anim = S.viewer.anim;
+    setRotation(meta.rotation_deg || 0, false);
     loadAudio();
     const pr = meta.proportions && meta.proportions.share_of_leg;
     const f2 = (v) => (v == null ? "–" : Number(v).toFixed(2));
@@ -273,6 +274,21 @@ async function openAnimation(cid) {
     seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
+// ------------------------------------------------------------------ rotate the whole animation
+let rotTimer = null;
+function setRotation(deg, save = true) {
+  deg = Math.max(-180, Math.min(180, Math.round(Number(deg) || 0)));
+  $("rotSlider").value = deg; $("rotNum").value = deg;
+  if (S.viewer) S.viewer.yaw = (deg * Math.PI) / 180;
+  if (save && S.character != null) {
+    clearTimeout(rotTimer);
+    rotTimer = setTimeout(() => api(`/api/rotation/${S.character}`, { degrees: deg }).catch((e) => toast("Rotation not saved: " + e.message, true)), 300);
+  }
+}
+$("rotSlider").oninput = (e) => setRotation(e.target.value);
+$("rotNum").onchange = (e) => setRotation(e.target.value);
+$("rotReset").onclick = () => setRotation(0);
+
 // ------------------------------------------------------------------ facing per shot (close-ups)
 const F = { hints: [], dirty: false };
 async function loadFacing(cid) {

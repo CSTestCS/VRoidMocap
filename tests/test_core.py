@@ -1054,3 +1054,29 @@ class FacingMarks(unittest.TestCase):
         self.assertEqual([(x["start"], x["end"], x["facing"]) for x in h], [(80, 156, "back"), (203, 300, "front")])
         v = load_facing_hints(st.workdir, 0, 300)
         self.assertTrue(np.all(v[80:156] == -1) and np.all(v[203:] == 1) and np.isnan(v[:80]).all() and np.isnan(v[156:203]).all())
+
+
+class RotateAnimation(unittest.TestCase):
+    def test_turn_keeps_the_camera_view(self):
+        from vroidmocap.core.retarget import rotate_anim, _qmul
+        from vroidmocap.core.mathutil import quat_to_mat
+        rng = np.random.default_rng(2)
+        n = 5
+        q = rng.normal(size=(n, 3, 4)); q /= np.linalg.norm(q, axis=-1, keepdims=True)
+        cq = rng.normal(size=(n, 4)); cq /= np.linalg.norm(cq, axis=-1, keepdims=True)
+        a = {"bones": ["hips", "spine", "head"], "quats": q, "root": rng.normal(size=(n, 3)),
+             "cam_pos": rng.normal(size=(n, 3)) * 3, "cam_quat": cq, "frames": n}
+        b = rotate_anim(a, 75)
+        for k in range(n):
+            # hips position and orientation seen from the camera: unchanged
+            Ra, Rb = quat_to_mat(a["cam_quat"][k:k + 1])[0], quat_to_mat(b["cam_quat"][k:k + 1])[0]
+            pa = Ra.T @ (a["root"][k] - a["cam_pos"][k]); pb = Rb.T @ (b["root"][k] - b["cam_pos"][k])
+            self.assertTrue(np.allclose(pa, pb, atol=1e-6))
+            Ha, Hb = quat_to_mat(a["quats"][k, :1])[0], quat_to_mat(b["quats"][k, :1])[0]
+            self.assertTrue(np.allclose(Ra.T @ Ha, Rb.T @ Hb, atol=1e-6))
+        # ... and the facing in the scene turned by 75 deg about the vertical
+        Hb = quat_to_mat(b["quats"][0, :1])[0]; Ha = quat_to_mat(a["quats"][0, :1])[0]
+        fa, fb = Ha[:, 2], Hb[:, 2]
+        ya, yb = np.degrees(np.arctan2(fa[0], fa[2])), np.degrees(np.arctan2(fb[0], fb[2]))
+        self.assertAlmostEqual(((yb - ya + 180) % 360) - 180, 75.0, places=4)
+        self.assertTrue(np.allclose(b["quats"][:, 1:], a["quats"][:, 1:]))

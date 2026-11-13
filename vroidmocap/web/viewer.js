@@ -40,6 +40,7 @@ export class Viewer {
     this.controls.enableDamping = true;
     this.mode = "video";
     this.lockMove = false;
+    this.yaw = 0;  // the whole animation turned about the vertical (radians), with the video camera
     this.lockHeight = false;
     this.overlay = null;
     this.anim = null;
@@ -111,6 +112,7 @@ export class Viewer {
     VRMUtils.combineSkeletons?.(gltf.scene);
     this.isVrm0 = vrm.meta?.metaVersion === "0";
     if (this.isVrm0) VRMUtils.rotateVRM0(vrm);
+    this.baseYaw = vrm.scene.rotation.y;
     vrm.scene.traverse((o) => { o.frustumCulled = false; });
     this.vrm = vrm;
     this.scene.add(vrm.scene);
@@ -216,7 +218,7 @@ export class Viewer {
     if (F.hips) F.hips.position.set(A.fbxHips[f * 3], A.fbxHips[f * 3 + 1], A.fbxHips[f * 3 + 2]);
     // "lock movement": move the whole model back instead of its hips
     const off = this.lockOffset(f);
-    F.group.matrix.copy(new THREE.Matrix4().makeTranslation(-off.x, -off.y, -off.z).multiply(this.fbxPlacement));
+    F.group.matrix.copy(new THREE.Matrix4().makeRotationY(this.yaw).multiply(new THREE.Matrix4().makeTranslation(-off.x, -off.y, -off.z)).multiply(this.fbxPlacement));
     F.group.matrixWorldNeedsUpdate = true;
     F.group.updateMatrixWorld(true);
   }
@@ -240,6 +242,7 @@ export class Viewer {
     }
     const f = this.frame;
     const s = this.isVrm0 ? -1 : 1;
+    this.vrm.scene.rotation.y = (this.baseYaw ?? 0) + this.yaw;
     const B = A.B;
     for (let i = 0; i < B; i++) {
       const n = this.nodes[i];
@@ -278,8 +281,9 @@ export class Viewer {
     }
     // video camera
     const cp = A.camPos, cq = A.camQuat;
-    this.videoCam.position.set(cp[f * 3] - off.x, cp[f * 3 + 1] - off.y, cp[f * 3 + 2] - off.z);
-    this.videoCam.quaternion.set(cq[f * 4], cq[f * 4 + 1], cq[f * 4 + 2], cq[f * 4 + 3]);
+    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), this.yaw);
+    this.videoCam.position.set(cp[f * 3] - off.x, cp[f * 3 + 1] - off.y, cp[f * 3 + 2] - off.z).applyQuaternion(qy);
+    this.videoCam.quaternion.set(cq[f * 4], cq[f * 4 + 1], cq[f * 4 + 2], cq[f * 4 + 3]).premultiply(qy);
     this.videoCam.fov = A.vfov[f];
     this.videoCam.updateProjectionMatrix();
     if (this.mode === "free" && this.followTarget && hips) {
