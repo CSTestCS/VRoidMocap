@@ -28,7 +28,7 @@ from .detect import (L_ANK, L_FOOT, L_HEEL, L_HIP, L_SH, NOSE, R_ANK, R_FOOT, R_
 from .mathutil import mat_to_quat, normalize, quat_to_mat, slerp
 from .video import VideoReader
 
-ANALYSIS_VERSION = 11
+ANALYSIS_VERSION = 12
 PARALLEL_SHOTS = True
 USE_PERSON_DETECTOR = True  # person boxes from the Human-Art detector (else the pose model's own)
 
@@ -333,7 +333,7 @@ class Analyzer:
             self.progress(0.0, "Getting the person detector (one-time download, 20 MB)")
             pdp = ensure_model("person", lambda f: self.progress(0.0, f"Downloading the person detector: {f * 100:.0f}%"))
 
-        scan_path = os.path.join(self.workdir, "scan_v6.pkl" if USE_PERSON_DETECTOR else "scan_v5.pkl")
+        scan_path = os.path.join(self.workdir, "scan_v7.pkl" if USE_PERSON_DETECTOR else "scan_v5.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:
@@ -443,7 +443,12 @@ class Analyzer:
                         warped = cv2.warpPerspective(prev_gray, Hs, (cw, ch))
                         valid = cv2.warpPerspective(np.full_like(prev_gray, 1), Hs, (cw, ch)) > 0
                         if valid.sum() > 0.3 * valid.size:
-                            resid = float(np.mean(cv2.absdiff(warped, gray)[valid]))
+                            # (judged on the background: the people, glitter
+                            # and lights on them move by themselves)
+                            bgv = valid & (prev_mask > 0) if (CAM_RESID_BG and prev_mask is not None) else valid
+                            if bgv.sum() < 0.1 * valid.size:
+                                bgv = valid
+                            resid = float(np.mean(cv2.absdiff(warped, gray)[bgv]))
                     if ratio < 0.3 or resid > 14.0:
                         good[:] = False  # fast pan / blur: no usable camera motion for this step (not a cut)
                     else:
@@ -612,16 +617,26 @@ class Analyzer:
         fids = list(sc["frame_ids"])
         ok = sc["H_ok"]
         n_split = 0
+        bridges = []
         for i in range(2, len(fids)):
             starts_after_cut = any(fids[i - 1] < c <= fids[i] for c in sc["shot_starts"])
             if not ok[i] and ok[i - 1] and not starts_after_cut:
                 j = i
                 while j < len(fids) and not ok[j]:
                     j += 1
+                # a short gap (the person filling the picture for a moment, a
+                # flash): the camera is taken to hold still over it, as
+                # re-establishing it across a new shot is far less sure
+                cut_inside = any(fids[i] < c <= fids[min(j, len(fids) - 1)] for c in sc["shot_starts"])
+                if j < len(fids) and not cut_inside and (fids[j] - fids[i - 1]) <= CAM_GAP_BRIDGE_S * fps:
+                    bridges.append((i - 1, j))
+                    continue
                 if j < len(fids):
                     merged.add(fids[j])
                     n_split += 1
         merged = sorted(merged)
+        if bridges:
+            self._bridge_camera_gaps(sc, bridges, W, H)
         frame_shot = np.searchsorted(np.array(merged), np.arange(N), side="right") - 1
         for t in sc["tracks"]:
             t.shot = int(frame_shot[t.frames[0]])
@@ -641,6 +656,48 @@ class Analyzer:
         result["elapsed_s"] = time.time() - t_start
         self.progress(1.0, "Analysis complete")
         return result
+
+    def _bridge_camera_gaps(self, sc, bridges, W, H):
+        """Camera tracking gaps held over inside a shot: the background just
+        before and just after the gap is matched directly (people masked), so
+        the camera's turn over the gap is known; where that fails the camera
+        is taken to hold still over it."""
+        from .shotlink import _features
+        sift = cv2.SIFT_create(nfeatures=2000)
+        boxes_at = {}
+        for t in sc["tracks"]:
+            for f, b in zip(t.frames, t.boxes):
+                boxes_at.setdefault(int(f), []).append(b)
+        rd = VideoReader(self.video_path)
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        fids = sc["frame_ids"]
+        n_ok = 0
+        for (a, b) in bridges:
+            fa, fb = fids[a], fids[b]
+            A = rd.read(fa)
+            B = rd.read(fb)
+            if A is None or B is None:
+                continue
+            ka = _features(sift, A, boxes_at.get(fa, []), 0.5)
+            kb = _features(sift, B, boxes_at.get(fb, []), 0.5)
+            if ka is None or kb is None:
+                continue
+            m = bf.knnMatch(ka[1], kb[1], k=2)
+            good = [p[0] for p in m if len(p) == 2 and p[0].distance < 0.75 * p[1].distance]
+            if len(good) < 20:
+                continue
+            pa = ka[0][[g.queryIdx for g in good]]
+            pb = kb[0][[g.trainIdx for g in good]]
+            Hm, inl = cv2.findHomography(pa, pb, cv2.RANSAC, 3.0)
+            if Hm is None or inl is None or inl.sum() < 20 or inl.sum() < 0.4 * len(good):
+                continue
+            keep = inl.ravel().astype(bool)
+            sc["H_rel"][b] = np.concatenate([pa[keep], pb[keep]], 1).astype(np.float32)
+            sc["H_ids"][b] = (np.arange(keep.sum()) + 10 ** 9 + 10 ** 5 * b).astype(np.int32)
+            sc["H_ok"][b] = True
+            n_ok += 1
+        rd.close()
+        return n_ok
 
     # -- post-processing ---------------------------------------------------------
     def _solve(self, N, fps, W, H, stride, frame_ids, H_rel, H_ok, H_ids, shot_starts, tracklets, thumbs):
@@ -908,6 +965,8 @@ class Analyzer:
         return summary
 
 
+CAM_RESID_BG = True  # the camera step's blur/fast-pan check judged on the background only
+CAM_GAP_BRIDGE_S = 1.0  # camera tracking gaps this short inside a shot are held over, not a new shot
 LINK_SHOTS = False  # camera directions across cuts from the background (shotlink)
 PARALLEL_SCAN = True  # the person scan of the video's shots on several cores at once
 SCAN_PIECES_PER_WORKER = 3  # ranges per worker (an even load where shots differ in length)
