@@ -285,7 +285,8 @@ async function openAnimation(cid, step = "edit") {
 }
 // ------------------------------------------------------------------ step 3: corrections (Edit)
 const E = { edits: [], draft: null, cid: null };
-const epDefaults = () => ({ camOn: false, cam: { yaw: 0, pitch: 0, roll: 0, fov: 40, dist: 0 }, chrOn: false, chr: { place: null, dx: 0, dz: 0, dy: 0, yaw: 0 } });
+const epDefaults = () => ({ camOn: false, cam: { yaw: 0, pitch: 0, roll: 0, fov: 40, dist: 0 }, chrOn: false, chr: { place: null, dx: 0, dz: 0, dy: 0, yaw: 0 },
+  poseOn: false, pose: {} });
 async function loadEdits(cid) {
   E.cid = cid;
   try { E.edits = (await api(`/api/edits/${cid}`)).edits || []; } catch (e) { E.edits = []; }
@@ -316,7 +317,7 @@ function refreshEditPanel() {
   E.edits.forEach((e, i) => {
     const row = document.createElement("div");
     row.className = "ep-item";
-    const what = [e.camera ? "camera" : null, e.character ? "character" : null].filter(Boolean).join(" + ") || "—";
+    const what = [e.camera ? "camera" : null, e.character ? "character" : null, e.pose ? "pose" : null].filter(Boolean).join(" + ") || "—";
     row.innerHTML = `<span>Frame ${animFrameOf(e.frame)} · ${what} · ${e.length} frames</span><button class="ghost small">Go</button><button class="ghost small">✕</button>`;
     const [go, del] = row.querySelectorAll("button");
     go.onclick = () => { S.playing = false; updatePlay(); seek(animFrameOf(e.frame)); };
@@ -328,7 +329,12 @@ function refreshEditPanel() {
     $("epFrameNote").textContent = S.frame !== d.frame ? `(you are at frame ${S.frame}: the preview shows the correction at its own frame)` : "";
     $("epCamOn").checked = d.camOn; $("epCam").hidden = !d.camOn;
     $("epChrOn").checked = d.chrOn; $("epChr").hidden = !d.chrOn;
-    document.querySelectorAll("#epDraft input[type=range]").forEach((r) => {
+    $("epPoseOn").checked = d.poseOn; $("epPose").hidden = !d.poseOn;
+    const pa = d.pose[$("epBone").value] || [0, 0, 0];
+    [["epPB", 0], ["epPS", 1], ["epPT", 2]].forEach(([id, k]) => { $(id).value = pa[k]; $(id).nextElementSibling.textContent = `${pa[k]}°`; });
+    const nPosed = Object.values(d.pose).filter((x) => x && (x[0] || x[1] || x[2])).length;
+    $("epPoseInfo").textContent = nPosed ? `${nPosed} part${nPosed > 1 ? "s" : ""} posed` : "";
+    document.querySelectorAll("#epDraft input[type=range][data-k]").forEach((r) => {
       const [g, k] = r.dataset.k.split(".");
       r.value = d[g][k];
       r.nextElementSibling.textContent = Number(d[g][k]).toFixed(k === "dx" || k === "dz" || k === "dy" || k === "dist" ? 2 : 1);
@@ -337,7 +343,7 @@ function refreshEditPanel() {
 }
 function applyDraft() {
   const d = E.draft;
-  S.viewer.setEdit(d ? { frame: d.frame, camOn: d.camOn, cam: d.cam, chrOn: d.chrOn, chr: d.chr } : null);
+  S.viewer.setEdit(d ? { frame: d.frame, camOn: d.camOn, cam: d.cam, chrOn: d.chrOn, chr: d.chr, poseOn: d.poseOn, pose: d.pose } : null);
   refreshEditPanel();
 }
 $("epMark").onclick = () => {
@@ -354,7 +360,17 @@ $("epMark").onclick = () => {
 $("epCancel").onclick = () => { E.draft = null; applyDraft(); };
 $("epCamOn").onchange = (e) => { E.draft.camOn = e.target.checked; applyDraft(); };
 $("epChrOn").onchange = (e) => { E.draft.chrOn = e.target.checked; applyDraft(); };
-document.querySelectorAll("#epDraft input[type=range]").forEach((r) => (r.oninput = () => {
+$("epPoseOn").onchange = (e) => { E.draft.poseOn = e.target.checked; applyDraft(); };
+$("epBone").onchange = () => refreshEditPanel();
+[["epPB", 0], ["epPS", 1], ["epPT", 2]].forEach(([id, k]) => ($(id).oninput = () => {
+  const b = $("epBone").value;
+  const cur = E.draft.pose[b] || [0, 0, 0];
+  cur[k] = Number($(id).value);
+  E.draft.pose[b] = cur;
+  applyDraft();
+}));
+$("epPoseReset").onclick = () => { delete E.draft.pose[$("epBone").value]; applyDraft(); };
+document.querySelectorAll("#epDraft input[type=range][data-k]").forEach((r) => (r.oninput = () => {
   const [g, k] = r.dataset.k.split(".");
   E.draft[g][k] = Number(r.value);
   applyDraft();
@@ -376,7 +392,7 @@ for (const el of [$("gl")]) {
 $("epSave").onclick = () => {
   const d = E.draft;
   if (!d) return;
-  if (!d.camOn && !d.chrOn) { toast("Tick what is wrong (the camera, the character or both) and line it up first.", true); return; }
+  if (!d.camOn && !d.chrOn && !d.poseOn) { toast("Tick what is wrong (the camera, the character, the pose) and line it up first.", true); return; }
   if (S.frame !== d.frame) { S.playing = false; updatePlay(); seek(d.frame); }
   // read the corrected picture at the correction's frame (the preview applies it there)
   S.viewer.applyPose();
@@ -389,6 +405,7 @@ $("epSave").onclick = () => {
   const edit = { frame: Math.round(a), length: Math.max(1, Math.round(b - a)), view: snap.view };
   if (snap.camera) edit.camera = snap.camera;
   if (snap.character) edit.character = snap.character;
+  if (snap.pose) edit.pose = snap.pose;
   E.edits = E.edits.filter((e) => e.frame !== edit.frame).concat([edit]);
   E.dirty = true;
   E.draft = null;
@@ -713,6 +730,7 @@ document.addEventListener("keydown", (e) => {
   if (!$("step-viewer").classList.contains("active") || e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
   if (e.target.tagName === "TEXTAREA") return;
   if (e.target.closest && e.target.closest("#keyPanel, #editPanel, .rot") && e.target.type === "range" && e.code.startsWith("Arrow")) return;
+  if (e.target.tagName === "SELECT" && e.target.closest("#editPanel")) return;
   if (e.target.tagName === "SELECT" && e.code.startsWith("Arrow")) e.target.blur();
   if (e.code === "Space") { e.preventDefault(); $("playBtn").click(); }
   if (e.shiftKey && !$("keyPanel").hidden && (e.code === "ArrowLeft" || e.code === "ArrowRight")) { e.preventDefault(); jumpKey(e.code === "ArrowLeft" ? -1 : 1); return; }

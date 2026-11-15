@@ -158,6 +158,20 @@
             <div class="ep-row"><span>Nearer / further</span><input type="range" data-k="chr.dz" min="-5" max="5" step="0.01" value="0"><output></output></div>
             <div class="ep-row"><span>Up / down</span><input type="range" data-k="chr.dy" min="-1.5" max="1.5" step="0.01" value="0"><output></output></div>
           </div>
+          <label class="check"><input type="checkbox" id="epPoseOn"> The pose is wrong</label>
+          <div id="epPose" class="ep-group" hidden>
+            <div class="ep-row"><span>Body part</span><select id="epBone">
+              <option value="head">Head</option><option value="neck">Neck</option><option value="chest">Chest</option><option value="hips">Hips</option>
+              <option value="leftUpperArm">Left upper arm</option><option value="leftLowerArm">Left forearm</option><option value="leftHand">Left hand</option>
+              <option value="rightUpperArm">Right upper arm</option><option value="rightLowerArm">Right forearm</option><option value="rightHand">Right hand</option>
+              <option value="leftUpperLeg">Left thigh</option><option value="leftLowerLeg">Left shin</option><option value="leftFoot">Left foot</option>
+              <option value="rightUpperLeg">Right thigh</option><option value="rightLowerLeg">Right shin</option><option value="rightFoot">Right foot</option>
+            </select></div>
+            <div class="ep-row"><span>Bend (forward / back)</span><input type="range" id="epPB" min="-180" max="180" step="1" value="0"><output></output></div>
+            <div class="ep-row"><span>Out / in (sideways)</span><input type="range" id="epPS" min="-180" max="180" step="1" value="0"><output></output></div>
+            <div class="ep-row"><span>Turn</span><input type="range" id="epPT" min="-180" max="180" step="1" value="0"><output></output></div>
+            <div class="ep-row"><span class="muted small" id="epPoseInfo"></span><button id="epPoseReset" class="ghost small">Reset this part</button></div>
+          </div>
           <div class="ep-row"><span>Confused for</span><input type="number" id="epLen" min="1" step="1" value="30"> frames
             <button id="epEndHere" class="ghost small" title="Scrub to where it is right again, then click">Ends here</button></div>
           <div class="ep-actions">

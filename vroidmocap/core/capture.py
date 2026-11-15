@@ -625,7 +625,9 @@ def virtual_read(wbody, rgb, bb, best, state):
 
 def process_chunk(args):
     """Worker: landmarks for frames [s, e) given per-frame boxes."""
-    video, s, e, boxes, fps, out_path, wb_path = args
+    video, s, e, boxes, fps, out_path, wb_path = args[:7]
+    follow = bool(args[7]) if len(args) > 7 else False  # boxes after the first follow the joints read
+    boxes = np.array(boxes, np.float64, copy=True)
     if os.path.exists(out_path):
         return out_path
     n = e - s
@@ -700,6 +702,10 @@ def process_chunk(args):
                 lb = landmark_box(res[0].lm2d, res[0].vis)
                 bb = np.array([min(bb[0], lb[0]), min(bb[1], lb[1]), max(bb[2], lb[2]), max(bb[3], lb[3])])
             wb2d[i], wbs[i], wbz[i] = wb_read(wbody, rgb, bb, wb_state)
+            if follow and i + 1 < n:
+                nb = box_from_joints(wb2d[i].astype(np.float64), wbs[i].astype(np.float64), boxes[i], rgb.shape[1], rgb.shape[0])
+                if nb is not None:
+                    boxes[i + 1:] = nb
             last_kp = (wb2d[i].astype(np.float64), wbs[i].astype(np.float64))
             mk_new = update_markers(mk, None, g, *last_kp)  # ...and sit on the line wherever it is clear
             snapped = np.isfinite(mk_new[..., 0]) & ~(np.isfinite(mk[..., 0]) & (mk_new == mk).all(-1))
@@ -837,58 +843,66 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     return out
 
 
-def track_from_box(video, start, end, box, wb_path):
-    """Per-frame boxes of a character over frames [start, end), starting from
-    a box the user drew around her at `start`: each frame the whole-body model
-    reads her in the box and the next box follows her sure joints (its size
-    changing at most 15% a frame); where the reading is unsure the box holds."""
-    wbody = whole_body(wb_path)
-    rd = VideoReader(video)
-    bb = np.asarray(box, np.float64).copy()
-    H_, W_ = rd.height, rd.width
-    out = []
-    st = {}
-    for fi, bgr in rd.iter_frames(1, start, end):
-        out.append(bb.copy())
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        kp, sc, _ = wb_read(wbody, rgb, bb, st)
-        k = np.r_[0:17]
-        ok = sc[k] >= 0.35
-        if ok.sum() < 4:
-            continue
-        p = kp[k][ok]
-        lo, hi = p.min(0), p.max(0)
-        w, h = max(hi[0] - lo[0], 20.0), max(hi[1] - lo[1], 20.0)
-        nb = np.array([lo[0] - 0.25 * w, lo[1] - 0.2 * h, hi[0] + 0.25 * w, hi[1] + 0.2 * h])
-        # size: damped; centre: follows
-        ow, oh = bb[2] - bb[0], bb[3] - bb[1]
-        nw = float(np.clip(nb[2] - nb[0], 0.85 * ow, 1.15 * ow))
-        nh = float(np.clip(nb[3] - nb[1], 0.85 * oh, 1.15 * oh))
-        c = (nb[:2] + nb[2:]) / 2
-        bb = np.array([c[0] - nw / 2, c[1] - nh / 2, c[0] + nw / 2, c[1] + nh / 2])
-        bb = np.clip(bb, [-0.5 * W_, -0.5 * H_, 0, 0], [W_, H_, 1.5 * W_, 1.5 * H_])
-    rd.close()
-    while len(out) < end - start:
-        out.append(bb.copy())
-    return np.array(out)
+def box_from_joints(kp, sc, prev, W_, H_, min_score=0.35):
+    """The next frame's box from the body joints just read (padded), its size
+    changing at most 15% a frame; None where fewer than four joints are sure."""
+    k = np.r_[0:17]
+    ok = sc[k] >= min_score
+    if ok.sum() < 4:
+        return None
+    p = kp[k][ok]
+    lo, hi = p.min(0), p.max(0)
+    w, h = max(hi[0] - lo[0], 20.0), max(hi[1] - lo[1], 20.0)
+    nb = np.array([lo[0] - 0.25 * w, lo[1] - 0.2 * h, hi[0] + 0.25 * w, hi[1] + 0.2 * h])
+    ow, oh = prev[2] - prev[0], prev[3] - prev[1]
+    nw = float(np.clip(nb[2] - nb[0], 0.85 * ow, 1.15 * ow))
+    nh = float(np.clip(nb[3] - nb[1], 0.85 * oh, 1.15 * oh))
+    c = (nb[:2] + nb[2:]) / 2
+    bb = np.array([c[0] - nw / 2, c[1] - nh / 2, c[0] + nw / 2, c[1] + nh / 2])
+    return np.clip(bb, [-0.5 * W_, -0.5 * H_, 0, 0], [W_, H_, 1.5 * W_, 1.5 * H_])
 
 
-def recapture_range(video, workdir, char_id, start, end, box, fps, progress=None):
-    """Landmarks for frames [start, end) of a character, tracked from a box the
-    user drew (the Edit step). Returns a dict of the capture arrays for those
-    frames (cached by range and box)."""
+def recapture_edits(video, workdir, char_id, ranges, fps, progress=None, cancel=None, workers=None):
+    """Landmarks for the frames the user corrected (the Edit step): ranges is
+    a list of (start, end, box drawn around her at start). Each range is
+    captured following her from that box by the joints read frame to frame
+    (one pass: the body is read once a frame); the ranges run on all cores
+    at once, and an unchanged correction is not captured again (cached).
+    Returns a list of (start, end, dict of capture arrays)."""
     import hashlib
-    from .detect import ensure_model
+    import multiprocessing as mpc
+    from .detect import ensure_model, worker_count, gpu_wanted
     wb_path = ensure_model("wholebody")
     cdir = os.path.join(workdir, f"capture_c{char_id}")
     os.makedirs(cdir, exist_ok=True)
-    key = hashlib.md5(np.asarray(box, np.float64).round(1).tobytes()).hexdigest()[:10]
-    out_path = os.path.join(cdir, f"edit{CAPTURE_VERSION}_{start:07d}_{end:07d}_{key}.npz")
-    if not os.path.exists(out_path):
-        boxes = track_from_box(video, start, end, box, wb_path)
-        process_chunk((video, start, end, boxes, fps, out_path, wb_path))
-    d = dict(np.load(out_path))
-    return d
+    jobs, plan = [], []
+    for (a, b, box) in ranges:
+        key = hashlib.md5(np.asarray(box, np.float64).round(1).tobytes()).hexdigest()[:10]
+        # one job per correction: the capture follows her from the box the user
+        # drew, by the joints it reads (corrections run on all cores at once)
+        path = os.path.join(cdir, f"edit{CAPTURE_VERSION}_{a:07d}_{a:07d}_{b:07d}_{key}.npz")
+        if not os.path.exists(path):
+            jobs.append((video, a, b, np.tile(np.asarray(box, np.float64), (b - a, 1)), fps, path, wb_path, True))
+        plan.append((a, b, [(a, b, path)]))
+    if jobs:
+        workers = workers or worker_count(1.7, cap=4 if gpu_wanted() else 6)
+        total = sum(j[2] - j[1] for j in jobs)
+        done = 0
+        with mpc.get_context("spawn").Pool(max(1, min(len(jobs), workers))) as pool:
+            for path in pool.imap_unordered(process_chunk, jobs):
+                if cancel is not None and cancel():
+                    pool.terminate()
+                    from .analysis import Cancelled
+                    raise Cancelled()
+                name = os.path.basename(path)[:-4].split("_")
+                done += int(name[3]) - int(name[2])
+                if progress is not None:
+                    progress(done / max(total, 1), f"Looking again at the corrected frames: {done}/{total}")
+    out = []
+    for (a, b, paths) in plan:
+        parts = [dict(np.load(p)) for (_, _, p) in paths]
+        out.append((a, b, {k: np.concatenate([d[k] for d in parts]) for k in parts[0]}))
+    return out
 
 
 def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3, wbz=None):

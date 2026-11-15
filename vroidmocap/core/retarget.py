@@ -1053,6 +1053,37 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         f0 = a + int(np.argmax(fin))  # the edit's frame, or the first solved one after it
         d = hips_u - T[f0]
         P[a:b] = P[a:b] + (e["w"][:, None, None] * d[None, None, :])
+    # a pose the user set (the Edit step): at its frame, the joints are where
+    # the user put them, seen from the camera the user looked through
+    pose_frames = {}
+    for e in user_edits:
+        po, look = e.get("pose"), e.get("camera") or e.get("view")
+        if not po or not look or not po.get("joints"):
+            continue
+        Rv = _three_to_cv(look["quat"])
+        vp = np.asarray(look["pos"], np.float64)
+        sc = float(po.get("scale", 1.0)) or 1.0
+        row = np.full((33, 3), np.nan)
+        for k, v in po["joints"].items():
+            k = int(k)
+            if 0 <= k < 33:
+                row[k] = Rv.T @ (np.asarray(v, np.float64) - vp) / sc
+        if not np.isfinite(row[[L_SH, R_SH, L_HIP, R_HIP]]).all():
+            continue
+        # points not given ride with their nearest given joint
+        near = {L_INDEX: L_WR, L_PINKY: L_WR, L_THUMB: L_WR, R_INDEX: R_WR, R_PINKY: R_WR, R_THUMB: R_WR,
+                L_HEEL: L_ANK, R_HEEL: R_ANK, L_FOOT: L_ANK, R_FOOT: R_ANK}
+        for k, src in near.items():
+            if not np.isfinite(row[k]).all():
+                row[k] = row[src]
+        hipc_u = (row[L_HIP] + row[R_HIP]) / 2
+        row = np.where(np.isfinite(row), row, hipc_u)
+        f = e["start"]
+        P[f] = row
+        valid[f] = True
+        bad[f] = False
+        pose_frames[f] = e
+    dbg("pose_frames", np.array(sorted(pose_frames), np.int64))
     if user_edits:
         T = (P[:, L_HIP] + P[:, R_HIP]) / 2
     mp2d = lm2d  # MediaPipe's own picture positions (it does not clamp joints to the edge)
@@ -1064,6 +1095,20 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     for wi, tips in ((L_WR, (L_INDEX, L_PINKY, L_THUMB)), (R_WR, (R_INDEX, R_PINKY, R_THUMB))):
         for j in tips:
             P[:, j] = P0[:, j] - P0[:, wi] + P[:, wi]
+    for f, e in pose_frames.items():  # (the posed frame keeps the face and hand points it was given)
+        Rv = _three_to_cv((e.get("camera") or e["view"])["quat"])
+        vp = np.asarray((e.get("camera") or e["view"])["pos"], np.float64)
+        sc = float(e["pose"].get("scale", 1.0)) or 1.0
+        for k, v in e["pose"]["joints"].items():
+            k = int(k)
+            if k < 11 or k in (L_INDEX, L_PINKY, L_THUMB, R_INDEX, R_PINKY, R_THUMB):
+                P[f, k] = Rv.T @ (np.asarray(v, np.float64) - vp) / sc
+        for k, src in ((L_INDEX, L_WR), (L_PINKY, L_WR), (L_THUMB, L_WR), (R_INDEX, R_WR), (R_PINKY, R_WR), (R_THUMB, R_WR)):
+            if not np.isfinite(P[f, k]).all():
+                P[f, k] = P[f, src]
+        for k in range(11):
+            if not np.isfinite(P[f, k]).all():
+                P[f, k] = (P[f, L_SH] + P[f, R_SH]) / 2 + np.array([0, -0.25, 0])
     progress(0.27, "Solving camera continuity")
     # yaw continuity across cuts using THIS character
     refine_gravity(P, vis, R_rel, shot_of, shots, valid)
@@ -1095,6 +1140,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     turned_away = ~np.isfinite(psi_c) | (np.cos(np.nan_to_num(psi_c)) < np.cos(np.radians(110)))
     neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(NECK_MAX_DEG))
     face_q = np.where(turned_away | ~neck_ok, 0.0, face_q)
+    for f in pose_frames:
+        face_q[f] = 0.0  # (the head as the user posed it: from the face points given)
     if not HEAD_FACE_FIT:
         face_q = np.zeros_like(face_q)
     head_w = np.einsum("nij,njk->nik", R_w, Rface)
@@ -1343,12 +1390,26 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     conf = np.where(seen, np.maximum(conf, 0.55), 0.0)
     if cu_pelvis.any() and skel.has("hips"):
         seen[:, skel.bones.index("hips")] |= cu_pelvis & js[:, L_HIP] & js[:, R_HIP]
+    driven = [i for i, bn in enumerate(skel.bones) if bn in BONE_LANDMARKS or bn in ("head", "neck")]
+    for f, e in pose_frames.items():
+        # over the correction's length the app's own reading of the limbs the
+        # user moved was confused: they go from the user's pose to the next
+        # reading after it; at its frame every bone is as the user set it
+        changed = [skel.bones.index(b) for b in e["pose"].get("changed", []) if skel.has(b)]
+        if changed:
+            seen[e["start"]:e["end"], changed] = False
+            conf[e["start"]:e["end"], changed] = 0.0  # (the smoothing must not pull the pose towards them)
+        seen[f, driven] = True
+        conf[f, driven] = 1.0
     dbg("seen", seen)
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)
     strength = np.array([HAND_SMOOTH if b.endswith("Hand") else 2.0 if any(f in b for f in FINGERS) else 1.0
                          for b in skel.bones])
-    Q = filter_rotations(Q, conf, fps, smoothing, strength=strength)
+    protect = np.zeros(N, bool)
+    if pose_frames:
+        protect[list(pose_frames)] = True
+    Q = filter_rotations(Q, conf, fps, smoothing, strength=strength, protect=protect if pose_frames else None)
     dbg("Q_filt", Q)
 
     # ---- 6. the scene: the camera from the scenery, the character inside it
@@ -1393,6 +1454,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             raised = (dn[:, 1] / np.maximum(np.linalg.norm(dn, axis=1), 1e-9) > RAISED_THIGH_Y) & (knee_c[:, kn] < RAISED_THIGH_CONF)
             seen[raised, iu] = False
             seen[raised, il] = False
+    for f in pose_frames:
+        seen[f, driven] = True  # (a pose the user set is never a misreading)
     Q = nat.apply(Q, root0, fps, conf)
     dbg("Q_nat", Q)
     # keyframes only where a bone is seen: in between, smooth in-between motion

@@ -224,6 +224,7 @@ export class Viewer {
     if (this._editAt(f)) {
       const M = this._editCharMatrix(F.hips);
       if (M) { F.group.matrix.premultiply(M); F.group.matrixWorldNeedsUpdate = true; F.group.updateMatrixWorld(true); }
+      this._editPose();
     }
   }
 
@@ -272,6 +273,7 @@ export class Viewer {
         m.decompose(this.vrm.scene.position, this.vrm.scene.quaternion, this.vrm.scene.scale);
         this.vrm.scene.updateMatrixWorld(true);
       }
+      this._editPose();
     }
     const jumped = Math.abs(f - this.lastFrame) > 2;
     const dt = jumped ? 0 : Math.min(0.1, Math.abs(f - this.lastFrame) / A.fps);
@@ -341,6 +343,80 @@ export class Viewer {
       .multiply(new THREE.Matrix4().makeRotationY(((e.chr.yaw || 0) * Math.PI) / 180))
       .multiply(new THREE.Matrix4().makeTranslation(-h.x, -h.y, -h.z));
   }
+  boneNode(name) {
+    if (this.vrm) return this.vrm.humanoid.getNormalizedBoneNode(name);
+    if (this.fbx) { const n = this.anim?.meta?.fbx_bone_nodes?.[name]; return n ? this.fbx.get(n) : null; }
+    return null;
+  }
+  /** The character's own axes now (world): left (her left), up, forward. */
+  bodyAxes() {
+    const L = new THREE.Vector3(), R = new THREE.Vector3();
+    const l = this.boneNode("leftUpperLeg"), r = this.boneNode("rightUpperLeg");
+    if (!l || !r) return null;
+    l.getWorldPosition(L); r.getWorldPosition(R);
+    const left = L.sub(R); left.y = 0; left.normalize();
+    const up = new THREE.Vector3(0, 1, 0);
+    return { left, up, fwd: new THREE.Vector3().crossVectors(left, up).normalize() };
+  }
+  static POSE_ORDER = ["hips", "spine", "chest", "upperChest", "neck", "head",
+    "leftUpperArm", "leftLowerArm", "leftHand", "rightUpperArm", "rightLowerArm", "rightHand",
+    "leftUpperLeg", "leftLowerLeg", "leftFoot", "rightUpperLeg", "rightLowerLeg", "rightFoot"];
+  /** edit.pose = {bone: [bend, out, turn] degrees}: each turns the bone (and what hangs from it)
+   * about its joint: bend about her left-right axis, out about her forward axis, turn about the vertical. */
+  _editPose() {
+    const pose = this.edit?.poseOn ? this.edit.pose : null;
+    if (!pose) return;
+    const ax = this.bodyAxes();
+    if (!ax) return;
+    const d2r = Math.PI / 180;
+    const root = this.vrm ? this.vrm.scene : this.fbx.group;
+    for (const b of Viewer.POSE_ORDER) {
+      const a = pose[b];
+      if (!a || (!a[0] && !a[1] && !a[2])) continue;
+      const n = this.boneNode(b);
+      if (!n || !n.parent) continue;
+      root.updateMatrixWorld(true);
+      const side = b.startsWith("right") ? -1 : 1;  // "out" is away from the body on either side
+      // (+ bend: forward, as raising a knee or an arm in front; + out: away from the body)
+      const dq = new THREE.Quaternion().setFromAxisAngle(ax.up, a[2] * d2r)
+        .multiply(new THREE.Quaternion().setFromAxisAngle(ax.fwd, side * a[1] * d2r))
+        .multiply(new THREE.Quaternion().setFromAxisAngle(ax.left, -a[0] * d2r));
+      const qw = new THREE.Quaternion(), pw = new THREE.Quaternion();
+      n.getWorldQuaternion(qw);
+      n.parent.getWorldQuaternion(pw);
+      n.quaternion.copy(pw.invert().multiply(dq.multiply(qw)));
+      n.updateMatrixWorld(true);
+    }
+    root.updateMatrixWorld(true);
+  }
+  /** The posed joints (world), in MediaPipe numbering, with face points from the posed head. */
+  poseJoints() {
+    const P = (name) => { const n = this.boneNode(name); if (!n) return null; const p = new THREE.Vector3(); n.getWorldPosition(p); return p; };
+    const map = { 11: "leftUpperArm", 12: "rightUpperArm", 13: "leftLowerArm", 14: "rightLowerArm", 15: "leftHand", 16: "rightHand",
+      23: "leftUpperLeg", 24: "rightUpperLeg", 25: "leftLowerLeg", 26: "rightLowerLeg", 27: "leftFoot", 28: "rightFoot", 31: "leftToes", 32: "rightToes" };
+    const out = {};
+    for (const [k, b] of Object.entries(map)) { const p = P(b); if (p) out[k] = p.toArray(); }
+    const head = P("head"), neck = P("neck") || P("upperChest") || P("chest");
+    const ax = this.bodyAxes();
+    if (head && neck && ax) {
+      const up = head.clone().sub(neck).normalize();
+      const eL = P("leftEye"), eR = P("rightEye");
+      let left = eL && eR ? eL.clone().sub(eR).normalize() : null;
+      if (!left && this.vrm) {  // the head's own left axis (normalized bones: +X is her left; VRM 0.x is turned round)
+        const q = new THREE.Quaternion();
+        this.boneNode("head").getWorldQuaternion(q);
+        left = new THREE.Vector3(this.isVrm0 ? -1 : 1, 0, 0).applyQuaternion(q);
+      }
+      if (!left) left = ax.left.clone();
+      const fwd = new THREE.Vector3().crossVectors(left, up).normalize();
+      left = new THREE.Vector3().crossVectors(up, fwd).normalize();
+      const at = (u, f, l) => head.clone().addScaledVector(up, u).addScaledVector(fwd, f).addScaledVector(left, l).toArray();
+      Object.assign(out, { 0: at(0.06, 0.09, 0), 1: at(0.08, 0.07, 0.02), 2: at(0.08, 0.07, 0.03), 3: at(0.08, 0.065, 0.045),
+        4: at(0.08, 0.07, -0.02), 5: at(0.08, 0.07, -0.03), 6: at(0.08, 0.065, -0.045), 7: at(0.05, 0, 0.07), 8: at(0.05, 0, -0.07),
+        9: at(0.02, 0.08, 0.02), 10: at(0.02, 0.08, -0.02) });
+    }
+    return out;
+  }
   /** The floor point (x, z) under a click on the picture (video camera), or null. */
   floorAt(clientX, clientY) {
     const rect = this.canvas.getBoundingClientRect(), r = this.videoRect();
@@ -397,6 +473,10 @@ export class Viewer {
       const pw = 0.15 * (x1 - x0), ph = 0.1 * (y1 - y0);
       out.character = { hips: h.toArray(), fwd: fwd.toArray(), scale: A.meta.scale || 1,
         box: isFinite(x0) ? [x0 - pw, y0 - ph, x1 + pw, y1 + ph] : null };
+    }
+    if (this.edit?.poseOn && this.edit.pose && Object.values(this.edit.pose).some((a) => a && (a[0] || a[1] || a[2]))) {
+      out.pose = { joints: this.poseJoints(), scale: A.meta.scale || 1,
+        changed: Object.entries(this.edit.pose).filter(([, a]) => a && (a[0] || a[1] || a[2])).map(([b]) => b) };
     }
     return out;
   }

@@ -226,7 +226,7 @@ class AppState:
         clean = []
         for e in edits:
             c = {"frame": int(e["frame"]), "length": max(1, int(e.get("length", 1)))}
-            for k in ("camera", "character", "view", "note"):
+            for k in ("camera", "character", "view", "pose", "note"):
                 if e.get(k) is not None:
                     c[k] = e[k]
             clean.append(c)
@@ -243,7 +243,7 @@ class AppState:
             raise ValueError("Another task is still running")
         if self.skel is None:
             raise ValueError("Choose a .vrm avatar first")
-        from .core.capture import recapture_range
+        from .core.capture import recapture_edits
         from .core.retarget import solve_animation
 
         def run(progress, cancel):
@@ -257,16 +257,16 @@ class AppState:
             cap = dict(np.load(orig))
             fps = float(self.analysis["fps"])
             N = len(cap["tracked"])
-            todo = [e for e in self.edits(char_id)["edits"] if (e.get("character") or {}).get("box")]
-            for k, e in enumerate(todo):
-                if cancel():
-                    from .core.analysis import Cancelled
-                    raise Cancelled()
-                a = int(np.clip(e["frame"], 0, N - 1))
-                b = int(np.clip(a + int(e["length"]), a + 1, N))
-                progress(0.05 + 0.75 * k / max(len(todo), 1), f"Looking again at frames {a}-{b - 1} with your correction ({k + 1}/{len(todo)})")
-                got = recapture_range(self.video, self.workdir, char_id, a, b, e["character"]["box"], fps)
-                for key, arr in got.items():
+            ranges = []
+            for e in self.edits(char_id)["edits"]:
+                box = (e.get("character") or {}).get("box")
+                if box:
+                    a = int(np.clip(e["frame"], 0, N - 1))
+                    ranges.append((a, int(np.clip(a + int(e["length"]), a + 1, N)), box))
+            got = recapture_edits(self.video, self.workdir, char_id, ranges, fps,
+                                  lambda f, m: progress(0.05 + 0.75 * f, m), cancel) if ranges else []
+            for a, b, arrs in got:
+                for key, arr in arrs.items():
                     if key in cap and cap[key].shape[1:] == arr.shape[1:] and len(cap[key]) >= b:
                         cap[key][a:b] = arr[:b - a]
                 cap["tracked"][a:b] = True
@@ -326,6 +326,7 @@ class AppState:
             names, fq, fh = self.skel.fbx.pose(list(a["bones"]), a["quats"], a["root"])
             parts += [("fbx_quats", fq), ("fbx_hips", fh)]
             meta["fbx_names"] = names
+            meta["fbx_bone_nodes"] = dict(self.skel.fbx.hb)  # avatar bone -> the model's node (posing in the Edit step)
         meta["layout"] = {}
         off = 0
         blobs = []
