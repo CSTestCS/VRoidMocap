@@ -348,7 +348,7 @@ $("epMark").onclick = () => {
   d.cam.fov = Math.round(S.anim.vfov[S.frame] * 2) / 2;
   $("epLen").value = Math.max(1, Math.round(S.anim.fps));  // a second, until set
   E.draft = d;
-  if (S.layout === "3d") setLayout("overlay");
+  if (S.layout !== "overlay") setLayout("overlay");  // lining up is done over the picture
   applyDraft();
 };
 $("epCancel").onclick = () => { E.draft = null; applyDraft(); };
