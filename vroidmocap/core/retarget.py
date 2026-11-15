@@ -59,6 +59,7 @@ HAND_PNP = True  # hand rotation from the avatar's rigid palm fitted to the pict
 HEAD_GAIN = (1.0, 1.0, 1.5)  # turn, nod, tilt of the head (relative to the chest) as read from the face, scaled
 STAND_HIPS = 0.95  # hips height (share of the rest height) when no foot is seen in a whole shot
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
+HEAD_HINT_SLACK_DEG = 20.0  # a head the user posed: how far off a hand-made pose may be (not corrected)
 NECK_MAX_DEG = 90.0  # a face fit turned further than this from the chest is not used
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
 SEGMENT_LIMBS = (0, 1, 2, 3, 4, 5, 6, 7)  # which limbs (SEG_MP order: arms, then legs)
@@ -520,6 +521,10 @@ def upright_uv(uv, mask, shots, shot_of):
     return out
 
 
+USER_FACING_HOLD = os.environ.get("VROIDMOCAP_FACING_HOLD", "0") == "1"  # hold the user's facing over the length (else: at its frame)
+USER_FACING_SPAN = 3  # frames from the edit's frame the user's facing is given at
+USER_FACING_W_AT = 12.0  # its weight there
+USER_FACING_SEEN = float(os.environ.get("VROIDMOCAP_FACING_SEEN", "0.15"))  # after that, where the picture shows her facing: x USER_FACING_W
 USER_FACING_W = 4.0  # weight of a facing the user set (per frame, x the facing tracker's own clue weights)
 USER_EDIT_FADE = 0.25  # the last part of an edit's length over which its corrections fade out
 
@@ -606,8 +611,20 @@ def pose_hints(user_edits, N):
             up = (row[L_SH] + row[R_SH]) / 2 - (row[L_HIP] + row[R_HIP]) / 2
             F = np.cross(left, up)  # (left x up = forwards, in any right-handed frame)
             F = F / max(np.linalg.norm(F), 1e-9)
+        Rh = None
+        if changed & {"head", "neck"} and np.isfinite(row[[NOSE, L_EAR, R_EAR]]).all():
+            # the head as posed, as a rotation of the face template (x = her left,
+            # y = up, z = forwards) into the camera frame
+            x = row[L_EAR] - row[R_EAR]
+            z = row[NOSE] - (row[L_EAR] + row[R_EAR]) / 2
+            x = x / max(np.linalg.norm(x), 1e-9)
+            z = z - (z @ x) * x
+            z = z / max(np.linalg.norm(z), 1e-9)
+            Rh = np.stack([x, np.cross(z, x), z], 1)
+            hint[[NOSE, L_EAR, R_EAR]] = row[[NOSE, L_EAR, R_EAR]]
         if np.isfinite(hint).any() or F is not None:
-            out.append({"frame": e["start"], "start": e["start"], "end": e["end"], "w": e["w"], "joints": hint, "fwd": F})
+            out.append({"frame": e["start"], "start": e["start"], "end": e["end"], "w": e["w"], "joints": hint, "fwd": F,
+                        "head": Rh})
     return out
 
 
@@ -939,6 +956,22 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if any(e.get("character") for e in user_edits) or any(h["fwd"] is not None for h in hints):
         r3_e, view_e = facing.lateral_axes(uv_f, focal, cx, cy)
         user_prior, user_prior_w = np.full(N, np.nan), np.zeros(N)
+        # where the picture shows which way she faces, the user's facing is
+        # given at the edit's frame and the tracker carries it on with the
+        # picture's own turning; where it cannot (close-ups of the hips and
+        # legs), it holds over the edit's length
+        blind = np.zeros(N, bool)
+        if wb_sync is not None:
+            s_ = np.asarray(wb_sync[1], np.float64)
+            blind = closeup_frames(s_) & (s_[:, 5:7].max(1) < 0.45)
+
+        def put_facing(e, psi_u):
+            a, b = e["start"], e["end"]
+            seen_k = 1.0 if USER_FACING_HOLD else USER_FACING_SEEN
+            w = USER_FACING_W * e["w"] * np.where(blind[a:b], 1.0, seen_k)
+            w[:USER_FACING_SPAN] = max(USER_FACING_W_AT, USER_FACING_W)
+            user_prior[a:b] = psi_u
+            user_prior_w[a:b] = w
         for e in user_edits:
             got = edit_in_camera(e)
             if got is None:
@@ -946,13 +979,11 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             _, F = got
             f0 = e["start"]
             psi_u = float(np.arctan2(F @ r3_e[f0], -(F @ view_e[f0])))
-            user_prior[e["start"]:e["end"]] = psi_u
-            user_prior_w[e["start"]:e["end"]] = USER_FACING_W * e["w"]
+            put_facing(e, psi_u)
         for h in hints:  # (a torso the user turned says more than where the character stands)
             if h["fwd"] is not None:
                 F, f0 = h["fwd"], h["start"]
-                user_prior[h["start"]:h["end"]] = float(np.arctan2(F @ r3_e[f0], -(F @ view_e[f0])))
-                user_prior_w[h["start"]:h["end"]] = USER_FACING_W * h["w"]
+                put_facing(h, float(np.arctan2(F @ r3_e[f0], -(F @ view_e[f0]))))
         dbg("user_facing", user_prior)
     # the user's posed limbs, where they fall in the picture: which detected
     # side is her left (the facing tracker otherwise decides it)
@@ -1193,7 +1224,48 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     yaw_h = np.arctan2(np.sum(fz * r3, 1), -np.sum(fz * view, 1))
     turned_away = ~np.isfinite(psi_c) | (np.cos(np.nan_to_num(psi_c)) < np.cos(np.radians(110)))
     neck_ok = np.cos(yaw_h - np.nan_to_num(psi_c)) > np.cos(np.radians(NECK_MAX_DEG))
+    face_raw = face_q.copy()
+    dbg("face_raw", face_raw)
     face_q = np.where(turned_away | ~neck_ok, 0.0, face_q)
+    # a head the user posed: what the face points show is read against it
+    head_fixed = np.zeros(N)
+    for h in hints:
+        if h.get("head") is None:
+            continue
+        a, b, Rh = h["start"], h["end"], h["head"]
+        towards = -(Rh[:, 2] @ (h["joints"][NOSE] / max(np.linalg.norm(h["joints"][NOSE]), 1e-9)))
+        if towards < 0.1:
+            # her face is turned away from the camera: any face read here was
+            # the detector guessing at the back of her head
+            face_q[a:b] = 0.0
+            continue
+        near = [g for g in range(a, min(b, a + 4)) if face_raw[g] > 0]
+        if not near:
+            continue
+        # the face points' reading at the posed frame, against the pose: the
+        # same difference holds while it was confused (the motion stays the
+        # picture's own); a face the checks above dropped is used again
+        g = near[0]
+        C = mat_to_quat((Rh @ Rface[g].T)[None])[0]
+        # (a head posed by hand is a few tens of degrees off at best: only
+        # the part of the difference beyond that is taken as a misreading)
+        C = C if C[3] >= 0 else -C
+        th = 2 * np.arccos(np.clip(C[3], -1, 1))
+        th2 = max(th - np.radians(HEAD_HINT_SLACK_DEG), 0.0)
+        if th2 <= 0:
+            C = np.array([0, 0, 0, 1.0])
+        else:
+            ax = C[:3] / max(np.linalg.norm(C[:3]), 1e-12)
+            C = np.r_[ax * np.sin(th2 / 2), np.cos(th2 / 2)]
+        for k in range(a, b):
+            if face_raw[k] <= 0:
+                continue
+            w = float(h["w"][k - a])
+            Ck = quat_to_mat(slerp(np.array([0, 0, 0, 1.0]), C, w)[None])[0]
+            Rface[k] = Ck @ Rface[k]
+            face_q[k] = max(face_q[k], face_raw[k])
+            head_fixed[k] = max(head_fixed[k], w)
+    dbg("head_fixed", head_fixed)
     if not HEAD_FACE_FIT:
         face_q = np.zeros_like(face_q)
     head_w = np.einsum("nij,njk->nik", R_w, Rface)
@@ -1383,7 +1455,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # rendered heads with known motion, scale them back up
     if HEAD_GAIN != (1.0, 1.0, 1.0) and skel.has("head") and skel.has("neck"):
         hn, hh = bidx["neck"], bidx["head"]
-        use = qvalid & (face_q > 0.15)
+        use = qvalid & (face_q > 0.15) & (head_fixed < 0.5)  # (a head read against the user's pose is not scaled)
         Rel = quat_to_mat(Q[use, hn]) @ quat_to_mat(Q[use, hh])
         yaw = np.arctan2(Rel[:, 0, 2], Rel[:, 2, 2]) * HEAD_GAIN[0]
         pitch = np.arcsin(np.clip(-Rel[:, 1, 2], -1, 1)) * HEAD_GAIN[1]

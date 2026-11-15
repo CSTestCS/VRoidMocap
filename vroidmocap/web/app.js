@@ -682,7 +682,10 @@ function seek(f) {
   $("timecode").textContent = `${fmtTime(f / fps)}.${String(Math.floor(((f / fps) % 1) * 100)).padStart(2, "0")} · frame ${f} / ${S.anim.frames - 1} @ ${S.anim.fps} fps`;
   const shot = S.anim.shot[f];
   const row = S.analysis?.camera?.[S.anim.src[f]];
-  $("frameInfo").textContent = (S.anim.valid[f] > 0.5 ? "Tracked" : "Character not visible (pose interpolated)") +
+  const lost = S.anim.valid[f] <= 0.5;
+  $("frameInfo").textContent = (!lost ? "Tracked" : document.body.classList.contains("edit-mode")
+    ? "Not found here (pose interpolated): mark it and place her where she is, and the detector looks there again"
+    : "Character not visible (pose interpolated)") +
     ` · shot ${shot + 1}` + (row ? ` · camera yaw ${row[0].toFixed(1)}° pitch ${row[1].toFixed(1)}° roll ${row[2].toFixed(1)}° · FOV ${S.anim.vfov[f].toFixed(1)}°` : "") +
     ` · hands ${S.anim.hs[f * 2] >= 0.5 ? "L✓" : "L–"} ${S.anim.hs[f * 2 + 1] >= 0.5 ? "R✓" : "R–"}`;
   $("camBadge").textContent = S.viewer.mode === "video" || S.layout === "overlay" ? "Video camera" : "Free camera (drag to orbit, right-drag to pan, wheel to zoom)";
