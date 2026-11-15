@@ -19,8 +19,9 @@
   <nav id="steps">
     <button data-step="setup" class="active">1 · Files</button>
     <button data-step="analysis" disabled>2 · Analysis</button>
-    <button data-step="viewer" disabled>3 · Animation</button>
-    <button data-step="keys" disabled title="Keyframe the fingers and the face on top of the animation">4 · Fingers &amp; face</button>
+    <button data-step="edit" disabled title="Check the animation and correct where the camera or the character was lost">3 · Edit</button>
+    <button data-step="viewer" disabled>4 · Animation</button>
+    <button data-step="keys" disabled title="Keyframe the fingers and the face on top of the animation">5 · Fingers &amp; face</button>
   </nav>
   <div id="jobbar" hidden>
     <div class="jobmsg" id="jobmsg"></div>
@@ -105,20 +106,20 @@
         <button data-cam="video" class="active">Video camera</button>
         <button data-cam="free">Free camera</button>
       </div>
-      <label class="check"><input type="checkbox" id="lockMove"> Lock movement</label>
-      <label class="check"><input type="checkbox" id="lockHeight" disabled> also height</label>
+      <label class="check anim-only"><input type="checkbox" id="lockMove"> Lock movement</label>
+      <label class="check anim-only"><input type="checkbox" id="lockHeight" disabled> also height</label>
       <label class="check"><input type="checkbox" id="showLm" checked> Landmarks</label>
       <label class="check"><input type="checkbox" id="showGrid" checked> Floor</label>
       <label class="check" title="Output frame rate: the animation is resampled to exactly this rate (viewer playback and export)">Frame rate
         <select id="fpsSel"><option value="12">12 fps</option><option value="24">24 fps</option><option value="30" selected>30 fps</option><option value="60">60 fps</option></select></label>
       <div class="spacer"></div>
-      <label class="rot" title="Turn the whole animation (and the video camera with it) about the vertical, to line it up for export. Saved with the character; the export uses it.">Rotate
+      <label class="rot anim-only" title="Turn the whole animation (and the video camera with it) about the vertical, to line it up for export. Saved with the character; the export uses it.">Rotate
         <input type="range" id="rotSlider" min="-180" max="180" step="1" value="0">
         <input type="number" id="rotNum" min="-180" max="180" step="1" value="0">°
         <button id="rotReset" class="ghost small" title="Back to 0°">0°</button></label>
       <span class="muted" id="viewerChar"></span>
       <button id="otherChar" class="ghost">Choose another character</button>
-      <button id="exportBtn" class="primary">Export .fbx</button>
+      <button id="exportBtn" class="primary anim-only">Export .fbx</button>
     </div>
     <div class="stage" id="stage">
       <div class="pane" id="pane3d"><canvas id="gl"></canvas><div class="badge" id="camBadge"></div></div>
@@ -128,6 +129,43 @@
           <canvas id="lmCanvas"></canvas>
         </div>
       </div>
+      <aside id="editPanel" class="keypanel editpanel" hidden>
+        <div class="kp-head"><b>Corrections</b> <span class="muted small" id="epCount"></span></div>
+        <div id="epIdle" class="kp-body">
+          <p class="muted small">Play or scrub (← → one frame) to where the camera or the character is wrong, then mark it. A correction tells the app what it is looking at in that frame; its length is how long it was confused.</p>
+          <button id="epMark" class="primary small">Mark a mistake at this frame</button>
+          <div id="epList" class="ep-list"></div>
+          <div class="ep-actions">
+            <button id="epSubmit" class="primary" disabled>Submit corrections (animate again)</button>
+            <button id="epDone" class="ghost">Looks right: continue to Animation ▶</button>
+          </div>
+        </div>
+        <div id="epDraft" class="kp-body" hidden>
+          <div class="small">Correction at frame <b id="epFrame"></b> <span class="muted" id="epFrameNote"></span></div>
+          <label class="check"><input type="checkbox" id="epCamOn"> The camera is wrong</label>
+          <div id="epCam" class="ep-group" hidden>
+            <div class="ep-row"><span>Turn</span><input type="range" data-k="cam.yaw" min="-180" max="180" step="0.5" value="0"><output></output></div>
+            <div class="ep-row"><span>Tilt</span><input type="range" data-k="cam.pitch" min="-60" max="60" step="0.5" value="0"><output></output></div>
+            <div class="ep-row"><span>Roll</span><input type="range" data-k="cam.roll" min="-45" max="45" step="0.5" value="0"><output></output></div>
+            <div class="ep-row"><span>Zoom (view angle)</span><input type="range" data-k="cam.fov" min="8" max="100" step="0.5" value="40"><output></output></div>
+            <div class="ep-row"><span>Move in / out</span><input type="range" data-k="cam.dist" min="-5" max="5" step="0.05" value="0"><output></output></div>
+          </div>
+          <label class="check"><input type="checkbox" id="epChrOn"> The character is wrong (or missing)</label>
+          <div id="epChr" class="ep-group" hidden>
+            <p class="muted small">Click the picture where she stands to put her there, then line her up:</p>
+            <div class="ep-row"><span>Facing</span><input type="range" data-k="chr.yaw" min="-180" max="180" step="1" value="0"><output></output></div>
+            <div class="ep-row"><span>Left / right</span><input type="range" data-k="chr.dx" min="-3" max="3" step="0.01" value="0"><output></output></div>
+            <div class="ep-row"><span>Nearer / further</span><input type="range" data-k="chr.dz" min="-5" max="5" step="0.01" value="0"><output></output></div>
+            <div class="ep-row"><span>Up / down</span><input type="range" data-k="chr.dy" min="-1.5" max="1.5" step="0.01" value="0"><output></output></div>
+          </div>
+          <div class="ep-row"><span>Confused for</span><input type="number" id="epLen" min="1" step="1" value="30"> frames
+            <button id="epEndHere" class="ghost small" title="Scrub to where it is right again, then click">Ends here</button></div>
+          <div class="ep-actions">
+            <button id="epSave" class="primary small">Save correction</button>
+            <button id="epCancel" class="ghost small">Cancel</button>
+          </div>
+        </div>
+      </aside>
       <aside id="keyPanel" class="keypanel" hidden>
         <div class="kp-top">
           <div class="seg" id="kpTabs">
@@ -164,7 +202,7 @@
       <div class="audio" title="Sound of the reference video">
         <button id="muteBtn" class="icon" title="Sound on / off (M)" aria-label="Sound on / off">🔇</button>
         <input type="range" id="volume" min="0" max="1" step="0.05" value="0.8" aria-label="Volume">
-        <audio id="refAudio" preload="metadata"></audio>
+        <audio id="refAudio" preload="auto"></audio>
       </div>
       <div class="crop">
         <button id="cropIn" class="ghost small" title="Start the range at this frame (I)">[ In</button>
@@ -176,7 +214,7 @@
     </div>
     <div class="track"><canvas id="trackCanvas" height="18"></canvas></div>
     <div class="muted small" id="frameInfo"></div>
-    <div class="facingrow" title="In shots that show only part of her (the hips and thighs), which way she faces cannot be read from the picture. Set it here for the shot under the playhead; the whole shot (from cut to cut) takes it.">
+    <div class="facingrow anim-only" title="In shots that show only part of her (the hips and thighs), which way she faces cannot be read from the picture. Set it here for the shot under the playhead; the whole shot (from cut to cut) takes it.">
       <span class="small">She faces, in this shot:</span>
       <div class="seg" id="facingSeg">
         <button data-facing="auto" class="active">Auto</button><button data-facing="front">Front (towards the camera)</button><button data-facing="back">Back (away)</button>

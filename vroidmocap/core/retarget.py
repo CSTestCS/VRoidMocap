@@ -520,6 +520,58 @@ def upright_uv(uv, mask, shots, shot_of):
     return out
 
 
+USER_FACING_W = 4.0  # weight of a facing the user set (per frame, x the facing tracker's own clue weights)
+USER_EDIT_FADE = 0.25  # the last part of an edit's length over which its corrections fade out
+
+
+def load_user_edits(workdir, char_id, N, scale_hint=None):
+    """The corrections the user made in the Edit step (edits_c<id>.json):
+    a list of {"frame", "length" (video frames), "camera": {"quat" (three.js
+    camera -> world), "pos", "vfov"} or absent, "character": {"hips" (world,
+    the animation's units), "fwd" (world), "box" (video px), "scale"} or
+    absent, "view": the camera the user looked through ({"quat", "pos"})}.
+    Returns them with [start, end) frame ranges and, per frame, the weight
+    (1, fading out over the last USER_EDIT_FADE of the length)."""
+    path = os.path.join(workdir, f"edits_c{char_id}.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as fh:
+            edits = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for e in edits:
+        a = int(e.get("frame", -1))
+        if not 0 <= a < N:
+            continue
+        b = int(np.clip(a + max(int(e.get("length", 1)), 1), a + 1, N))
+        w = np.ones(b - a)
+        nf = int(round(USER_EDIT_FADE * (b - a)))
+        if nf >= 2:
+            w[-nf:] = np.linspace(1.0, 0.0, nf + 1)[1:]
+        out.append(dict(e, start=a, end=b, w=w))
+    return out
+
+
+def _three_to_cv(quat):
+    """three.js camera quaternion (x, y, z, w) -> cv camera -> world rotation."""
+    return quat_to_mat(np.asarray(quat, np.float64)[None])[0] @ cam.D
+
+
+def edit_in_camera(e):
+    """(hips (3,) and facing (3,) in the cv camera frame of the camera the user
+    looked through, metres of the solve) of a character edit, or None."""
+    ch, view = e.get("character"), e.get("camera") or e.get("view")
+    if not ch or not view:
+        return None
+    Rv = _three_to_cv(view["quat"])
+    sc = float(ch.get("scale", 1.0)) or 1.0
+    hips = Rv.T @ (np.asarray(ch["hips"], np.float64) - np.asarray(view["pos"], np.float64)) / sc
+    fwd = Rv.T @ np.asarray(ch["fwd"], np.float64)
+    return hips, fwd / max(np.linalg.norm(fwd), 1e-9)
+
+
 def load_facing_hints(workdir, char_id, N):
     """(N,) front/back the user set per shot in the editor: +1 facing the
     camera, -1 turned away, nan = not set (facing_hints_c<id>.json: a list of
@@ -663,6 +715,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     N, fps, W, H = A["frames"], A["fps"], A["width"], A["height"]
     cx, cy = W / 2, H / 2
     focal = npz["focal"].astype(np.float64)
+    user_edits = load_user_edits(workdir, char_id, N)
+    for e in user_edits:
+        if e.get("camera") and e["camera"].get("vfov"):
+            fu = cam.focal_from_vfov(float(e["camera"]["vfov"]), H)
+            k = fu / max(focal[e["start"]], 1e-6)
+            focal[e["start"]:e["end"]] *= 1 + (k - 1) * e["w"]
     shot_of = npz["shot_of"]
     shots = [dict(s) for s in A["shots"]]
     for i, s in enumerate(shots):
@@ -824,8 +882,23 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     if hinted.any():
         front_v = np.where(hinted, hint * HINT_STRENGTH, front_v if front_v is not None else np.nan)
     dbg("front_vote", front_v if front_v is not None else np.full(N, np.nan))
+    user_prior, user_prior_w = None, None
+    if any(e.get("character") for e in user_edits):
+        r3_e, view_e = facing.lateral_axes(uv_f, focal, cx, cy)
+        user_prior, user_prior_w = np.full(N, np.nan), np.zeros(N)
+        for e in user_edits:
+            got = edit_in_camera(e)
+            if got is None:
+                continue
+            _, F = got
+            f0 = e["start"]
+            psi_u = float(np.arctan2(F @ r3_e[f0], -(F @ view_e[f0])))
+            user_prior[e["start"]:e["end"]] = psi_u
+            user_prior_w[e["start"]:e["end"]] = USER_FACING_W * e["w"]
+        dbg("user_facing", user_prior)
     psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
-                                                  shot_spans(valid, shot_of), fps, W2=W2_f, front=front_v)
+                                                  shot_spans(valid, shot_of), fps, W2=W2_f, front=front_v,
+                                                  prior=user_prior, prior_w=user_prior_w)
     if CARRY_FACING and wb_sync is not None:
         prior = carried_facing(psi_p, bad, valid, uv, wb_sync[1], focal, cx, cy, shot_of, shots, npz, W, H, fps)
         dbg("facing_prior", prior)
@@ -966,6 +1039,22 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                              progress=lambda f: progress(0.05 + 0.2 * f, "Reconstructing the body in 3D"))
     P[~valid] = np.nan
     T = (P[:, L_HIP] + P[:, R_HIP]) / 2  # camera -> hip centre, now with the refined distance
+    for e in user_edits:
+        # where the user put the character relative to the camera: the whole
+        # body is moved there over the edit's length
+        got = edit_in_camera(e)
+        if got is None:
+            continue
+        hips_u, _ = got
+        a, b = e["start"], e["end"]
+        fin = np.isfinite(T[a:b, 0])
+        if not fin.any():
+            continue
+        f0 = a + int(np.argmax(fin))  # the edit's frame, or the first solved one after it
+        d = hips_u - T[f0]
+        P[a:b] = P[a:b] + (e["w"][:, None, None] * d[None, None, :])
+    if user_edits:
+        T = (P[:, L_HIP] + P[:, R_HIP]) / 2
     mp2d = lm2d  # MediaPipe's own picture positions (it does not clamp joints to the edge)
     lm2d = uv
     # landmarks that are not part of the solve ride along with their parent joint
@@ -984,6 +1073,17 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         yaw_at[f] = cam.hips_yaw(P[f], Rw0)
     R_w = world_cameras(npz["cam_q"].astype(np.float64), shot_of, shots, [], {}, None, focal, W, H, facing=yaw_at,
                         links=shot_links(npz))
+    for e in user_edits:
+        if not e.get("camera"):
+            continue
+        # the camera the user set at the edit's first frame; the camera's own
+        # tracked turning carries on from it over the edit's length
+        a, b = e["start"], e["end"]
+        Cc = _three_to_cv(e["camera"]["quat"]) @ R_w[a].T
+        for k in range(a, b):
+            w = e["w"][k - a]
+            Ck = Cc if w >= 1 else quat_to_mat(slerp(np.array([0, 0, 0, 1.0]), mat_to_quat(Cc[None])[0], w)[None])[0]
+            R_w[k] = Ck @ R_w[k]
 
     # head: fitted to the face points (turn, nod, tilt), in world space
     Rface, face_q = headfit.head_from_face(wb2d, wbs, focal, cx, cy, valid)

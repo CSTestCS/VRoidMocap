@@ -22,12 +22,21 @@ const S = { analysis: null, character: null, viewer: null, anim: null, playing: 
 
 // ------------------------------------------------------------------ navigation
 function showStep(name) {
-  const keysMode = name === "keys";
-  const sec = keysMode ? "viewer" : name;
+  const keysMode = name === "keys", editMode = name === "edit";
+  const sec = keysMode || editMode ? "viewer" : name;
   document.querySelectorAll(".step").forEach((s) => s.classList.toggle("active", s.id === "step-" + sec));
   document.querySelectorAll("#steps button").forEach((b) => b.classList.toggle("active", b.dataset.step === name));
   document.body.classList.toggle("keys-mode", keysMode);
+  document.body.classList.toggle("edit-mode", editMode);
   $("keyPanel").hidden = !keysMode;
+  $("editPanel").hidden = !editMode;
+  if (S.viewer) {
+    // corrections are made in the animation's own world: no turn, no locked movement
+    if (editMode) { S.viewer.yaw = 0; S.viewer.lockMove = false; S.viewer.lockHeight = false; }
+    else { S.viewer.yaw = (Number($("rotSlider").value) * Math.PI) / 180; S.viewer.lockMove = $("lockMove").checked; S.viewer.lockHeight = $("lockHeight").checked; }
+    if (!editMode) { E.draft = null; S.viewer.setEdit(null); }
+  }
+  if (editMode) refreshEditPanel();
   if (keysMode) refreshKeyPanel();
   if (sec === "viewer") { S.viewer?.resize(); setTimeout(() => { S.viewer?.resize(); if (S.anim) { sizeLm(); drawTrack(); } }, 30); }
   if (name === "analysis") drawCamChart();
@@ -224,7 +233,7 @@ async function startCapture(cid) {
     await api("/api/capture", { character: cid, smoothing: Number($("smoothing").value), foot_lock: $("footLock").checked });
     const st = await watchJob();
     await refreshState();
-    if (!st.error) openAnimation(cid);
+    if (!st.error) openAnimation(cid, "edit");
   } catch (e) { toast(e.message, true); }
 }
 
@@ -240,9 +249,9 @@ async function ensureViewer() {
     setJob(null);
   }
 }
-async function openAnimation(cid) {
+async function openAnimation(cid, step = "edit") {
   try {
-    showStep("viewer");
+    showStep(step);
     await ensureViewer();
     const keepT = S.character === cid && S.anim ? S.frame / S.anim.fps : null;
     const fps = Number($("fpsSel").value);
@@ -258,10 +267,10 @@ async function openAnimation(cid) {
       ? `Proportions measured over the whole video (share of the leg length): upper arm ${f2(pr.upper_arm)} · forearm ${f2(pr.forearm)} · thigh ${f2(pr.thigh)} · shin ${f2(pr.shin)} · shoulders ${f2(pr.shoulder_width)} · hips ${f2(pr.hip_width)}`
       : "";
     S.character = cid;
-    $("steps").children[2].disabled = false;
-    $("steps").children[3].disabled = false;
+    for (const k of [2, 3, 4]) $("steps").children[k].disabled = false;
     await loadKeys(cid);
     await loadFacing(cid);
+    await loadEdits(cid);
     const c = S.analysis.characters.find((x) => x.id === cid);
     $("viewerChar").textContent = c ? c.name : "";
     $("scrub").max = meta.frames - 1;
@@ -274,12 +283,139 @@ async function openAnimation(cid) {
     seek(keepT != null ? keepT * meta.fps : firstValid());
   } catch (e) { toast(e.message, true); }
 }
+// ------------------------------------------------------------------ step 3: corrections (Edit)
+const E = { edits: [], draft: null, cid: null };
+const epDefaults = () => ({ camOn: false, cam: { yaw: 0, pitch: 0, roll: 0, fov: 40, dist: 0 }, chrOn: false, chr: { place: null, dx: 0, dz: 0, dy: 0, yaw: 0 } });
+async function loadEdits(cid) {
+  E.cid = cid;
+  try { E.edits = (await api(`/api/edits/${cid}`)).edits || []; } catch (e) { E.edits = []; }
+  E.draft = null;
+  E.dirty = false;
+  refreshEditPanel();
+}
+// video frame <-> animation frame (the animation can be resampled)
+function animFrameOf(src) {
+  const A = S.anim; if (!A) return 0;
+  let lo = 0, hi = A.frames - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (A.src[m] < src) lo = m + 1; else hi = m; }
+  return lo;
+}
+function saveEdits() {
+  return api(`/api/edits/${E.cid}`, { edits: E.edits }).then((r) => { E.edits = r.edits; refreshEditPanel(); drawTrack(); })
+    .catch((e) => toast("Corrections not saved: " + e.message, true));
+}
+function refreshEditPanel() {
+  if (!S.anim) return;
+  const d = E.draft;
+  $("epIdle").hidden = !!d;
+  $("epDraft").hidden = !d;
+  $("epCount").textContent = E.edits.length ? `${E.edits.length} saved` : "";
+  $("epSubmit").disabled = !E.edits.length && !E.dirty;
+  const list = $("epList");
+  list.innerHTML = "";
+  E.edits.forEach((e, i) => {
+    const row = document.createElement("div");
+    row.className = "ep-item";
+    const what = [e.camera ? "camera" : null, e.character ? "character" : null].filter(Boolean).join(" + ") || "—";
+    row.innerHTML = `<span>Frame ${animFrameOf(e.frame)} · ${what} · ${e.length} frames</span><button class="ghost small">Go</button><button class="ghost small">✕</button>`;
+    const [go, del] = row.querySelectorAll("button");
+    go.onclick = () => { S.playing = false; updatePlay(); seek(animFrameOf(e.frame)); };
+    del.onclick = () => { E.edits.splice(i, 1); E.dirty = true; saveEdits(); };
+    list.appendChild(row);
+  });
+  if (d) {
+    $("epFrame").textContent = d.frame;
+    $("epFrameNote").textContent = S.frame !== d.frame ? `(you are at frame ${S.frame}: the preview shows the correction at its own frame)` : "";
+    $("epCamOn").checked = d.camOn; $("epCam").hidden = !d.camOn;
+    $("epChrOn").checked = d.chrOn; $("epChr").hidden = !d.chrOn;
+    document.querySelectorAll("#epDraft input[type=range]").forEach((r) => {
+      const [g, k] = r.dataset.k.split(".");
+      r.value = d[g][k];
+      r.nextElementSibling.textContent = Number(d[g][k]).toFixed(k === "dx" || k === "dz" || k === "dy" || k === "dist" ? 2 : 1);
+    });
+  }
+}
+function applyDraft() {
+  const d = E.draft;
+  S.viewer.setEdit(d ? { frame: d.frame, camOn: d.camOn, cam: d.cam, chrOn: d.chrOn, chr: d.chr } : null);
+  refreshEditPanel();
+}
+$("epMark").onclick = () => {
+  if (!S.anim) return;
+  S.playing = false; updatePlay();
+  const d = epDefaults();
+  d.frame = S.frame;
+  d.cam.fov = Math.round(S.anim.vfov[S.frame] * 2) / 2;
+  $("epLen").value = Math.max(1, Math.round(S.anim.fps));  // a second, until set
+  E.draft = d;
+  if (S.layout === "3d") setLayout("overlay");
+  applyDraft();
+};
+$("epCancel").onclick = () => { E.draft = null; applyDraft(); };
+$("epCamOn").onchange = (e) => { E.draft.camOn = e.target.checked; applyDraft(); };
+$("epChrOn").onchange = (e) => { E.draft.chrOn = e.target.checked; applyDraft(); };
+document.querySelectorAll("#epDraft input[type=range]").forEach((r) => (r.oninput = () => {
+  const [g, k] = r.dataset.k.split(".");
+  E.draft[g][k] = Number(r.value);
+  applyDraft();
+}));
+$("epEndHere").onclick = () => {
+  if (!E.draft) return;
+  if (S.frame <= E.draft.frame) { toast("Scrub forward to where it is right again first.", true); return; }
+  $("epLen").value = S.frame - E.draft.frame;
+};
+// click the picture to put her there (on the floor, seen through the video camera)
+for (const el of [$("gl")]) {
+  el.addEventListener("click", (ev) => {
+    const d = E.draft;
+    if (!d || !d.chrOn || S.frame !== d.frame || !S.viewer) return;
+    const p = S.viewer.floorAt(ev.clientX, ev.clientY);
+    if (p) { d.chr.place = p; d.chr.dx = 0; d.chr.dz = 0; applyDraft(); }
+  });
+}
+$("epSave").onclick = () => {
+  const d = E.draft;
+  if (!d) return;
+  if (!d.camOn && !d.chrOn) { toast("Tick what is wrong (the camera, the character or both) and line it up first.", true); return; }
+  if (S.frame !== d.frame) { S.playing = false; updatePlay(); seek(d.frame); }
+  // read the corrected picture at the correction's frame (the preview applies it there)
+  S.viewer.applyPose();
+  const snap = S.viewer.editSnapshot();
+  if (d.chrOn && !snap.character?.box) { toast("The character is not in the picture: put her where she is first.", true); return; }
+  const A = S.anim;
+  const a = A.src[d.frame];
+  const lenAnim = Math.max(1, Number($("epLen").value) || 1);
+  const b = A.src[Math.min(A.frames - 1, d.frame + lenAnim)];
+  const edit = { frame: Math.round(a), length: Math.max(1, Math.round(b - a)), view: snap.view };
+  if (snap.camera) edit.camera = snap.camera;
+  if (snap.character) edit.character = snap.character;
+  E.edits = E.edits.filter((e) => e.frame !== edit.frame).concat([edit]);
+  E.dirty = true;
+  E.draft = null;
+  applyDraft();
+  saveEdits();
+  toast("Correction saved. Add more, then submit them.");
+};
+$("epSubmit").onclick = async () => {
+  if (S.character == null) return;
+  try {
+    await api("/api/refine", { character: S.character, smoothing: Number($("smoothing").value), foot_lock: $("footLock").checked });
+    const cid = S.character;
+    showStep("analysis");
+    const st = await watchJob();
+    await refreshState();
+    if (!st.error) { await openAnimation(cid, "edit"); toast("Animated again with your corrections. Check it, and correct more if needed."); }
+    else showStep("edit");
+  } catch (e) { toast(e.message, true); }
+};
+$("epDone").onclick = () => showStep("viewer");
+
 // ------------------------------------------------------------------ rotate the whole animation
 let rotTimer = null;
 function setRotation(deg, save = true) {
   deg = Math.max(-180, Math.min(180, Math.round(Number(deg) || 0)));
   $("rotSlider").value = deg; $("rotNum").value = deg;
-  if (S.viewer) S.viewer.yaw = (deg * Math.PI) / 180;
+  if (S.viewer && !document.body.classList.contains("edit-mode")) S.viewer.yaw = (deg * Math.PI) / 180;
   if (save && S.character != null) {
     clearTimeout(rotTimer);
     rotTimer = setTimeout(() => api(`/api/rotation/${S.character}`, { degrees: deg }).catch((e) => toast("Rotation not saved: " + e.message, true)), 300);
@@ -537,11 +673,18 @@ function seek(f) {
   else sizeLm();
   refreshKeyPanel();
   refreshFacing();
+  if (E.draft) refreshEditPanel();
+  if (!S.playing) parkAudio();
 }
 $("scrub").oninput = (e) => { S.playing = false; updatePlay(); seek(Number(e.target.value)); };
 $("stepBack").onclick = () => { S.playing = false; updatePlay(); seek(S.frame - 1); };
 $("stepFwd").onclick = () => { S.playing = false; updatePlay(); seek(S.frame + 1); };
-function updatePlay() { $("playBtn").textContent = S.playing ? "⏸" : "▶"; syncAudio(); }
+function updatePlay() {
+  $("playBtn").textContent = S.playing ? "⏸" : "▶";
+  if (S.playing && soundOn && (audio.paused || audio.readyState < 3)) S.waitAudio = performance.now();
+  if (!S.playing) S.waitAudio = 0;
+  syncAudio();
+}
 $("playBtn").onclick = () => {
   S.playing = !S.playing;
   const [a, b] = playRange();
@@ -567,8 +710,10 @@ $("cropIn").onclick = () => setCrop(S.frame, S.crop ? Math.max(S.crop[1], S.fram
 $("cropOut").onclick = () => setCrop(S.crop ? Math.min(S.crop[0], S.frame) : 0, S.frame);
 $("cropClear").onclick = () => setCrop(null);
 document.addEventListener("keydown", (e) => {
-  if (!$("step-viewer").classList.contains("active") || e.target.tagName === "INPUT" && e.target.type !== "range") return;
-  if (e.target.closest && e.target.closest("#keyPanel") && e.target.type === "range" && e.code.startsWith("Arrow")) return;
+  if (!$("step-viewer").classList.contains("active") || e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
+  if (e.target.tagName === "TEXTAREA") return;
+  if (e.target.closest && e.target.closest("#keyPanel, #editPanel, .rot") && e.target.type === "range" && e.code.startsWith("Arrow")) return;
+  if (e.target.tagName === "SELECT" && e.code.startsWith("Arrow")) e.target.blur();
   if (e.code === "Space") { e.preventDefault(); $("playBtn").click(); }
   if (e.shiftKey && !$("keyPanel").hidden && (e.code === "ArrowLeft" || e.code === "ArrowRight")) { e.preventDefault(); jumpKey(e.code === "ArrowLeft" ? -1 : 1); return; }
   if (e.code === "ArrowLeft") { e.preventDefault(); $("stepBack").click(); }
@@ -584,6 +729,14 @@ function tick(now) {
   if (!S.playing || !S.anim) return;
   const dt = (now - (S.last || now)) / 1000;
   S.last = now;
+  // with sound on, the picture waits for the sound to start (at most 2 s), so they start together
+  if (S.waitAudio) {
+    if (audio.paused || audio.readyState < 3) {
+      syncAudio();
+      if (now - S.waitAudio < 2000) return;
+    }
+    S.waitAudio = 0;
+  }
   S.t += dt * Number($("speed").value);
   const [a, b] = playRange();
   let f = Math.floor(S.t * S.anim.fps);
@@ -604,8 +757,9 @@ audio.volume = Number($("volume").value);
 function loadAudio() {
   audio.pause();
   audio.removeAttribute("src");
-  if (soundOn) { audio.src = `/api/media?t=${Date.now()}`; }
+  if (soundOn) { audio.src = `/api/media?t=${Date.now()}`; audio.load(); }
   updateSound();
+  parkAudio();
 }
 function updateSound() {
   $("muteBtn").textContent = soundOn ? "🔊" : "🔇";
@@ -618,12 +772,23 @@ function audioTime() {
   const f = S.frame;
   return A.src[f] / sfps + Math.max(0, S.t - f / A.fps);
 }
+let parkTimer = null;
+function parkAudio() {
+  // paused: keep the sound loaded at the playhead, so that it starts at once on play
+  if (!S.anim || !soundOn || S.playing) return;
+  clearTimeout(parkTimer);
+  parkTimer = setTimeout(() => {
+    if (!audio.getAttribute("src")) { audio.src = `/api/media?t=${Date.now()}`; audio.load(); }
+    try { if (Math.abs(audio.currentTime - audioTime()) > 0.05) audio.currentTime = audioTime(); } catch (e) { /* not loaded yet */ }
+  }, 120);
+}
 function syncAudio() {
   if (!S.anim || !soundOn || !S.playing) {
     if (!audio.paused) audio.pause();
+    parkAudio();
     return;
   }
-  if (!audio.getAttribute("src")) audio.src = `/api/media?t=${Date.now()}`;
+  if (!audio.getAttribute("src")) { audio.src = `/api/media?t=${Date.now()}`; audio.load(); }
   const rate = Number($("speed").value);
   if (audio.playbackRate !== rate) audio.playbackRate = rate;
   const want = audioTime();
@@ -634,7 +799,14 @@ function syncAudio() {
     audio.currentTime = want;  // jumped (seek, loop, a cut in the animation) or drifted
   }
 }
-$("muteBtn").onclick = () => { soundOn = !soundOn; updateSound(); syncAudio(); };
+$("muteBtn").onclick = () => {
+  soundOn = !soundOn;
+  updateSound();
+  if (soundOn && S.playing && (audio.paused || audio.readyState < 3)) S.waitAudio = performance.now();
+  syncAudio();
+};
+audio.addEventListener("playing", () => { S.waitAudio = 0; S.last = performance.now(); });
+$("speed").addEventListener("change", (e) => e.target.blur());
 $("volume").oninput = (e) => {
   audio.volume = Number(e.target.value);
   try { localStorage.setItem("vm.volume", e.target.value); } catch (er) { /* no storage */ }
@@ -667,6 +839,13 @@ function drawTrack() {
   if (K.cid === S.character) {  // hand-set keys: amber ticks (bright in step 4)
     ctx.fillStyle = $("keyPanel").hidden ? "rgba(246,173,85,.45)" : "#f6ad55";
     for (const tab of ["hands", "face"]) for (const t of keyTimes(tab)) ctx.fillRect(Math.round((t * A.fps / n) * W), tab === "hands" ? 0 : 9, 2, 9);
+  }
+  if (E.edits.length && A.src) {  // corrections: red, over the frames they cover
+    ctx.fillStyle = "rgba(240,90,90,0.9)";
+    for (const e of E.edits) {
+      const f0 = animFrameOf(e.frame), f1 = animFrameOf(e.frame + e.length);
+      ctx.fillRect((f0 / n) * W, 0, Math.max(2, ((f1 - f0) / n) * W), 3);
+    }
   }
   if (S.crop) {
     const x0 = (S.crop[0] / n) * W, x1 = ((S.crop[1] + 1) / n) * W;
@@ -728,7 +907,11 @@ $("exportBtn").onclick = () => {
   if (S.crop) $("exCropInfo").textContent = `(${$("cropInfo").textContent.replace(/^Range /, "")})`;
   $("exportDlg").showModal();
 };
-$("fpsSel").onchange = () => { if (S.character != null) openAnimation(S.character); };
+$("fpsSel").onchange = (e) => {
+  e.target.blur();
+  const cur = document.body.classList.contains("edit-mode") ? "edit" : document.body.classList.contains("keys-mode") ? "keys" : "viewer";
+  if (S.character != null) openAnimation(S.character, cur);
+};
 $("exportDlg").addEventListener("close", async () => {
   if ($("exportDlg").returnValue !== "ok") return;
   const opts = { character: S.character, in_place: $("exInPlace").checked, lock_height: $("exLockHeight").checked, camera: $("exCamera").checked, fps: S.anim.fps, model: $("exModel").checked };

@@ -221,6 +221,10 @@ export class Viewer {
     F.group.matrix.copy(new THREE.Matrix4().makeRotationY(this.yaw).multiply(new THREE.Matrix4().makeTranslation(-off.x, -off.y, -off.z)).multiply(this.fbxPlacement));
     F.group.matrixWorldNeedsUpdate = true;
     F.group.updateMatrixWorld(true);
+    if (this._editAt(f)) {
+      const M = this._editCharMatrix(F.hips);
+      if (M) { F.group.matrix.premultiply(M); F.group.matrixWorldNeedsUpdate = true; F.group.updateMatrixWorld(true); }
+    }
   }
 
   applyPose() {
@@ -242,7 +246,9 @@ export class Viewer {
     }
     const f = this.frame;
     const s = this.isVrm0 ? -1 : 1;
-    this.vrm.scene.rotation.y = (this.baseYaw ?? 0) + this.yaw;
+    this.vrm.scene.position.set(0, 0, 0);
+    this.vrm.scene.scale.set(1, 1, 1);
+    this.vrm.scene.rotation.set(0, (this.baseYaw ?? 0) + this.yaw, 0);
     const B = A.B;
     for (let i = 0; i < B; i++) {
       const n = this.nodes[i];
@@ -257,6 +263,16 @@ export class Viewer {
       hips.position.set(s * x, y, s * z);
     }
     this._applyKeys(f);
+    if (this._editAt(f)) {
+      this.vrm.scene.updateMatrixWorld(true);
+      const M = this._editCharMatrix(hips);
+      if (M) {
+        this.vrm.scene.updateMatrix();
+        const m = M.multiply(this.vrm.scene.matrix);
+        m.decompose(this.vrm.scene.position, this.vrm.scene.quaternion, this.vrm.scene.scale);
+        this.vrm.scene.updateMatrixWorld(true);
+      }
+    }
     const jumped = Math.abs(f - this.lastFrame) > 2;
     const dt = jumped ? 0 : Math.min(0.1, Math.abs(f - this.lastFrame) / A.fps);
     this.vrm.update(dt);
@@ -285,6 +301,14 @@ export class Viewer {
     this.videoCam.position.set(cp[f * 3] - off.x, cp[f * 3 + 1] - off.y, cp[f * 3 + 2] - off.z).applyQuaternion(qy);
     this.videoCam.quaternion.set(cq[f * 4], cq[f * 4 + 1], cq[f * 4 + 2], cq[f * 4 + 3]).premultiply(qy);
     this.videoCam.fov = A.vfov[f];
+    if (this._editAt(f) && this.edit.camOn) {
+      const c = this.edit.cam, cam = this.videoCam, d2r = Math.PI / 180;
+      cam.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), c.yaw * d2r));
+      cam.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), c.pitch * d2r));
+      cam.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), c.roll * d2r));
+      cam.position.add(new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).multiplyScalar(c.dist));
+      if (c.fov) cam.fov = c.fov;
+    }
     this.videoCam.updateProjectionMatrix();
     if (this.mode === "free" && this.followTarget && hips) {
       const p = new THREE.Vector3();
@@ -293,6 +317,88 @@ export class Viewer {
       this.controls.target.add(d);
       this.freeCam.position.add(d);
     }
+  }
+
+  // ---- corrections (the Edit step): previewed at their frame only
+  /** edit = {frame, camOn, cam: {yaw, pitch, roll, fov, dist}, chrOn, chr: {place: [x, z] | null, dx, dz, dy, yaw}} */
+  setEdit(edit) { this.edit = edit; this.lastFrame = -1; }
+  _editAt(f) { return !!(this.edit && this.edit.frame === f && this.anim); }
+  _editCharMatrix(hipsNode) {
+    const e = this.edit;
+    if (!e || !e.chrOn || !hipsNode) return null;
+    const h = new THREE.Vector3();
+    hipsNode.getWorldPosition(h);
+    // the camera's left/right and forward on the floor (before any camera correction)
+    const cq = this.anim.camQuat, f = this.frame;
+    const q = new THREE.Quaternion(cq[f * 4], cq[f * 4 + 1], cq[f * 4 + 2], cq[f * 4 + 3]);
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q); right.y = 0; right.normalize();
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q); fwd.y = 0; fwd.normalize();
+    const t = h.clone();
+    if (e.chr.place) { t.x = e.chr.place[0]; t.z = e.chr.place[1]; }
+    t.addScaledVector(right, e.chr.dx || 0).addScaledVector(fwd, e.chr.dz || 0);
+    t.y += e.chr.dy || 0;
+    return new THREE.Matrix4().makeTranslation(t.x, t.y, t.z)
+      .multiply(new THREE.Matrix4().makeRotationY(((e.chr.yaw || 0) * Math.PI) / 180))
+      .multiply(new THREE.Matrix4().makeTranslation(-h.x, -h.y, -h.z));
+  }
+  /** The floor point (x, z) under a click on the picture (video camera), or null. */
+  floorAt(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect(), r = this.videoRect();
+    const x = ((clientX - rect.left - r.x) / r.w) * 2 - 1, y = -(((clientY - rect.top - r.y) / r.h) * 2 - 1);
+    if (Math.abs(x) > 1 || Math.abs(y) > 1) return null;
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(new THREE.Vector2(x, y), this.videoCam);
+    const p = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) return null;
+    return [p.x, p.z];
+  }
+  _bonePositions() {
+    const out = [];
+    const v = () => new THREE.Vector3();
+    if (this.vrm) {
+      for (const b of ["hips", "spine", "chest", "neck", "head", "leftUpperArm", "rightUpperArm", "leftLowerArm", "rightLowerArm",
+        "leftHand", "rightHand", "leftUpperLeg", "rightUpperLeg", "leftLowerLeg", "rightLowerLeg", "leftFoot", "rightFoot"]) {
+        const n = this.vrm.humanoid.getNormalizedBoneNode(b);
+        if (n) { const p = v(); n.getWorldPosition(p); out.push([b, p]); }
+      }
+      const head = this.vrm.humanoid.getNormalizedBoneNode("head");
+      if (head) { const p = v(); head.getWorldPosition(p); p.y += 0.15; out.push(["headTop", p]); }
+    } else if (this.fbx) {
+      this.fbx.root.traverse((o) => { if (o.isBone) { const p = v(); o.getWorldPosition(p); out.push([o.name, p]); } });
+    }
+    return out;
+  }
+  /** What a correction at the current frame says, in the animation's world: the camera the user
+   * looked through (and set, if adjusted), and the character's hips, facing and box in the picture. */
+  editSnapshot() {
+    const cam = this.videoCam, A = this.anim;
+    cam.updateMatrixWorld(true);
+    const view = { quat: cam.quaternion.toArray(), pos: cam.position.toArray() };
+    const out = { view };
+    if (this.edit?.camOn) out.camera = { quat: view.quat, pos: view.pos, vfov: cam.fov };
+    if (this.edit?.chrOn) {
+      const bones = this._bonePositions();
+      const get = (n) => (bones.find((b) => b[0] === n) || [])[1];
+      const hipsN = this.hipsObject();
+      const h = new THREE.Vector3();
+      hipsN.getWorldPosition(h);
+      let L = get("leftUpperLeg"), R = get("rightUpperLeg");
+      if ((!L || !R) && this.fbx) { L = new THREE.Vector3(); R = new THREE.Vector3(); this.fbx.feet[0]?.getWorldPosition(L); this.fbx.feet[1]?.getWorldPosition(R); }
+      const fwd = new THREE.Vector3().crossVectors(L.clone().sub(R), new THREE.Vector3(0, 1, 0)).normalize();
+      // the box around her in the picture (video pixels)
+      const W = A.meta.width, H = A.meta.height;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const [, p] of bones) {
+        const q = p.clone().project(cam);
+        if (q.z > 1) continue;
+        const px = (q.x + 1) / 2 * W, py = (1 - q.y) / 2 * H;
+        x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py);
+      }
+      const pw = 0.15 * (x1 - x0), ph = 0.1 * (y1 - y0);
+      out.character = { hips: h.toArray(), fwd: fwd.toArray(), scale: A.meta.scale || 1,
+        box: isFinite(x0) ? [x0 - pw, y0 - ph, x1 + pw, y1 + ph] : null };
+    }
+    return out;
   }
 
   setMode(mode) {

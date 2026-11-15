@@ -120,3 +120,15 @@ body.keys-mode .stage.only3d #paneVideo, body.keys-mode .stage.overlay #paneVide
 .rot { display: inline-flex; align-items: center; gap: 6px; }
 .rot input[type=range] { width: 120px; }
 .rot input[type=number] { width: 56px; }
+
+.editpanel .ep-group { border-left: 2px solid var(--line); margin: 4px 0 8px; padding-left: 8px; }
+.ep-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; }
+.ep-row > span:first-child { min-width: 110px; }
+.ep-row input[type=range] { flex: 1; }
+.ep-row output { min-width: 44px; text-align: right; color: var(--muted); }
+.ep-row input[type=number] { width: 64px; }
+.ep-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.ep-list { margin: 8px 0; display: flex; flex-direction: column; gap: 4px; }
+.ep-item { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+.ep-item span { flex: 1; }
+body.edit-mode .anim-only { display: none !important; }

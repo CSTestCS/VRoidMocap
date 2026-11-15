@@ -837,6 +837,60 @@ def capture(video, workdir, char_id, progress=None, cancel=None, workers=None):
     return out
 
 
+def track_from_box(video, start, end, box, wb_path):
+    """Per-frame boxes of a character over frames [start, end), starting from
+    a box the user drew around her at `start`: each frame the whole-body model
+    reads her in the box and the next box follows her sure joints (its size
+    changing at most 15% a frame); where the reading is unsure the box holds."""
+    wbody = whole_body(wb_path)
+    rd = VideoReader(video)
+    bb = np.asarray(box, np.float64).copy()
+    H_, W_ = rd.height, rd.width
+    out = []
+    st = {}
+    for fi, bgr in rd.iter_frames(1, start, end):
+        out.append(bb.copy())
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        kp, sc, _ = wb_read(wbody, rgb, bb, st)
+        k = np.r_[0:17]
+        ok = sc[k] >= 0.35
+        if ok.sum() < 4:
+            continue
+        p = kp[k][ok]
+        lo, hi = p.min(0), p.max(0)
+        w, h = max(hi[0] - lo[0], 20.0), max(hi[1] - lo[1], 20.0)
+        nb = np.array([lo[0] - 0.25 * w, lo[1] - 0.2 * h, hi[0] + 0.25 * w, hi[1] + 0.2 * h])
+        # size: damped; centre: follows
+        ow, oh = bb[2] - bb[0], bb[3] - bb[1]
+        nw = float(np.clip(nb[2] - nb[0], 0.85 * ow, 1.15 * ow))
+        nh = float(np.clip(nb[3] - nb[1], 0.85 * oh, 1.15 * oh))
+        c = (nb[:2] + nb[2:]) / 2
+        bb = np.array([c[0] - nw / 2, c[1] - nh / 2, c[0] + nw / 2, c[1] + nh / 2])
+        bb = np.clip(bb, [-0.5 * W_, -0.5 * H_, 0, 0], [W_, H_, 1.5 * W_, 1.5 * H_])
+    rd.close()
+    while len(out) < end - start:
+        out.append(bb.copy())
+    return np.array(out)
+
+
+def recapture_range(video, workdir, char_id, start, end, box, fps, progress=None):
+    """Landmarks for frames [start, end) of a character, tracked from a box the
+    user drew (the Edit step). Returns a dict of the capture arrays for those
+    frames (cached by range and box)."""
+    import hashlib
+    from .detect import ensure_model
+    wb_path = ensure_model("wholebody")
+    cdir = os.path.join(workdir, f"capture_c{char_id}")
+    os.makedirs(cdir, exist_ok=True)
+    key = hashlib.md5(np.asarray(box, np.float64).round(1).tobytes()).hexdigest()[:10]
+    out_path = os.path.join(cdir, f"edit{CAPTURE_VERSION}_{start:07d}_{end:07d}_{key}.npz")
+    if not os.path.exists(out_path):
+        boxes = track_from_box(video, start, end, box, wb_path)
+        process_chunk((video, start, end, boxes, fps, out_path, wb_path))
+    d = dict(np.load(out_path))
+    return d
+
+
 def fill_wholebody_gaps(wb2d, wbs, ranges, max_gap=3, wbz=None):
     """Interpolate the whole-body keypoints over the frames it was not run on."""
     for s, e in ranges:

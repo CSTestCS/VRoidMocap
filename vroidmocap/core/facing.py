@@ -137,7 +137,7 @@ def _true_width(w, ok, fallback):
 
 
 def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None,
-                 front=None):
+                 front=None, prior_w=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
@@ -267,7 +267,8 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
             base = base + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
         if prior is not None:
             pr = prior[sl]
-            base = base + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
+            pw = W_PRIOR if prior_w is None else prior_w[sl][:, None]
+            base = base + np.where(np.isfinite(pr)[:, None], pw * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
         l2c = lp2_c[sl] if lp2_c is not None else None
         l2p = lp2_p[sl] if lp2_p is not None else None
         u0 = (base + learned_cost2(lp_c[sl], l2c) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
@@ -294,7 +295,8 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
             up_ = up_ + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
         if prior is not None:
             pr = prior[sl]
-            up_ = up_ + np.where(np.isfinite(pr)[:, None], W_PRIOR * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
+            pw = W_PRIOR if prior_w is None else prior_w[sl][:, None]
+            up_ = up_ + np.where(np.isfinite(pr)[:, None], pw * (1 - np.cos(PSI[None] - np.nan_to_num(pr)[:, None])), 0.0)
         kp = _viterbi(up_, tp)
         pp = np.array([_refine(up_[i], kp[i]) for i in range(e - s)])
         # continuous: light zero-phase smoothing

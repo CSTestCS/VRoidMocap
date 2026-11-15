@@ -202,11 +202,80 @@ class AppState:
                 cap = capture(self.video, self.workdir, char_id,
                               lambda f, m: progress(f * 0.85, m), cancel)
                 np.savez_compressed(cap_path, **cap)
+                orig = os.path.join(self.workdir, f"capture_c{char_id}_orig.npz")
+                if os.path.exists(orig):
+                    os.remove(orig)  # (the Edit step's base capture: this is the new one)
             anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
                                    lambda f, m: progress(0.85 + 0.15 * f, m), foot_lock=foot_lock)
             self._save_anim(char_id, anim)
             return {"character": char_id}
         self.job = Job("capture", run)
+
+    # ------------------------------------------------------------------ the Edit step: the user's corrections
+    def edits(self, char_id):
+        p = os.path.join(self.workdir, f"edits_c{char_id}.json")
+        try:
+            with open(p) as fh:
+                return {"edits": json.load(fh)}
+        except (OSError, ValueError):
+            return {"edits": []}
+
+    def save_edits(self, char_id, edits):
+        if not isinstance(edits, list):
+            raise ValueError("edits must be a list")
+        clean = []
+        for e in edits:
+            c = {"frame": int(e["frame"]), "length": max(1, int(e.get("length", 1)))}
+            for k in ("camera", "character", "view", "note"):
+                if e.get(k) is not None:
+                    c[k] = e[k]
+            clean.append(c)
+        clean.sort(key=lambda e: e["frame"])
+        with open(os.path.join(self.workdir, f"edits_c{char_id}.json"), "w") as fh:
+            json.dump(clean, fh)
+        return {"edits": clean}
+
+    def start_refine(self, char_id, smoothing=1.0, foot_lock=True):
+        """Animate again with the user's corrections: where the user placed the
+        character, those frames are captured again (tracked from the box drawn
+        around her), then the whole animation is solved with every correction."""
+        if self.job and not self.job.done:
+            raise ValueError("Another task is still running")
+        if self.skel is None:
+            raise ValueError("Choose a .vrm avatar first")
+        from .core.capture import recapture_range
+        from .core.retarget import solve_animation
+
+        def run(progress, cancel):
+            import shutil
+            cap_path = os.path.join(self.workdir, f"capture_c{char_id}.npz")
+            orig = os.path.join(self.workdir, f"capture_c{char_id}_orig.npz")
+            if not os.path.exists(cap_path) and not os.path.exists(orig):
+                raise ValueError("Motion capture this character first")
+            if not os.path.exists(orig):
+                shutil.copyfile(cap_path, orig)
+            cap = dict(np.load(orig))
+            fps = float(self.analysis["fps"])
+            N = len(cap["tracked"])
+            todo = [e for e in self.edits(char_id)["edits"] if (e.get("character") or {}).get("box")]
+            for k, e in enumerate(todo):
+                if cancel():
+                    from .core.analysis import Cancelled
+                    raise Cancelled()
+                a = int(np.clip(e["frame"], 0, N - 1))
+                b = int(np.clip(a + int(e["length"]), a + 1, N))
+                progress(0.05 + 0.75 * k / max(len(todo), 1), f"Looking again at frames {a}-{b - 1} with your correction ({k + 1}/{len(todo)})")
+                got = recapture_range(self.video, self.workdir, char_id, a, b, e["character"]["box"], fps)
+                for key, arr in got.items():
+                    if key in cap and cap[key].shape[1:] == arr.shape[1:] and len(cap[key]) >= b:
+                        cap[key][a:b] = arr[:b - a]
+                cap["tracked"][a:b] = True
+            np.savez_compressed(cap_path, **cap)
+            anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
+                                   lambda f, m: progress(0.8 + 0.2 * f, m), foot_lock=foot_lock)
+            self._save_anim(char_id, anim)
+            return {"character": char_id}
+        self.job = Job("refine", run)
 
     def _save_anim(self, char_id, anim):
         arrays = {k: v for k, v in anim.items() if isinstance(v, np.ndarray)}
@@ -510,6 +579,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, STATE.keys_info(int(p.split("/")[3])))
             if p.startswith("/api/facing/"):
                 return self._send(200, STATE.facing_hints(int(p.split("/")[3])))
+            if p.startswith("/api/edits/"):
+                return self._send(200, STATE.edits(int(p.split("/")[3])))
             if p == "/api/export.fbx":
                 cid = int(q["character"])
                 fd, tmp = tempfile.mkstemp(suffix=".fbx")
@@ -572,6 +643,11 @@ class Handler(BaseHTTPRequestHandler):
                              int(body.get("fps", 30)), bool(body.get("model", True)),
                              start=body.get("start"), end=body.get("end"))
                 return self._send(200, {"ok": True, "path": path})
+            if p.startswith("/api/edits/"):
+                return self._send(200, STATE.save_edits(int(p.split("/")[3]), body.get("edits", [])))
+            if p == "/api/refine":
+                STATE.start_refine(int(body["character"]), float(body.get("smoothing", 1.0)), bool(body.get("foot_lock", True)))
+                return self._send(200, {"ok": True})
             if p.startswith("/api/rotation/"):
                 return self._send(200, {"degrees": STATE.set_rotation(int(p.split("/")[3]), body["degrees"])})
             if p.startswith("/api/facing/"):
