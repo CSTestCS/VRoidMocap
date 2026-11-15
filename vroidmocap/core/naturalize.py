@@ -74,16 +74,14 @@ def wrap(a):
 ACC_REF = np.radians(2.0)  # deviation from steady motion (per (frame at 30 fps)^2) where light smoothing takes over
 
 
-def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength=None, protect=None):
+def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength=None):
     """Q: (N,B,4) local quats, conf: (N,B) 0..1. Returns filtered Q (N,B,4).
 
     Frames where a bone's confidence is below `thr` (not visible, occluded,
     character off screen) keep the last seen rotation, then blend into the next
     seen rotation over `blend_s` seconds. Sudden spikes (single-frame flips)
     are treated as not seen. The result is smoothed more when the bone is
-    nearly still (where jitter shows) and less when it moves fast.
-    protect: optional (N,) frames set by the user (a pose in the Edit step):
-    never taken for spikes, and kept exactly as given."""
+    nearly still (where jitter shows) and less when it moves fast."""
     N, B = Q.shape[:2]
     out = np.empty_like(Q)
     fs = fps / 30.0
@@ -109,8 +107,6 @@ def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength
             dev = q_angle(qv, med)
             lim = max(np.radians(25), 5 * float(np.median(dev)))
             keep = dev < lim
-            if protect is not None:
-                keep |= protect[idx]
             if keep.sum() >= 2:
                 idx, qv = idx[keep], continuity(qv[keep])
         # hold + blend fill
@@ -149,18 +145,6 @@ def filter_rotations(Q, conf, fps, smoothing=1.0, thr=0.5, blend_s=0.2, strength
         dev = gaussian_smooth(dev, 2 * fs)
         alpha = np.clip(dev / (ACC_REF * (k / fs) ** 2), 0, 1)[:, None]
         res = normalize(heavy * (1 - alpha) + light * alpha)
-        if protect is not None:
-            pk = protect & ok
-            if pk.any():
-                # the user's pose exactly at its frame, eased into the smoothed motion around it
-                r = max(1, int(round(0.1 * fps)))
-                for f in np.where(pk)[0]:
-                    for d in range(-r, r + 1):
-                        g = f + d
-                        if 0 <= g < N:
-                            wgt = 1.0 - abs(d) / (r + 1)
-                            qf = full[f] if np.dot(full[f], res[g]) >= 0 else -full[f]
-                            res[g] = normalize(res[g] * (1 - wgt) + qf * wgt)
         out[:, b] = res
     return out
 

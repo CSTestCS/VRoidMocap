@@ -452,16 +452,9 @@ export class Viewer {
     const view = { quat: cam.quaternion.toArray(), pos: cam.position.toArray() };
     const out = { view };
     if (this.edit?.camOn) out.camera = { quat: view.quat, pos: view.pos, vfov: cam.fov };
-    if (this.edit?.chrOn) {
-      const bones = this._bonePositions();
-      const get = (n) => (bones.find((b) => b[0] === n) || [])[1];
-      const hipsN = this.hipsObject();
-      const h = new THREE.Vector3();
-      hipsN.getWorldPosition(h);
-      let L = get("leftUpperLeg"), R = get("rightUpperLeg");
-      if ((!L || !R) && this.fbx) { L = new THREE.Vector3(); R = new THREE.Vector3(); this.fbx.feet[0]?.getWorldPosition(L); this.fbx.feet[1]?.getWorldPosition(R); }
-      const fwd = new THREE.Vector3().crossVectors(L.clone().sub(R), new THREE.Vector3(0, 1, 0)).normalize();
-      // the box around her in the picture (video pixels)
+    const posed = this.edit?.poseOn && this.edit.pose && Object.values(this.edit.pose).some((a) => a && (a[0] || a[1] || a[2]));
+    // the box around her in the picture (video pixels): where the detector looks again
+    const boxOf = (bones) => {
       const W = A.meta.width, H = A.meta.height;
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const [, p] of bones) {
@@ -471,11 +464,21 @@ export class Viewer {
         x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py);
       }
       const pw = 0.15 * (x1 - x0), ph = 0.1 * (y1 - y0);
-      out.character = { hips: h.toArray(), fwd: fwd.toArray(), scale: A.meta.scale || 1,
-        box: isFinite(x0) ? [x0 - pw, y0 - ph, x1 + pw, y1 + ph] : null };
+      return isFinite(x0) ? [x0 - pw, y0 - ph, x1 + pw, y1 + ph] : null;
+    };
+    if (this.edit?.chrOn) {
+      const bones = this._bonePositions();
+      const get = (n) => (bones.find((b) => b[0] === n) || [])[1];
+      const hipsN = this.hipsObject();
+      const h = new THREE.Vector3();
+      hipsN.getWorldPosition(h);
+      let L = get("leftUpperLeg"), R = get("rightUpperLeg");
+      if ((!L || !R) && this.fbx) { L = new THREE.Vector3(); R = new THREE.Vector3(); this.fbx.feet[0]?.getWorldPosition(L); this.fbx.feet[1]?.getWorldPosition(R); }
+      const fwd = new THREE.Vector3().crossVectors(L.clone().sub(R), new THREE.Vector3(0, 1, 0)).normalize();
+      out.character = { hips: h.toArray(), fwd: fwd.toArray(), scale: A.meta.scale || 1, box: boxOf(bones) };
     }
-    if (this.edit?.poseOn && this.edit.pose && Object.values(this.edit.pose).some((a) => a && (a[0] || a[1] || a[2]))) {
-      out.pose = { joints: this.poseJoints(), scale: A.meta.scale || 1,
+    if (posed) {
+      out.pose = { joints: this.poseJoints(), scale: A.meta.scale || 1, box: boxOf(this._bonePositions()),
         changed: Object.entries(this.edit.pose).filter(([, a]) => a && (a[0] || a[1] || a[2])).map(([b]) => b) };
     }
     return out;

@@ -49,6 +49,7 @@ LP2_MIRROR = 1.5   # its depth-mirror mistake reading
 SPIN_SLOPE = 1.0   # cost slope of turning faster than 2 x SIG_V per frame
 SPIN_MAX = 5.0     # fastest turn (x SIG_V per frame) a spin reaches
 SWAP_PRIOR = 0.15   # per frame cost of reading the labels swapped
+W_SWAP_HINT = 25.0  # the user's posed limbs say which side is which (Edit step)
 SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
 SIG_TWIST = np.radians(28.0)  # pelvis vs chest
@@ -137,7 +138,7 @@ def _true_width(w, ok, fallback):
 
 
 def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None,
-                 front=None, prior_w=None):
+                 front=None, prior_w=None, labels=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
@@ -149,7 +150,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     over from the surrounding shots), nan where none: it counts as one more
     clue, so what the picture shows can still overrule it.
     front: optional (N,) -1..1, + = facing the camera, - = turned away (nan
-    = no opinion): a front/back clue, weighted by its size."""
+    = no opinion): a front/back clue, weighted by its size.
+    labels: optional (N,) +1 = the labels as detected are right, -1 = they are
+    swapped (nan = no opinion), from limbs the user posed."""
     N = len(uv)
     psi_c = np.full(N, np.nan)
     psi_p = np.full(N, np.nan)
@@ -273,6 +276,10 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         l2p = lp2_p[sl] if lp2_p is not None else None
         u0 = (base + learned_cost2(lp_c[sl], l2c) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
         u1 = (base + learned_cost2(lp_c[sl], l2c, True) + width_cost(w_sh[sl], c_sh[sl], -1.0) + SWAP_PRIOR) * obs
+        if labels is not None:
+            lb = labels[sl][:, None]
+            u0 = u0 + np.where(lb < 0, W_SWAP_HINT, 0.0)
+            u1 = u1 + np.where(lb > 0, W_SWAP_HINT, 0.0)
         U = np.concatenate([u0, u1], 1)
         st = _viterbi(U, TR)
         sw = st >= K

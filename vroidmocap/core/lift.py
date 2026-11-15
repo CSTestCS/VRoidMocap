@@ -52,6 +52,7 @@ SIG2D = np.array([0.02, 0.02, 0.012, 0.012, 0.012, 0.012, 0.025, 0.025, 0.012, 0
 SIG_Z = 0.08
 W_KNEE = 60.0
 W_FOOT = 20.0
+W_HINT = 20.0  # a limb the user posed (Edit step): per unit of squared direction difference
 FOOT_CHOICE = True
 W_SHOULDER = 40.0  # upper arm far behind the chest
 W_ELBOW = 10.0
@@ -187,9 +188,24 @@ def _viterbi(unary, pair_fn, n, S):
     return st
 
 
-def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps):
+def _hint_cost(d, hint, a, b):
+    """(n,S) cost of each candidate direction d (n,S,3) against the bone
+    a->b of hint (n,33,3) (MediaPipe indices; nan = no hint): zero without one."""
+    if hint is None:
+        return 0.0
+    h = hint[:, b] - hint[:, a]
+    ok = np.isfinite(h).all(1)
+    if not ok.any():
+        return 0.0
+    hn = np.where(ok[:, None], h, 0.0) / np.maximum(np.linalg.norm(np.nan_to_num(h), axis=1, keepdims=True), 1e-9)
+    return W_HINT * ok[:, None] * np.sum((d - hn[:, None]) ** 2, -1)
+
+
+def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps, hint=None):
     """Choose towards/away for the middle and end joint of one limb over a
-    segment. X: (n,J,3) current estimate. Returns new (mid, end) positions."""
+    segment. X: (n,J,3) current estimate. hint: optional (n,33,3) joints the
+    user posed (nan = none): where given, the choice that points the bones
+    their way. Returns new (mid, end) positions."""
     root, mid, end, is_leg = limb
     n = len(X)
     P = X[:, JI[root]]
@@ -223,6 +239,7 @@ def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps):
         # pointing at the camera is in front of the body, not straight behind it)
         Fc = _chest_facing(X)
         unary = unary + W_SHOULDER * np.maximum(-np.sum(d1 * Fc[:, None], -1) - 0.55, 0.0) ** 2
+    unary = unary + _hint_cost(d1, hint, root, mid) + _hint_cost(d2, hint, mid, end)
     k = (fps / 30.0 / 0.35) ** 2
 
     def pair(f):
@@ -234,7 +251,7 @@ def _limb_choice(X, rays, zrel, conf, L1, L2, limb, fps):
     return M[ar, st], E[ar, st]
 
 
-def _foot_choice(X, rays, zrel, conf, L, ank, heel, toe, fps):
+def _foot_choice(X, rays, zrel, conf, L, ank, heel, toe, fps, hint=None):
     """Towards/away for the toes of one foot (then the heel to fit): a foot
     points forwards-ish as seen from the pelvis, never backwards. Returns
     (heel, toe) positions (n,3)."""
@@ -245,7 +262,7 @@ def _foot_choice(X, rays, zrel, conf, L, ank, heel, toe, fps):
     F, _ = _facing(X)
     d = normalize(ct - A[:, None])
     unary = np.minimum(cost, 12.0) * conf[:, JI[toe], None] + \
-        W_FOOT * np.maximum(-np.sum(d * F[:, None], -1) - 0.2, 0.0) ** 2
+        W_FOOT * np.maximum(-np.sum(d * F[:, None], -1) - 0.2, 0.0) ** 2 + _hint_cost(d, hint, ank, toe)
     k = (fps / 30.0 / 0.35) ** 2
     st = _viterbi(unary, lambda f: k * np.sum((d[f][:, None] - d[f - 1][None]) ** 2, -1), n, 2)
     T = ct[np.arange(n), st]
@@ -430,13 +447,15 @@ def measure_proportions(P0, uv, conf, focal, segments, fps, z_extra=None, torso=
 
 
 def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress=None, torso=None, z_extra_w=0.5,
-              measured=None):
+              measured=None, hint=None):
     """P0: (N,33,3) rough camera-space landmarks (learned depth, metric root
     distance). uv: (N,33,2) picture positions. conf: (N,33) 0..1.
     z_extra: optional (N,33) second depth opinion relative to the hip centre
     (nan = none). segments: list of (start, end) runs of valid frames.
     torso: optional (psi_chest, psi_pelvis, r3, view) from facing.track_facing:
     sets how much deeper the left shoulder / hip is than the right one.
+    hint: optional (N,33,3) joints a user posed (nan = none), camera space:
+    they only choose between the readings the picture allows.
     Returns (P (N,33,3) with the solved joints replaced, lengths dict)."""
     N, idx, fin, uvj, cj, zrel, wz, zroot = _prepare(P0, uv, conf, segments, fps, z_extra, torso, z_extra_w)
     if measured is not None:
@@ -457,7 +476,8 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
             e2 = EDGES.index((JI[mid], JI[end]))
             if not (np.isfinite(L[e1]) and np.isfinite(L[e2])):
                 continue
-            M, E = _limb_choice(X, rays, zrel[sl], cj[sl], L[e1], L[e2], limb, fps)
+            hs = hint[sl] if hint is not None and np.isfinite(hint[sl]).any() else None
+            M, E = _limb_choice(X, rays, zrel[sl], cj[sl], L[e1], L[e2], limb, fps, hint=hs)
             dE = E - X[:, JI[end]]
             X[:, JI[mid]] = M
             X[:, JI[end]] = E
@@ -472,7 +492,7 @@ def fuse_body(P0, uv, conf, focal, cx, cy, segments, fps, z_extra=None, progress
                 ok_f = all(np.isfinite(L[EDGES.index(pr)]) for pr in
                            ((JI[end], JI[toe]), (JI[end], JI[heel]), (JI[heel], JI[toe])))
                 if ok_f and FOOT_CHOICE:
-                    Hh, Tt = _foot_choice(X, rays, zrel[sl], cj[sl], L, end, heel, toe, fps)
+                    Hh, Tt = _foot_choice(X, rays, zrel[sl], cj[sl], L, end, heel, toe, fps, hint=hs)
                     X[:, JI[heel]], X[:, JI[toe]] = Hh, Tt
                     zr[:, JI[heel]] = zr[:, JI[end]] + (Hh[:, 2] - E[:, 2])
                     zr[:, JI[toe]] = zr[:, JI[end]] + (Tt[:, 2] - E[:, 2])

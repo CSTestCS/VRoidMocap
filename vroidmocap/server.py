@@ -238,13 +238,14 @@ class AppState:
     def start_refine(self, char_id, smoothing=1.0, foot_lock=True):
         """Animate again with the user's corrections: where the user placed the
         character, those frames are captured again (tracked from the box drawn
-        around her), then the whole animation is solved with every correction."""
+        around her), then solved again with the corrections as clues; only the
+        frames each correction covers change in the animation."""
         if self.job and not self.job.done:
             raise ValueError("Another task is still running")
         if self.skel is None:
             raise ValueError("Choose a .vrm avatar first")
         from .core.capture import recapture_edits
-        from .core.retarget import solve_animation
+        from .core.retarget import solve_animation, splice_anim
 
         def run(progress, cancel):
             import shutil
@@ -258,8 +259,9 @@ class AppState:
             fps = float(self.analysis["fps"])
             N = len(cap["tracked"])
             ranges = []
-            for e in self.edits(char_id)["edits"]:
-                box = (e.get("character") or {}).get("box")
+            edits = self.edits(char_id)["edits"]
+            for e in edits:
+                box = (e.get("character") or {}).get("box") or (e.get("pose") or {}).get("box")
                 if box:
                     a = int(np.clip(e["frame"], 0, N - 1))
                     ranges.append((a, int(np.clip(a + int(e["length"]), a + 1, N)), box))
@@ -271,8 +273,16 @@ class AppState:
                         cap[key][a:b] = arr[:b - a]
                 cap["tracked"][a:b] = True
             np.savez_compressed(cap_path, **cap)
+            try:
+                before = self.anim(char_id)  # the animation the user was correcting
+            except KeyError:
+                before = None
             anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
                                    lambda f, m: progress(0.8 + 0.2 * f, m), foot_lock=foot_lock)
+            if before is not None:
+                # only the frames the user marked change (each correction's length)
+                marked = [(int(e["frame"]), int(e["frame"]) + int(e["length"])) for e in edits]
+                anim = splice_anim(before, anim, marked)
             self._save_anim(char_id, anim)
             return {"character": char_id}
         self.job = Job("refine", run)
