@@ -54,78 +54,10 @@ SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
 SIG_TWIST = np.radians(28.0)  # pelvis vs chest
 W_FRONT = 3.0       # front/back voted over a moment from the hips' left/right labels (close-ups)
-W_LOOK = float(__import__("os").environ.get("VROIDMOCAP_W_LOOK", "4.0"))  # her front / back from how she looks
-W_WEAK = float(__import__("os").environ.get("VROIDMOCAP_W_WEAK", "1.0"))  # widths read by one model only (the other lost her): x this
+W_LOOK = float(__import__("os").environ.get("VROIDMOCAP_W_LOOK", "8.0"))  # her front / back from how she looks
+W_WEAK = float(__import__("os").environ.get("VROIDMOCAP_W_WEAK", "0.7"))  # widths read by one model only (the other lost her): x this
 W_PRIOR = 3.0       # a facing carried over from the surrounding shots (close-ups), per frame
 BAD_MARGIN = 6.0    # cost by which a frame must contradict its tracked reading to be dropped
-import os as _os
-MOMENTUM = _os.environ.get("VROIDMOCAP_FACING_MOMENTUM", "0") != "0"  # a turn carries on where the picture says nothing new
-M_STEP = 1.0        # degrees per facing state (momentum tracker)
-M_ACC = float(_os.environ.get("VROIDMOCAP_M_ACC", "0.25"))    # cost of the turning speed changing by one step (deg/frame at 30 fps)
-M_SPEED = float(_os.environ.get("VROIDMOCAP_M_SPEED", "0.02"))  # cost of turning, per frame, x (speed / SIG_V)^2
-M_VMAX = 20.0       # fastest turn, deg/frame at 30 fps
-
-
-def _viterbi_momentum(U, fps):
-    """Facing over time with momentum. U (n, 2K): cost of each facing (5 deg
-    bins) with the labels as detected [:K] or swapped [K:]. The state is the
-    facing in 1 deg steps, the turning speed and the labels: a steady turn
-    costs little, speeding up / slowing down costs, so where the picture
-    gives nothing new (a back view, frames without a detection) a turn
-    carries on instead of stalling. Returns (psi (n,) radians, swapped (n,))."""
-    n = len(U)
-    J = int(round(360 / M_STEP))
-    # speed in whole steps per frame (finer at higher frame rates is not needed)
-    vmax = max(1, int(round(M_VMAX * 30.0 / fps / M_STEP)))
-    vel = np.arange(-vmax, vmax + 1)
-    Vn = len(vel)
-    sv = np.degrees(SIG_V) * 30.0 / fps
-    speed_c = M_SPEED * (vel * M_STEP / sv) ** 2
-    acc = M_ACC * (30.0 / fps)  # (a change per frame at 60 fps is half as much per second)
-    # unary on the fine grid: linear between the 5 deg bins
-    pos = np.arange(J) * M_STEP / (360.0 / K)
-    c0 = np.floor(pos).astype(int) % K
-    c1 = (c0 + 1) % K
-    t = pos - np.floor(pos)
-    Uf = np.stack([(1 - t) * U[:, s * K + c0] + t * U[:, s * K + c1] for s in (0, 1)], 1)  # (n,2,J)
-    src_j = (np.arange(J)[:, None] - vel[None, :]) % J  # (J,Vn): where a facing came from at each speed
-    C = Uf[0][:, :, None] + speed_c[None, None, :]  # (2,J,Vn)
-    back = np.zeros((n, 2, J, Vn), np.int8)  # (old labels * 3 + speed change + 1)
-    for f in range(1, n):
-        best = None
-        for ds in (0, 1):
-            Cs = C[::-1] if ds else C  # labels kept / changed over
-            for dv in (-1, 0, 1):
-                vi = np.clip(np.arange(Vn) - dv, 0, Vn - 1)  # previous speed index
-                cand = Cs[:, src_j, vi[None, :]] if True else None  # (2,J,Vn)
-                cand = cand + (acc * abs(dv)) + (SWAP_SWITCH if ds else 0.0)
-                if dv != 0:
-                    edge = (np.arange(Vn) - dv < 0) | (np.arange(Vn) - dv >= Vn)
-                    cand[:, :, edge] = np.inf
-                code = ds * 3 + dv + 1
-                if best is None:
-                    best, bcode = cand, np.full(cand.shape, code, np.int8)
-                else:
-                    better = cand < best
-                    best = np.where(better, cand, best)
-                    bcode = np.where(better, code, bcode)
-        C = best + Uf[f][:, :, None] + speed_c[None, None, :]
-        C -= C.min()
-        back[f] = bcode
-    s, j, v = np.unravel_index(int(np.argmin(C)), C.shape)
-    psi = np.zeros(n)
-    sw = np.zeros(n, bool)
-    for f in range(n - 1, -1, -1):
-        psi[f] = j * M_STEP
-        sw[f] = bool(s)
-        if f == 0:
-            break
-        code = int(back[f, s, j, v])
-        ds, dv = code // 3, code % 3 - 1
-        j = (j - vel[v]) % J
-        v = v - dv
-        s = 1 - s if ds else s
-    return np.radians(psi), sw
 
 
 def _wrap(a):
@@ -367,18 +299,12 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
             u0 = u0 + np.where(lb < 0, W_SWAP_HINT, 0.0)
             u1 = u1 + np.where(lb > 0, W_SWAP_HINT, 0.0)
         U = np.concatenate([u0, u1], 1)
-        if MOMENTUM:
-            pc, sw = _viterbi_momentum(U, fps)
-            kc = np.round(pc / (2 * np.pi / K)).astype(int) % K
-            uc = np.where(sw[:, None], u1, u0)
-            ua = np.where(sw[:, None], u0, u1)
-        else:
-            st = _viterbi(U, TR)
-            sw = st >= K
-            kc = st % K
-            uc = np.where(sw[:, None], u1, u0)
-            ua = np.where(sw[:, None], u0, u1)
-            pc = np.array([_refine(uc[i], kc[i]) for i in range(e - s)])
+        st = _viterbi(U, TR)
+        sw = st >= K
+        kc = st % K
+        uc = np.where(sw[:, None], u1, u0)
+        ua = np.where(sw[:, None], u0, u1)
+        pc = np.array([_refine(uc[i], kc[i]) for i in range(e - s)])
         # a single frame whose picture says the opposite of everything around it
         # (labels swapped for one frame, a mis-detection) is not used at all
         ar = np.arange(e - s)
