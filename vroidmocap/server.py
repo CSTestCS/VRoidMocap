@@ -206,7 +206,7 @@ class AppState:
                 if os.path.exists(orig):
                     os.remove(orig)  # (the Edit step's base capture: this is the new one)
             anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
-                                   lambda f, m: progress(0.85 + 0.15 * f, m), foot_lock=foot_lock)
+                                   lambda f, m: progress(0.85 + 0.15 * f, m), foot_lock=foot_lock, video=self.video)
             self._save_anim(char_id, anim)
             return {"character": char_id}
         self.job = Job("capture", run)
@@ -278,7 +278,7 @@ class AppState:
             except KeyError:
                 before = None
             anim = solve_animation(cap, self.workdir, char_id, self.skel, smoothing,
-                                   lambda f, m: progress(0.8 + 0.2 * f, m), foot_lock=foot_lock)
+                                   lambda f, m: progress(0.8 + 0.2 * f, m), foot_lock=foot_lock, video=self.video)
             if before is not None:
                 # only the frames the user marked change (each correction's length)
                 marked = [(int(e["frame"]), int(e["frame"]) + int(e["length"])) for e in edits]
@@ -286,6 +286,29 @@ class AppState:
             self._save_anim(char_id, anim)
             return {"character": char_id}
         self.job = Job("refine", run)
+
+    def room_scan(self, char_id):
+        """The scenery as coloured points in the animation's world (see
+        core/roomscan.py), cached next to the animation it was built from.
+        Binary: uint32 count, float32 xyz * count, uint8 rgb * count."""
+        from .core.roomscan import build_room
+        anim = self.anim(char_id)
+        ap = os.path.join(self.workdir, f"anim_c{char_id}.npz")
+        stamp = int(os.path.getmtime(ap)) if os.path.exists(ap) else 0
+        cp = os.path.join(self.workdir, f"room_c{char_id}_{stamp}.npz")
+        if os.path.exists(cp):
+            d = np.load(cp)
+            pos, col = d["pos"], d["col"]
+        else:
+            pos, col = build_room(self.video, anim)
+            for name in os.listdir(self.workdir):  # (older scans of this character)
+                if name.startswith(f"room_c{char_id}_") and name.endswith(".npz"):
+                    try:
+                        os.remove(os.path.join(self.workdir, name))
+                    except OSError:
+                        pass
+            np.savez(cp, pos=pos, col=col)
+        return np.uint32(len(pos)).tobytes() + pos.astype(np.float32).tobytes() + col.astype(np.uint8).tobytes()
 
     def _save_anim(self, char_id, anim):
         arrays = {k: v for k, v in anim.items() if isinstance(v, np.ndarray)}
@@ -592,6 +615,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, STATE.facing_hints(int(p.split("/")[3])))
             if p.startswith("/api/edits/"):
                 return self._send(200, STATE.edits(int(p.split("/")[3])))
+            if p.startswith("/api/room/"):
+                return self._send(200, STATE.room_scan(int(p.split("/")[3])), "application/octet-stream")
             if p == "/api/export.fbx":
                 cid = int(q["character"])
                 fd, tmp = tempfile.mkstemp(suffix=".fbx")

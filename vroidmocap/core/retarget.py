@@ -59,6 +59,11 @@ HAND_PNP = True  # hand rotation from the avatar's rigid palm fitted to the pict
 HEAD_GAIN = (1.0, 1.0, 1.5)  # turn, nod, tilt of the head (relative to the chest) as read from the face, scaled
 STAND_HIPS = 0.95  # hips height (share of the rest height) when no foot is seen in a whole shot
 PLANT_UNSEEN = True   # hidden lower legs stand on the floor
+CONSENSUS = os.environ.get("VROIDMOCAP_CONSENSUS", "1") != "0"  # a bone's reading needs the readings around it to agree
+CONSENSUS_WIN_S = float(os.environ.get("VROIDMOCAP_CONS_WIN", "0.25"))
+CONSENSUS_TOL_DEG = float(os.environ.get("VROIDMOCAP_CONS_TOL", "20"))
+CONSENSUS_SPEED = float(os.environ.get("VROIDMOCAP_CONS_SPEED", "250"))  # deg/s a limb can turn
+CONSENSUS_NEED = float(os.environ.get("VROIDMOCAP_CONS_NEED", "0.5"))
 HEAD_HINT_SLACK_DEG = 20.0  # a head the user posed: how far off a hand-made pose may be (not corrected)
 NECK_MAX_DEG = 90.0  # a face fit turned further than this from the chest is not used
 HEAD_FACE_FIT = True  # head turn / nod / tilt from the 68 face points (else from ears, eyes, nose)
@@ -775,7 +780,8 @@ def closeup_scores(capture, W, H, extra=None):
 
 
 # ----------------------------------------------------------------------------- main
-def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True, debug=None):
+def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=None, foot_lock=True, debug=None,
+                    video=None):
     dbg = (lambda k, v: debug.__setitem__(k, np.array(v, copy=True))) if debug is not None else (lambda k, v: None)
     progress = progress or (lambda *a: None)
     with open(os.path.join(workdir, "analysis.json")) as f:
@@ -914,6 +920,12 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             Ylift = None
     W_lift = lifter.as_mediapipe(Ylift) if Ylift is not None else None
     Wc_f, W2_f, uv_f, conf_f = Wc, W_lift, uv, conf
+    if FACING_SKIP_BRIDGED and bridged.any():
+        # (a frame whose 3D guess was carried over from another moment says
+        # nothing about which way she faces now: it would pin the facing to
+        # that moment's)
+        Wc_f = Wc.copy()
+        Wc_f[bridged] = np.nan
     cu_axes = np.zeros(N, bool)
     if wb_sync is not None and (hinted.any() or CLOSEUP_PELVIS == "all"):
         s_ = np.asarray(wb_sync[1], np.float64)
@@ -950,6 +962,20 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     front_v = closeup_front_vote(wb_sync, valid, shot_of, fps) if (CLOSEUP_FRONT_VOTE and wb_sync is not None) else None
     if hinted.any():
         front_v = np.where(hinted, hint * HINT_STRENGTH, front_v if front_v is not None else np.nan)
+    look = None
+    if APPEARANCE_FACING and video:
+        # her front or her back, from how she looks (the detectors read a back
+        # view poorly: hair over the shoulders, a "face" found on the back of the head)
+        try:
+            progress(0.03, "Reading which way she faces from how she looks")
+            from . import appearance
+            look = appearance.front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=shot_of)
+        except Exception:
+            log.exception("appearance facing failed")
+            look = None
+        dbg("look_vote", look if look is not None else np.full(N, np.nan))
+        if look is not None:
+            look = look * APPEARANCE_STRENGTH
     dbg("front_vote", front_v if front_v is not None else np.full(N, np.nan))
     user_prior, user_prior_w = None, None
     hints = pose_hints(user_edits, N)
@@ -1009,7 +1035,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     dbg("labels_hint", labels if labels is not None else np.full(N, np.nan))
     psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
                                                   shot_spans(valid, shot_of), fps, W2=W2_f, front=front_v,
-                                                  prior=user_prior, prior_w=user_prior_w, labels=labels)
+                                                  prior=user_prior, prior_w=user_prior_w, labels=labels, look=look, weak=bridged)
     if CARRY_FACING and wb_sync is not None:
         prior = carried_facing(psi_p, bad, valid, uv, wb_sync[1], focal, cx, cy, shot_of, shots, npz, W, H, fps)
         dbg("facing_prior", prior)
@@ -1021,7 +1047,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                 prior_w = np.where(mine, user_prior_w, facing.W_PRIOR)
             psi_c, psi_p, swap, bad = facing.track_facing(uv_f, conf_f, face_score, Wc_f, T, focal, cx, cy, valid,
                                                           shot_spans(valid, shot_of), fps, W2=W2_f, prior=prior,
-                                                          front=front_v, labels=labels, prior_w=prior_w)
+                                                          front=front_v, labels=labels, prior_w=prior_w, look=look, weak=bridged)
     # frames that contradict everything around them (one-frame label swaps,
     # mis-detections): their bone rotations count as not seen (the pose holds /
     # blends across them); the position (hip centre) is still used
@@ -1514,6 +1540,14 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     conf = np.where(seen, np.maximum(conf, 0.55), 0.0)
     if cu_pelvis.any() and skel.has("hips"):
         seen[:, skel.bones.index("hips")] |= cu_pelvis & js[:, L_HIP] & js[:, R_HIP]
+    if CONSENSUS:
+        # a reading the readings around it do not back up is not the bone
+        # moving: it is the detectors flickering (sparkles, cloth, a dark
+        # outfit). The bone holds through it.
+        seen0 = seen
+        seen = consensus_seen(Q, seen, fps, shot_of)
+        conf = np.where(seen, conf, 0.0)
+        dbg("unbacked", seen0 & ~seen)
     dbg("seen", seen)
     nat = Naturalizer(skel)
     Q = nat.unflip_fingers(Q)
@@ -1570,6 +1604,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
     # from its last seen pose to its next; before a bone is first seen it is in
     # the A pose
     Q = hold_unseen(Q, seen, fps, neutral_pose(skel), skel, Q_world=Q_obs)
+    dbg("Q_hold", Q)
     # a limb that is not seen is still there: arms and thighs point where the
     # motion around them says (read over +-4 s; +-8 s or +-20 s when the limb
     # was not seen for longer than that)
@@ -1580,6 +1615,8 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
                                   lambda m: lifter.cached_lift(workdir, capture, runs(valid, shot_of), W, H, fps, m))
         Q, filled = context_fill(Q, seen, valid, dirs, skel, fps, shot_of)
         kept |= filled
+        dbg("filled", filled)
+    dbg("Q_ctx", Q)
     root = place_root(skel, Q, Xw, js_ok, scale, fps, shot_of)
     contacts = foot_contacts(skel, Q, root, fps, feet_seen & seen[:, [bidx["leftLowerLeg"], bidx["rightLowerLeg"]]])
     stand_y = float(skel.rest_pos["hips"][1]) * STAND_HIPS if "hips" in skel.rest_pos else None
@@ -1603,6 +1640,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         Q = foot_lock_ik(skel, Q, root, contacts & ~planted, fps)
         Q = nat.legs_only(Q, root)  # ...then make sure the thighs still do not twist
         Q = hold_unseen(Q, kept, fps, neutral_pose(skel), skel, Q_world=Q_obs, observed=seen)
+    dbg("Q_plant", Q)
     # ---- 7b. hands that touch the body touch it on the avatar too, and no
     # limb passes through another part of the body (they just touch)
     from . import body_shape, contacts as touch
@@ -1900,6 +1938,14 @@ for _a, _b in LR_PAIRS:
     LR_PERM[_a], LR_PERM[_b] = _b, _a
 
 
+CAMPATH_DEBUG = {}
+APPEARANCE_FACING = os.environ.get("VROIDMOCAP_LOOK", "1") != "0"  # front / back from how she looks
+APPEARANCE_STRENGTH = float(os.environ.get("VROIDMOCAP_LOOK_W", "1.0"))
+FACING_SKIP_BRIDGED = os.environ.get("VROIDMOCAP_FACING_SKIP_BRIDGED", "1") != "0"
+CAM_CONTRA_FROM_CHARACTER = os.environ.get("VROIDMOCAP_CAM_CONTRA", "1") != "0"
+CAM_CONTRA_SMOOTH_S = 0.3
+
+
 def camera_path(C_ref, cseg, G, R_w, Pc, hips_seen, shot_of, fps):
     """Where the camera is in the world (actor metres), frame by frame.
 
@@ -1921,6 +1967,7 @@ def camera_path(C_ref, cseg, G, R_w, Pc, hips_seen, shot_of, fps):
     ok = hips_seen & np.isfinite(hip).all(1)
     L = max(1, int(round(0.25 * fps)))
     scales = {}
+    contra = []  # stretches whose travel the character contradicts
     for k in np.unique(sg[sg >= 0]):
         m = sg == k
         path = np.cumsum(np.where(m[:, None], dw, 0.0), axis=0)
@@ -1938,15 +1985,35 @@ def camera_path(C_ref, cseg, G, R_w, Pc, hips_seen, shot_of, fps):
             sc = -np.sum(w * np.sum(dU * dY, 1)) / max(np.sum(w * np.sum(dU * dU, 1)), 1e-12)
             r = np.linalg.norm(sc * dU + dY, axis=1)
             w = np.where(r < 0.05, 1.0, 0.05 / np.maximum(r, 1e-9))
+        CAMPATH_DEBUG[int(k)] = (float(sc), int(m.sum()), int(np.argmax(m)))
         if sc > 0:
             scales[k] = sc
+        elif CAM_CONTRA_FROM_CHARACTER:
+            contra.append(k)
     if scales:
         default = float(np.median(list(scales.values())))
     else:
         zc = Pc[ok, L_HIP, 2] if ok.any() else np.array([3.0])
         default = 2.0 * float(np.median(zc))
     s_f = np.array([scales.get(k, default) if k >= 0 else 0.0 for k in sg])
-    cs = np.cumsum(dw * s_f[:, None], axis=0)
+    step = dw * s_f[:, None]
+    for k in contra:
+        # the scenery's travel goes against what the character shows (blurred
+        # or particle-covered scenery: a tilt read as a rise): its direction is
+        # not to be trusted. The camera travels so that the character's hips
+        # hold still instead (smoothed: her own small moves stay hers)
+        m = sg == k
+        idx = np.where(m)[0]
+        good = idx[ok[idx]]
+        if len(good) < 2:
+            step[m] = 0.0
+            continue
+        Yi = np.stack([np.interp(idx, good, Y[good, c]) for c in range(3)], 1)
+        Yi = gaussian_smooth(Yi, max(1.0, CAM_CONTRA_SMOOTH_S * fps)) if len(idx) > 3 else Yi
+        st_ = np.zeros_like(Yi)
+        st_[1:] = -(Yi[1:] - Yi[:-1])
+        step[idx] = st_
+    cs = np.cumsum(step, axis=0)
     return cs - _shot_start_values(cs, shot_of)
 
 
@@ -2656,6 +2723,43 @@ def just_outside(uv, raw, W, H, reach=0.25, min_score=0.5):
     out = (x < 0) | (x > W) | (y < 0) | (y > H)
     near = (x > -reach * W) & (x < W * (1 + reach)) & (y > -reach * H) & (y < H * (1 + reach))
     return out & near & (raw >= min_score)
+
+
+def consensus_seen(Q, seen, fps, shot_of, win_s=CONSENSUS_WIN_S, tol_deg=CONSENSUS_TOL_DEG,
+                   speed_dps=CONSENSUS_SPEED, need=CONSENSUS_NEED, passes=2):
+    """seen (N,B) with the readings the frames around them do not back up
+    taken out. A bone cannot jump: a reading at f agrees with one at g when
+    their rotations differ by less than tol_deg plus what a fast limb turns
+    in |f-g| (speed_dps). A reading is kept when at least `need` of the other
+    seen readings within win_s (same shot) agree with it; with fewer than two
+    readings around it there is nothing to judge by and it is kept."""
+    N, B = seen.shape
+    Qn = np.where(np.isfinite(Q), Q, np.array([0, 0, 0, 1.0]))
+    Qn = Qn / np.maximum(np.linalg.norm(Qn, axis=-1, keepdims=True), 1e-12)
+    W_ = max(1, int(round(win_s * fps)))
+    out = seen.copy()
+    for b in range(B):
+        if seen[:, b].sum() < 3:
+            continue
+        q = Qn[:, b]
+        keep = seen[:, b].copy()
+        for _ in range(passes):
+            sup = np.zeros(N)
+            tot = np.zeros(N)
+            for d in range(1, W_ + 1):
+                both = keep[:-d] & keep[d:] & (shot_of[:-d] == shot_of[d:])
+                if not both.any():
+                    continue
+                c = np.abs(np.sum(q[:-d] * q[d:], -1))
+                ang = 2 * np.degrees(np.arccos(np.clip(c, -1, 1)))
+                ok = both & (ang < tol_deg + speed_dps * d / fps)
+                sup[:-d] += ok
+                sup[d:] += ok
+                tot[:-d] += both
+                tot[d:] += both
+            keep = seen[:, b] & ((tot < 2) | (sup >= need * tot))
+        out[:, b] = keep
+    return out
 
 
 def bone_seen(skel, js, hvalid, face_seen, fps, shot_of, near_out=None, seg_known=None):

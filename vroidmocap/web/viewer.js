@@ -308,7 +308,8 @@ export class Viewer {
       cam.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), c.yaw * d2r));
       cam.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), c.pitch * d2r));
       cam.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), c.roll * d2r));
-      cam.position.add(new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).multiplyScalar(c.dist));
+      cam.position.add(new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).multiplyScalar(c.dist || 0));
+      if (c.move) cam.position.add(new THREE.Vector3(c.move[0], c.move[1], c.move[2]));
       if (c.fov) cam.fov = c.fov;
     }
     this.videoCam.updateProjectionMatrix();
@@ -320,6 +321,106 @@ export class Viewer {
       this.freeCam.position.add(d);
     }
   }
+
+  // ---- the room scan: the scenery as coloured points (the Edit step's guide)
+  setRoom(buf) {
+    if (this.room) { this.scene.remove(this.room); this.room.geometry.dispose(); this.room.material.dispose(); this.room = null; }
+    if (!buf) return;
+    const n = new Uint32Array(buf, 0, 1)[0];
+    const pos = new Float32Array(buf, 4, n * 3);
+    const col = new Uint8Array(buf, 4 + n * 12, n * 3);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+    const m = new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: this.roomOpacity ?? 0.6, depthWrite: false });
+    this.room = new THREE.Points(g, m);
+    this.room.visible = !!this.roomOn;
+    this.scene.add(this.room);
+  }
+  showRoom(on, opacity) {
+    this.roomOn = on;
+    if (opacity != null) this.roomOpacity = opacity;
+    if (this.room) { this.room.visible = on; this.room.material.opacity = this.roomOpacity ?? 0.6; }
+  }
+
+  /** The camera of a correction, driven like a free camera over the picture
+   * (the view stays the video's frame): drag to turn it, right-drag (or
+   * shift-drag) to move it sideways / up and down, wheel to move it in and
+   * out (shift-wheel: zoom), W A S D Q E to move it. The scene follows the
+   * mouse, so a point dragged onto the picture stays there. `getCam()`
+   * returns the correction's camera settings while they can be changed. */
+  bindEditCam(getCam, changed) {
+    const el = this.canvas;
+    let down = null;
+    this._dragged = false;
+    const depth = () => {
+      const h = this.hipsObject();
+      const p = new THREE.Vector3(0, 1, 0);
+      h?.getWorldPosition(p);
+      return Math.max(0.5, p.distanceTo(this.videoCam.position));
+    };
+    const perPx = () => {
+      const r = this.videoRect();
+      return (2 * Math.tan((this.videoCam.fov * Math.PI) / 360)) / Math.max(r.h, 1);  // radians (small angles) per pixel
+    };
+    const axes = () => {
+      const q = this.videoCam.quaternion;
+      return { right: new THREE.Vector3(1, 0, 0).applyQuaternion(q), up: new THREE.Vector3(0, 1, 0).applyQuaternion(q), fwd: new THREE.Vector3(0, 0, -1).applyQuaternion(q) };
+    };
+    const move = (c, v) => { c.move = c.move || [0, 0, 0]; c.move[0] += v.x; c.move[1] += v.y; c.move[2] += v.z; };
+    el.addEventListener("pointerdown", (ev) => {
+      const c = getCam();
+      if (!c) return;
+      down = { x: ev.clientX, y: ev.clientY, pan: ev.button === 2 || ev.button === 1 || ev.shiftKey, moved: false };
+      this._dragged = false;
+      this.controls.enabled = false;
+      el.setPointerCapture(ev.pointerId);
+    });
+    el.addEventListener("pointermove", (ev) => {
+      const c = getCam();
+      if (!down || !c) return;
+      const dx = ev.clientX - down.x, dy = ev.clientY - down.y;
+      if (!down.moved && Math.hypot(dx, dy) < 3) return;
+      down.moved = true;
+      this._dragged = true;
+      down.x = ev.clientX; down.y = ev.clientY;
+      const k = perPx();
+      if (down.pan) {
+        const { right, up } = axes(), s = k * depth();
+        move(c, right.multiplyScalar(-dx * s).add(up.multiplyScalar(dy * s)));
+      } else {
+        c.yaw = (c.yaw || 0) + (dx * k * 180) / Math.PI;
+        c.pitch = Math.max(-89, Math.min(89, (c.pitch || 0) + (dy * k * 180) / Math.PI));
+      }
+      changed();
+    });
+    const up = (ev) => { if (down) { down = null; this.controls.enabled = true; try { el.releasePointerCapture(ev.pointerId); } catch (e) { /* */ } } };
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+    el.addEventListener("contextmenu", (ev) => { if (getCam()) ev.preventDefault(); });
+    el.addEventListener("wheel", (ev) => {
+      const c = getCam();
+      if (!c) return;
+      ev.preventDefault();
+      if (ev.shiftKey || ev.altKey) c.fov = Math.max(5, Math.min(120, (c.fov || this.videoCam.fov) * Math.exp(ev.deltaY * 0.001)));
+      else move(c, axes().fwd.multiplyScalar(-ev.deltaY * 0.001 * depth()));
+      changed();
+    }, { passive: false });
+    window.addEventListener("keydown", (ev) => {
+      const c = getCam();
+      const t = ev.target;
+      if (!c || (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT"))) return;
+      const key = ev.key.toLowerCase();
+      const dir = { w: [0, 0, 1], s: [0, 0, -1], a: [-1, 0, 0], d: [1, 0, 0], q: [0, -1, 0], e: [0, 1, 0] }[key];
+      if (!dir) return;
+      ev.preventDefault();
+      const { right, up, fwd } = axes(), step = depth() * (ev.shiftKey ? 0.1 : 0.02);
+      move(c, right.multiplyScalar(dir[0] * step).add(up.multiplyScalar(dir[1] * step)).add(fwd.multiplyScalar(dir[2] * step)));
+      changed();
+    });
+  }
+  /** true once after a drag (a click that ends a drag is not a click on the picture) */
+  consumeDrag() { const d = this._dragged; this._dragged = false; return d; }
 
   // ---- corrections (the Edit step): previewed at their frame only
   /** edit = {frame, camOn, cam: {yaw, pitch, roll, fov, dist}, chrOn, chr: {place: [x, z] | null, dx, dz, dy, yaw}} */

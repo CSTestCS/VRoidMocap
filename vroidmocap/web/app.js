@@ -30,6 +30,7 @@ function showStep(name) {
   document.body.classList.toggle("edit-mode", editMode);
   $("keyPanel").hidden = !keysMode;
   $("editPanel").hidden = !editMode;
+  if (S.viewer && typeof showRoom === "function") showRoom(editMode && $("epRoom").checked);
   if (S.viewer) {
     // corrections are made in the animation's own world: no turn, no locked movement
     if (editMode) { S.viewer.yaw = 0; S.viewer.lockMove = false; S.viewer.lockHeight = false; }
@@ -285,10 +286,13 @@ async function openAnimation(cid, step = "edit") {
 }
 // ------------------------------------------------------------------ step 3: corrections (Edit)
 const E = { edits: [], draft: null, cid: null };
-const epDefaults = () => ({ camOn: false, cam: { yaw: 0, pitch: 0, roll: 0, fov: 40, dist: 0 }, chrOn: false, chr: { place: null, dx: 0, dz: 0, dy: 0, yaw: 0 },
+const epDefaults = () => ({ camOn: false, cam: { yaw: 0, pitch: 0, roll: 0, fov: 40, dist: 0, move: [0, 0, 0] }, chrOn: false, chr: { place: null, dx: 0, dz: 0, dy: 0, yaw: 0 },
   poseOn: false, pose: {} });
 async function loadEdits(cid) {
   E.cid = cid;
+  E.roomFor = null;  // (a new animation: its room scan is built again when shown)
+  bindEditCam();
+  if ($("epRoom").checked) setTimeout(() => showRoom(document.body.classList.contains("edit-mode")), 0);
   try { E.edits = (await api(`/api/edits/${cid}`)).edits || []; } catch (e) { E.edits = []; }
   E.draft = null;
   E.dirty = false;
@@ -341,6 +345,35 @@ function refreshEditPanel() {
     });
   }
 }
+// the correction's camera, flown with the mouse / keys over the picture
+let editCamBound = false;
+function bindEditCam() {
+  if (editCamBound || !S.viewer) return;
+  editCamBound = true;
+  S.viewer.bindEditCam(() => {
+    const d = E.draft;
+    return d && d.camOn && S.frame === d.frame && document.body.classList.contains("edit-mode") ? d.cam : null;
+  }, () => applyDraft());
+}
+// the room scan (the scenery as points) to line the camera up against
+async function showRoom(on) {
+  if (!S.viewer) return;
+  S.viewer.showRoom(on, Number($("epRoomOp").value));
+  if (on && E.roomFor !== E.cid) {
+    E.roomFor = E.cid;
+    $("epRoomInfo").textContent = "Building the room scan…";
+    try {
+      const r = await fetch(`/api/room/${E.cid}`);
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      const buf = await r.arrayBuffer();
+      S.viewer.setRoom(buf);
+      S.viewer.showRoom($("epRoom").checked, Number($("epRoomOp").value));
+      $("epRoomInfo").textContent = `${new Uint32Array(buf, 0, 1)[0].toLocaleString()} points`;
+    } catch (e) { E.roomFor = null; $("epRoomInfo").textContent = ""; toast("Room scan: " + e.message, true); }
+  }
+}
+$("epRoom").onchange = (e) => showRoom(e.target.checked);
+$("epRoomOp").oninput = () => S.viewer && S.viewer.showRoom($("epRoom").checked, Number($("epRoomOp").value));
 function applyDraft() {
   const d = E.draft;
   S.viewer.setEdit(d ? { frame: d.frame, camOn: d.camOn, cam: d.cam, chrOn: d.chrOn, chr: d.chr, poseOn: d.poseOn, pose: d.pose } : null);
@@ -358,7 +391,8 @@ $("epMark").onclick = () => {
   applyDraft();
 };
 $("epCancel").onclick = () => { E.draft = null; applyDraft(); };
-$("epCamOn").onchange = (e) => { E.draft.camOn = e.target.checked; applyDraft(); };
+$("epCamOn").onchange = (e) => { E.draft.camOn = e.target.checked; bindEditCam(); applyDraft(); };
+$("epCamReset").onclick = () => { if (!E.draft) return; Object.assign(E.draft.cam, { yaw: 0, pitch: 0, roll: 0, dist: 0, move: [0, 0, 0], fov: Math.round(S.anim.vfov[E.draft.frame] * 2) / 2 }); applyDraft(); };
 $("epChrOn").onchange = (e) => { E.draft.chrOn = e.target.checked; applyDraft(); };
 $("epPoseOn").onchange = (e) => { E.draft.poseOn = e.target.checked; applyDraft(); };
 $("epBone").onchange = () => refreshEditPanel();
@@ -384,7 +418,8 @@ $("epEndHere").onclick = () => {
 for (const el of [$("gl")]) {
   el.addEventListener("click", (ev) => {
     const d = E.draft;
-    if (!d || !d.chrOn || S.frame !== d.frame || !S.viewer) return;
+    if (!S.viewer || S.viewer.consumeDrag()) return;  // (the end of a camera drag)
+    if (!d || !d.chrOn || S.frame !== d.frame) return;
     const p = S.viewer.floorAt(ev.clientX, ev.clientY);
     if (p) { d.chr.place = p; d.chr.dx = 0; d.chr.dz = 0; applyDraft(); }
   });

@@ -54,8 +54,78 @@ SWAP_SWITCH = 6.0   # cost of the labels changing over between frames
 SIG_V = np.radians(7.0)   # facing change per frame at 30 fps before it costs much
 SIG_TWIST = np.radians(28.0)  # pelvis vs chest
 W_FRONT = 3.0       # front/back voted over a moment from the hips' left/right labels (close-ups)
+W_LOOK = float(__import__("os").environ.get("VROIDMOCAP_W_LOOK", "4.0"))  # her front / back from how she looks
+W_WEAK = float(__import__("os").environ.get("VROIDMOCAP_W_WEAK", "1.0"))  # widths read by one model only (the other lost her): x this
 W_PRIOR = 3.0       # a facing carried over from the surrounding shots (close-ups), per frame
 BAD_MARGIN = 6.0    # cost by which a frame must contradict its tracked reading to be dropped
+import os as _os
+MOMENTUM = _os.environ.get("VROIDMOCAP_FACING_MOMENTUM", "0") != "0"  # a turn carries on where the picture says nothing new
+M_STEP = 1.0        # degrees per facing state (momentum tracker)
+M_ACC = float(_os.environ.get("VROIDMOCAP_M_ACC", "0.25"))    # cost of the turning speed changing by one step (deg/frame at 30 fps)
+M_SPEED = float(_os.environ.get("VROIDMOCAP_M_SPEED", "0.02"))  # cost of turning, per frame, x (speed / SIG_V)^2
+M_VMAX = 20.0       # fastest turn, deg/frame at 30 fps
+
+
+def _viterbi_momentum(U, fps):
+    """Facing over time with momentum. U (n, 2K): cost of each facing (5 deg
+    bins) with the labels as detected [:K] or swapped [K:]. The state is the
+    facing in 1 deg steps, the turning speed and the labels: a steady turn
+    costs little, speeding up / slowing down costs, so where the picture
+    gives nothing new (a back view, frames without a detection) a turn
+    carries on instead of stalling. Returns (psi (n,) radians, swapped (n,))."""
+    n = len(U)
+    J = int(round(360 / M_STEP))
+    # speed in whole steps per frame (finer at higher frame rates is not needed)
+    vmax = max(1, int(round(M_VMAX * 30.0 / fps / M_STEP)))
+    vel = np.arange(-vmax, vmax + 1)
+    Vn = len(vel)
+    sv = np.degrees(SIG_V) * 30.0 / fps
+    speed_c = M_SPEED * (vel * M_STEP / sv) ** 2
+    acc = M_ACC * (30.0 / fps)  # (a change per frame at 60 fps is half as much per second)
+    # unary on the fine grid: linear between the 5 deg bins
+    pos = np.arange(J) * M_STEP / (360.0 / K)
+    c0 = np.floor(pos).astype(int) % K
+    c1 = (c0 + 1) % K
+    t = pos - np.floor(pos)
+    Uf = np.stack([(1 - t) * U[:, s * K + c0] + t * U[:, s * K + c1] for s in (0, 1)], 1)  # (n,2,J)
+    src_j = (np.arange(J)[:, None] - vel[None, :]) % J  # (J,Vn): where a facing came from at each speed
+    C = Uf[0][:, :, None] + speed_c[None, None, :]  # (2,J,Vn)
+    back = np.zeros((n, 2, J, Vn), np.int8)  # (old labels * 3 + speed change + 1)
+    for f in range(1, n):
+        best = None
+        for ds in (0, 1):
+            Cs = C[::-1] if ds else C  # labels kept / changed over
+            for dv in (-1, 0, 1):
+                vi = np.clip(np.arange(Vn) - dv, 0, Vn - 1)  # previous speed index
+                cand = Cs[:, src_j, vi[None, :]] if True else None  # (2,J,Vn)
+                cand = cand + (acc * abs(dv)) + (SWAP_SWITCH if ds else 0.0)
+                if dv != 0:
+                    edge = (np.arange(Vn) - dv < 0) | (np.arange(Vn) - dv >= Vn)
+                    cand[:, :, edge] = np.inf
+                code = ds * 3 + dv + 1
+                if best is None:
+                    best, bcode = cand, np.full(cand.shape, code, np.int8)
+                else:
+                    better = cand < best
+                    best = np.where(better, cand, best)
+                    bcode = np.where(better, code, bcode)
+        C = best + Uf[f][:, :, None] + speed_c[None, None, :]
+        C -= C.min()
+        back[f] = bcode
+    s, j, v = np.unravel_index(int(np.argmin(C)), C.shape)
+    psi = np.zeros(n)
+    sw = np.zeros(n, bool)
+    for f in range(n - 1, -1, -1):
+        psi[f] = j * M_STEP
+        sw[f] = bool(s)
+        if f == 0:
+            break
+        code = int(back[f, s, j, v])
+        ds, dv = code // 3, code % 3 - 1
+        j = (j - vel[v]) % J
+        v = v - dv
+        s = 1 - s if ds else s
+    return np.radians(psi), sw
 
 
 def _wrap(a):
@@ -138,7 +208,7 @@ def _true_width(w, ok, fallback):
 
 
 def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fps, debug=None, W2=None, prior=None,
-                 front=None, prior_w=None, labels=None):
+                 front=None, prior_w=None, labels=None, look=None, weak=None):
     """uv (N,33,2) picture positions, conf (N,33) 0..1 (MediaPipe numbering,
     labels as detected). face_score (N,) 0..1 how clearly a face is seen (nan =
     unknown). Wc (N,33,3) learned 3D in camera orientation, T (N,3) camera ->
@@ -152,7 +222,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
     front: optional (N,) -1..1, + = facing the camera, - = turned away (nan
     = no opinion): a front/back clue, weighted by its size.
     labels: optional (N,) +1 = the labels as detected are right, -1 = they are
-    swapped (nan = no opinion), from limbs the user posed."""
+    swapped (nan = no opinion), from limbs the user posed.
+    look: optional (N,) -1..1 from how she looks (+ = her front, - = her
+    back, nan = no opinion): graded, square-on costs least."""
     N = len(uv)
     psi_c = np.full(N, np.nan)
     psi_p = np.full(N, np.nan)
@@ -172,6 +244,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
 
     c_sh = np.minimum(conf[:, L_SH], conf[:, R_SH])
     c_hp = np.minimum(conf[:, L_HIP], conf[:, R_HIP])
+    if weak is not None:  # (one model's shoulder / hip points only: in back views they sit on the hair)
+        c_sh = np.where(weak, c_sh * W_WEAK, c_sh)
+        c_hp = np.where(weak, c_hp * W_WEAK, c_hp)
     # the detectors' shoulder / hip points need not be as far apart as the
     # pose model's: the real width is the widest they ever appear
     ls, lh = lat_of(L_SH, R_SH), lat_of(L_HIP, R_HIP)
@@ -237,12 +312,15 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         # flipped: psi -> pi - psi), or, less often, only mirrors the depth
         # (which shoulder is nearer: psi -> -psi). Left/right labels in the
         # picture are handled by the swap state.
+        has = np.isfinite(lp)
+        lp = np.nan_to_num(lp)
         if swapped:
             lp = lp + np.pi
         d0 = 1 - np.cos(PSI[None] - lp[:, None])
         d1 = 1 - np.cos(PSI[None] - (np.pi - lp[:, None]))
         d2 = 1 - np.cos(PSI[None] + lp[:, None])
-        return W_LEARN * np.minimum(np.minimum(d0, d1 + pen[0]), d2 + pen[1])
+        # (no 3D guess at a frame: no opinion)
+        return np.where(has[:, None], W_LEARN * np.minimum(np.minimum(d0, d1 + pen[0]), d2 + pen[1]), 0.0)
 
     # face seen: front half; clearly not seen: back half
     face_c = W_FACE * (np.clip((fs - 0.45) / 0.25, 0, 1)[:, None] * np.maximum(0, -COS[None] - 0.25) +
@@ -268,6 +346,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         if front is not None:
             fv = np.nan_to_num(front[sl])
             base = base + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
+        if look is not None:
+            lv = np.nan_to_num(look[sl])
+            base = base + W_LOOK * np.abs(lv)[:, None] * (1 - np.sign(lv)[:, None] * COS[None]) / 2
         if prior is not None:
             pr = prior[sl]
             pw = W_PRIOR if prior_w is None else prior_w[sl][:, None]
@@ -275,18 +356,29 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         l2c = lp2_c[sl] if lp2_c is not None else None
         l2p = lp2_p[sl] if lp2_p is not None else None
         u0 = (base + learned_cost2(lp_c[sl], l2c) + width_cost(w_sh[sl], c_sh[sl], 1.0)) * obs
+        if debug is not None:
+            for nm, arr in (("c_base", base), ("c_learn", learned_cost2(lp_c[sl], l2c)), ("c_width", width_cost(w_sh[sl], c_sh[sl], 1.0)),
+                            ("c_learn_sw", learned_cost2(lp_c[sl], l2c, True)), ("c_width_sw", width_cost(w_sh[sl], c_sh[sl], -1.0)),
+                            ("c_face", face_c[sl] + nose_c[sl])):
+                debug.setdefault(nm, np.zeros((N, K)))[sl] = arr
         u1 = (base + learned_cost2(lp_c[sl], l2c, True) + width_cost(w_sh[sl], c_sh[sl], -1.0) + SWAP_PRIOR) * obs
         if labels is not None:
             lb = labels[sl][:, None]
             u0 = u0 + np.where(lb < 0, W_SWAP_HINT, 0.0)
             u1 = u1 + np.where(lb > 0, W_SWAP_HINT, 0.0)
         U = np.concatenate([u0, u1], 1)
-        st = _viterbi(U, TR)
-        sw = st >= K
-        kc = st % K
-        uc = np.where(sw[:, None], u1, u0)
-        ua = np.where(sw[:, None], u0, u1)
-        pc = np.array([_refine(uc[i], kc[i]) for i in range(e - s)])
+        if MOMENTUM:
+            pc, sw = _viterbi_momentum(U, fps)
+            kc = np.round(pc / (2 * np.pi / K)).astype(int) % K
+            uc = np.where(sw[:, None], u1, u0)
+            ua = np.where(sw[:, None], u0, u1)
+        else:
+            st = _viterbi(U, TR)
+            sw = st >= K
+            kc = st % K
+            uc = np.where(sw[:, None], u1, u0)
+            ua = np.where(sw[:, None], u0, u1)
+            pc = np.array([_refine(uc[i], kc[i]) for i in range(e - s)])
         # a single frame whose picture says the opposite of everything around it
         # (labels swapped for one frame, a mis-detection) is not used at all
         ar = np.arange(e - s)
@@ -300,6 +392,9 @@ def track_facing(uv, conf, face_score, Wc, T, focal, cx, cy, valid, segments, fp
         if front is not None:
             fv = np.nan_to_num(front[sl])
             up_ = up_ + W_FRONT * np.abs(fv)[:, None] * np.maximum(0.0, -np.sign(fv)[:, None] * COS[None])
+        if look is not None:
+            lv = np.nan_to_num(look[sl])
+            up_ = up_ + W_LOOK * np.abs(lv)[:, None] * (1 - np.sign(lv)[:, None] * COS[None]) / 2
         if prior is not None:
             pr = prior[sl]
             pw = W_PRIOR if prior_w is None else prior_w[sl][:, None]

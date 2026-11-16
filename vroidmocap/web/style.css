@@ -132,3 +132,5 @@ body.keys-mode .stage.only3d #paneVideo, body.keys-mode .stage.overlay #paneVide
 .ep-item { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
 .ep-item span { flex: 1; }
 body.edit-mode .anim-only { display: none !important; }
+.ep-room { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.ep-room input[type=range] { width: 90px; }

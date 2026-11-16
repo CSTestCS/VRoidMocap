@@ -333,7 +333,7 @@ class Analyzer:
             self.progress(0.0, "Getting the person detector (one-time download, 20 MB)")
             pdp = ensure_model("person", lambda f: self.progress(0.0, f"Downloading the person detector: {f * 100:.0f}%"))
 
-        scan_path = os.path.join(self.workdir, "scan_v7.pkl" if USE_PERSON_DETECTOR else "scan_v5.pkl")
+        scan_path = os.path.join(self.workdir, ("scan_v8.pkl" if CAM_IGNORE_SPECKS else "scan_v7.pkl") if USE_PERSON_DETECTOR else "scan_v5.pkl")
         if os.path.exists(scan_path):
             import pickle
             with open(scan_path, "rb") as fh:
@@ -420,6 +420,7 @@ class Analyzer:
             small = cv2.resize(bgr, (cw, ch), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             cut = bool(cuts_here)
+            specks = particle_mask(gray) if CAM_IGNORE_SPECKS else None
 
             # ---- camera motion (background only): long feature tracks over the
             # scenery (people masked out), kept as matched pairs with track ids
@@ -434,6 +435,9 @@ class Analyzer:
                 q = nxt.reshape(-1, 2)
                 good = ((st.ravel() == 1) & (st2.ravel() == 1) & (fb < 0.7) &
                         (q[:, 0] >= 0) & (q[:, 0] < cw) & (q[:, 1] >= 0) & (q[:, 1] < ch))
+                if specks is not None:  # (a point that ran onto a particle follows the particle)
+                    qi_ = np.clip(q.astype(int), 0, [cw - 1, ch - 1])
+                    good &= specks[qi_[:, 1], qi_[:, 0]] == 0
                 if good.sum() >= 12:
                     a, b = p0.reshape(-1, 2)[good], q[good]
                     Hs, inl = cv2.findHomography(a, b, cv2.RANSAC, 2.0)
@@ -577,6 +581,8 @@ class Analyzer:
             n_have = 0 if bg_pts is None else len(bg_pts)
             if n_have < 350:
                 m2 = prev_mask.copy()
+                if specks is not None:
+                    m2[specks > 0] = 0
                 if n_have:
                     for x_, y_ in bg_pts.astype(int):
                         cv2.circle(m2, (int(x_), int(y_)), 8, 0, -1)
@@ -963,6 +969,18 @@ class Analyzer:
         with open(os.path.join(self.workdir, "analysis.json"), "w") as f:
             json.dump(summary, f)
         return summary
+
+
+CAM_IGNORE_SPECKS = os.environ.get("VROIDMOCAP_SPECKS", "1") != "0"  # the camera never follows particles (sparkles, glitter, snow)
+
+
+def particle_mask(gray):
+    """Small bright specks in a (640-wide) grey frame: sparkles, glitter, snow,
+    lights. They move by themselves (drift, fall, twinkle), so the camera
+    is never tracked on them. Returns a uint8 mask, 255 = a speck."""
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, se)
+    return cv2.dilate(((th > 25) * 255).astype(np.uint8), np.ones((5, 5), np.uint8))
 
 
 CAM_RESID_BG = True  # the camera step's blur/fast-pan check judged on the background only

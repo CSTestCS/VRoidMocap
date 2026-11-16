@@ -131,6 +131,11 @@
       </div>
       <aside id="editPanel" class="keypanel editpanel" hidden>
         <div class="kp-head"><b>Corrections</b> <span class="muted small" id="epCount"></span></div>
+        <div class="kp-body ep-room">
+          <label class="check"><input type="checkbox" id="epRoom"> Show the room scan</label>
+          <input type="range" id="epRoomOp" min="0.1" max="1" step="0.05" value="0.6" title="How solid the room scan is drawn">
+          <span class="muted small" id="epRoomInfo"></span>
+        </div>
         <div id="epIdle" class="kp-body">
           <p class="muted small">Play or scrub (← → one frame) to where the camera or the character is wrong, then mark it. A correction tells the app what it is looking at in that frame; its length is how long it was confused, and only those frames are animated again. Frames where she was not found can be marked too: place her where she is and the detector looks there again.</p>
           <button id="epMark" class="primary small">Mark a mistake at this frame</button>
@@ -144,11 +149,10 @@
           <div class="small">Correction at frame <b id="epFrame"></b> <span class="muted" id="epFrameNote"></span></div>
           <label class="check"><input type="checkbox" id="epCamOn"> The camera is wrong</label>
           <div id="epCam" class="ep-group" hidden>
-            <div class="ep-row"><span>Turn</span><input type="range" data-k="cam.yaw" min="-180" max="180" step="0.5" value="0"><output></output></div>
-            <div class="ep-row"><span>Tilt</span><input type="range" data-k="cam.pitch" min="-60" max="60" step="0.5" value="0"><output></output></div>
+            <p class="muted small">Fly the camera over the picture (the view stays the video's frame, so you see exactly what is in shot): <b>drag</b> to turn it, <b>right-drag</b> (or shift-drag) to move it sideways and up / down, <b>wheel</b> to move it in / out, <b>shift-wheel</b> to zoom, <b>W A S D Q E</b> to move it (shift: faster). The scene follows the mouse: drag the room scan onto the picture.</p>
+            <div class="ep-row"><span>Zoom (view angle)</span><input type="range" data-k="cam.fov" min="5" max="120" step="0.5" value="40"><output></output></div>
             <div class="ep-row"><span>Roll</span><input type="range" data-k="cam.roll" min="-45" max="45" step="0.5" value="0"><output></output></div>
-            <div class="ep-row"><span>Zoom (view angle)</span><input type="range" data-k="cam.fov" min="8" max="100" step="0.5" value="40"><output></output></div>
-            <div class="ep-row"><span>Move in / out</span><input type="range" data-k="cam.dist" min="-5" max="5" step="0.05" value="0"><output></output></div>
+            <div class="ep-row"><button id="epCamReset" class="ghost small">Reset the camera</button></div>
           </div>
           <label class="check"><input type="checkbox" id="epChrOn"> The character is wrong (or missing)</label>
           <div id="epChr" class="ep-group" hidden>
