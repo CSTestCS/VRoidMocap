@@ -975,7 +975,9 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
             look = None
         dbg("look_vote", look if look is not None else np.full(N, np.nan))
         if look is not None:
-            look = look * APPEARANCE_STRENGTH
+            # (only where the pose model lost her: elsewhere the detectors read
+            # front / back better than the look does - busy backgrounds sway it)
+            look = np.where(bridged, look * APPEARANCE_STRENGTH, np.nan) if APPEARANCE_ONLY_LOST else look * APPEARANCE_STRENGTH
     dbg("front_vote", front_v if front_v is not None else np.full(N, np.nan))
     user_prior, user_prior_w = None, None
     hints = pose_hints(user_edits, N)
@@ -1941,6 +1943,7 @@ for _a, _b in LR_PAIRS:
 CAMPATH_DEBUG = {}
 APPEARANCE_FACING = os.environ.get("VROIDMOCAP_LOOK", "1") != "0"  # front / back from how she looks
 APPEARANCE_STRENGTH = float(os.environ.get("VROIDMOCAP_LOOK_W", "1.0"))
+APPEARANCE_ONLY_LOST = os.environ.get("VROIDMOCAP_LOOK_ALL", "0") == "0"
 FACING_SKIP_BRIDGED = os.environ.get("VROIDMOCAP_FACING_SKIP_BRIDGED", "1") != "0"
 CAM_CONTRA_FROM_CHARACTER = os.environ.get("VROIDMOCAP_CAM_CONTRA", "1") != "0"
 CAM_CONTRA_SMOOTH_S = 0.3
