@@ -969,7 +969,7 @@ def solve_animation(capture, workdir, char_id, skel, smoothing=1.0, progress=Non
         try:
             progress(0.03, "Reading which way she faces from how she looks")
             from . import appearance
-            look = appearance.front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=shot_of)
+            look = appearance.front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=shot_of, focal=focal)
         except Exception:
             log.exception("appearance facing failed")
             look = None

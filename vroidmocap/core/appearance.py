@@ -20,7 +20,8 @@ import numpy as np
 SAMPLE_HZ = 10.0       # embedded frames per second of video
 UPPER = 0.55           # the upper body: this share of the body box, from the top
 MIN_FRONT = 8          # plainly front-on frames needed to know her front
-MIN_SPREAD = 0.08      # front-on vs least alike: below this the look does not tell
+MIN_SPREAD = 0.08
+FRONT_FIT_Q = 0.5      # face fit quality that marks a plainly front-on frame      # front-on vs least alike: below this the look does not tell
 
 
 def body_boxes(capture, W, H):
@@ -102,7 +103,7 @@ def track_boxes(workdir, char_id, N, fps):
         return None
 
 
-def front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=None):
+def front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=None, focal=None):
     """(N,) -1..1: + = her front is to the camera, - = her back (nan = no
     opinion), or None when the video does not tell."""
     if not video or not os.path.exists(video):
@@ -115,9 +116,14 @@ def front_votes(video, workdir, char_id, capture, valid, fps, W, H, shot_of=None
     have = valid & np.isfinite(boxes).all(1) & ((boxes[:, 2] - boxes[:, 0]) > 16) & ((boxes[:, 3] - boxes[:, 1]) > 16)
     step = max(1, int(round(fps / SAMPLE_HZ)))
     frames = np.array([f for f in range(0, N, step) if have[f]], np.int64)
-    vis = np.asarray(capture["vis"], np.float64)
-    # plainly front-on: the pose model sees the nose and both eyes
-    face = (vis[:, [0, 2, 5]].min(1) >= 0.9) & valid
+    # plainly front-on: the face template fits the face points well (the pose
+    # model's own "nose and eyes visible" is set in back views too: 10-26% of
+    # such frames were turned away on the benchmarks; a good face fit: 0-2%)
+    if focal is None or capture.get("wb2d") is None:
+        return None
+    from .head import head_from_face
+    _, q = head_from_face(capture["wb2d"], capture["wbs"], np.asarray(focal, np.float64), W / 2, H / 2, valid)
+    face = (q > FRONT_FIT_Q) & valid
     if len(frames) < MIN_FRONT * 2 or face[frames].sum() < MIN_FRONT:
         return None
     E = embeddings(video, workdir, char_id, boxes, fps, frames)
